@@ -1,0 +1,200 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-03T22:50:00Z",
+  "title": "Design System: Agent Console R2",
+  "extensions": {
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Compact Headline",
+        "purpose": "只用于确实需要的页面级标题，不承担 hero 角色。"
+      },
+      "title": {
+        "displayName": "Workspace Title",
+        "purpose": "列表页、收件箱和设备页的紧凑标题。"
+      },
+      "body": {
+        "displayName": "Operational Body",
+        "purpose": "问题正文、说明与常规事实。"
+      },
+      "label": {
+        "displayName": "Control Label",
+        "purpose": "按钮、状态徽标、分段导航和列语义。"
+      },
+      "micro": {
+        "displayName": "Micro Metadata",
+        "purpose": "空间受限的眉题、时间与辅助元数据。"
+      },
+      "code": {
+        "displayName": "Technical Mono",
+        "purpose": "命令、路径、ID、修订、Diff 与输出。"
+      }
+    },
+    "shadows": [
+      {
+        "name": "overlay",
+        "value": "0 16px 40px rgb(0 0 0 / 22%)",
+        "purpose": "桌面或中等宽度导航 dialog。"
+      },
+      {
+        "name": "bottom-action-layer",
+        "value": "0 -12px 36px rgb(0 0 0 / 24%)",
+        "purpose": "手机待处理、设备与提问操作层。"
+      },
+      {
+        "name": "queue-lift",
+        "value": "0 -10px 32px rgb(0 0 0 / 8%)",
+        "purpose": "大于 1100px 的桌面队列编辑器。"
+      }
+    ],
+    "motion": [
+      {
+        "name": "motion-fast",
+        "value": "120ms",
+        "purpose": "按钮与导航的颜色、边界和背景状态变化。"
+      },
+      {
+        "name": "motion-base",
+        "value": "160ms",
+        "purpose": "常规表面状态变化。"
+      },
+      {
+        "name": "ease-standard",
+        "value": "cubic-bezier(0.2, 0, 0, 1)",
+        "purpose": "通用状态过渡。"
+      },
+      {
+        "name": "bottom-sheet-enter",
+        "value": "180ms cubic-bezier(0.2, 0.8, 0.2, 1)",
+        "purpose": "手机底部操作层的上移与关闭。"
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "header-search-collapse",
+        "value": "1250px"
+      },
+      {
+        "name": "attention-inspector-collapse",
+        "value": "1120px"
+      },
+      {
+        "name": "shell-and-queue-collapse",
+        "value": "1100px"
+      },
+      {
+        "name": "table-and-git-context-collapse",
+        "value": "900px"
+      },
+      {
+        "name": "mobile-workspace",
+        "value": "759px"
+      },
+      {
+        "name": "touch-controls",
+        "value": "599px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "当前视图唯一主动作的冷静蓝实心按钮。",
+      "html": "<button class=\"ds-btn-primary\" type=\"button\">绑定新设备</button>",
+      "css": ".ds-btn-primary { display: inline-flex; min-height: 36px; align-items: center; justify-content: center; padding: 8px 12px; border: 1px solid transparent; border-radius: var(--radius-control); background: var(--accent); color: var(--accent-contrast); font-family: var(--font-ui); font-weight: 650; line-height: 1.2; white-space: nowrap; transition: background var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard), color var(--motion-fast) var(--ease-standard); } .ds-btn-primary:hover:not(:disabled) { filter: brightness(1.08); } .ds-btn-primary:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; } .ds-btn-primary:disabled { border-color: var(--border-subtle); background: var(--bg-surface); color: var(--text-muted); opacity: 0.62; }"
+    },
+    {
+      "name": "Status Badge",
+      "kind": "chip",
+      "refersTo": "status-badge",
+      "description": "状态专用的 24px 药丸，可带当前色圆点。",
+      "html": "<span class=\"ds-status-badge ds-status-badge-success\"><span class=\"ds-status-dot\" aria-hidden=\"true\"></span>在线</span>",
+      "css": ".ds-status-badge { display: inline-flex; min-height: 24px; align-items: center; gap: 6px; padding: 2px 8px; border: 1px solid var(--border-subtle); border-radius: 999px; background: var(--bg-surface); color: var(--text-secondary); font-family: var(--font-ui); font-size: 11px; font-weight: 700; letter-spacing: 0.02em; line-height: 1.2; white-space: nowrap; } .ds-status-badge-success { color: var(--success); } .ds-status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }"
+    },
+    {
+      "name": "Selected Inbox Row",
+      "kind": "custom",
+      "refersTo": "inbox-row",
+      "description": "边到边行动列表中的单一选中事实。",
+      "html": "<button class=\"ds-inbox-row ds-inbox-row-selected\" type=\"button\"><span class=\"ds-inbox-icon\" aria-hidden=\"true\">!</span><span class=\"ds-inbox-copy\"><strong>批准删除重复事件</strong><small>等待风险审批</small></span><time class=\"ds-inbox-time\">11:39</time></button>",
+      "css": ".ds-inbox-row { display: grid; width: 100%; min-height: 66px; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 8px 10px 8px 12px; border: 0; border-bottom: 1px solid var(--border-subtle); background: transparent; color: var(--text-secondary); font-family: var(--font-ui); text-align: left; } .ds-inbox-row:hover { background: var(--bg-elevated); } .ds-inbox-row:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; } .ds-inbox-row-selected { background: var(--accent-soft); box-shadow: inset 1px 0 var(--accent); } .ds-inbox-icon { display: grid; width: 30px; height: 30px; place-items: center; border-radius: var(--radius-control); background: color-mix(in srgb, var(--warning), transparent 86%); color: var(--warning); font-weight: 700; } .ds-inbox-copy { display: grid; min-width: 0; gap: 2px; } .ds-inbox-copy > strong { overflow: hidden; color: var(--text-primary); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; } .ds-inbox-copy > small, .ds-inbox-time { color: var(--text-muted); font-size: 10px; }"
+    },
+    {
+      "name": "Compact Queue Composer",
+      "kind": "input",
+      "refersTo": "queue-composer-compact",
+      "description": "1100px 及以下（含 1024px）的 56px 单行下一轮队列。",
+      "html": "<form class=\"ds-queue-compact\"><label class=\"ds-queue-label\" for=\"ds-queue-input\">下一轮指令</label><input class=\"ds-queue-input\" id=\"ds-queue-input\" type=\"text\" placeholder=\"追加下一轮…\"><button class=\"ds-queue-cancel\" type=\"button\" aria-label=\"取消下一轮队列\">×</button><button class=\"ds-queue-submit\" type=\"submit\" aria-label=\"排入下一轮\">↵</button></form>",
+      "css": ".ds-queue-compact { display: grid; min-height: 56px; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--border-strong); border-right: 0; border-bottom: 0; border-left: 0; border-radius: 0; background: var(--bg-elevated); font-family: var(--font-ui); } .ds-queue-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; } .ds-queue-input { display: block; width: 100%; min-width: 0; height: 44px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-control); outline: 0; background: var(--bg-surface); color: var(--text-primary); font: 16px var(--font-ui); } .ds-queue-input:focus { border-color: var(--focus-ring); } .ds-queue-cancel, .ds-queue-submit { display: grid; width: 44px; height: 44px; padding: 0; place-items: center; border-radius: var(--radius-control); font: 18px var(--font-ui); } .ds-queue-cancel { border: 1px solid var(--border-subtle); background: transparent; color: var(--text-muted); } .ds-queue-submit { border: 0; background: var(--accent); color: var(--accent-contrast); } .ds-queue-cancel:hover { background: var(--accent-soft); color: var(--text-primary); } .ds-queue-submit:hover { filter: brightness(1.08); } .ds-queue-cancel:focus-visible, .ds-queue-submit:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }"
+    },
+    {
+      "name": "Mobile Action Sheet",
+      "kind": "custom",
+      "refersTo": "mobile-action-sheet",
+      "description": "待处理、设备和提问共用的内容自适应底部 dialog 语言。",
+      "html": "<section class=\"ds-action-sheet\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"ds-sheet-title\" tabindex=\"-1\"><header class=\"ds-sheet-header\"><strong id=\"ds-sheet-title\">Codex 提问</strong><button class=\"ds-sheet-close\" type=\"button\" aria-label=\"关闭提问\">×</button></header><p class=\"ds-sheet-body\">是否继续处理当前任务？</p><footer class=\"ds-sheet-actions\"><button class=\"ds-sheet-option\" type=\"button\">稍后</button><button class=\"ds-sheet-option\" type=\"button\">继续</button></footer></section>",
+      "css": ".ds-action-sheet { display: grid; width: 100%; overflow: hidden; padding: 0 14px 12px; border-top: 1px solid var(--border-strong); border-radius: 14px 14px 0 0; background: var(--bg-elevated); box-shadow: 0 -12px 36px rgb(0 0 0 / 24%); color: var(--text-primary); font-family: var(--font-ui); } .ds-action-sheet:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; } .ds-sheet-header { display: flex; min-height: 54px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border-subtle); } .ds-sheet-close { display: grid; width: 44px; height: 44px; padding: 0; place-items: center; border: 0; border-radius: var(--radius-control); background: transparent; color: var(--text-muted); font-size: 20px; } .ds-sheet-close:hover { background: var(--bg-surface); color: var(--text-primary); } .ds-sheet-close:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; } .ds-sheet-body { margin: 16px 0 18px; color: var(--text-primary); font-size: 16px; line-height: 1.45; } .ds-sheet-actions { display: flex; gap: 8px; } .ds-sheet-option { min-height: 44px; flex: 1; padding: 8px 12px; border: 1px solid var(--border-strong); border-radius: var(--radius-control); background: var(--bg-elevated); color: var(--text-primary); font-family: var(--font-ui); font-weight: 650; } .ds-sheet-option:hover { background: var(--accent-soft); } .ds-sheet-option:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "行动收件箱",
+    "overview": "Agent Console R2 是为扫读、聚焦事实和完成动作设计的行动工作区，不是协议说明书。它以紧凑工具栏、Graphite 发丝分隔和边到边工作列表作为第一层，将证据、属性与动作保持在同一任务语境中。蓝色只标记选择和主动作；复杂度通过分段视图与内容自适应操作层按需出现。\n\n这是一套 Operate 模式的界面：桌面第一视口是紧凑图标轨道、工作列表、决策或运行证据和属性检查器；手机只呈现列表或单一工作区，并由固定底部导航与底部操作层承接动作。视觉来源为行动收件箱结构（候选 3/7，seed `f812eac5`），任务详情沿用同一世界中的横向工作区，而不是大标题、说明卡或桌面模块的纵向复刻。",
+    "keyCharacteristics": [
+      "紧凑、事实优先、可操作。",
+      "Graphite 表面通过发丝边界而非装饰卡片分层。",
+      "桌面横向协作，手机分段聚焦。",
+      "蓝色稀缺，状态色只承载真实语义。",
+      "操作层在需要时出现，关闭后焦点回到触发点。"
+    ],
+    "rules": [
+      {
+        "name": "The Sparse Blue Rule",
+        "body": "蓝色只用于当前选择、结构链接与唯一主动作；任何信息仅凭“重要”不得染蓝。",
+        "section": "colors"
+      },
+      {
+        "name": "The Semantic State Rule",
+        "body": "success、warning、danger 与 sensitive 必须保留各自事实语义，不能拿状态色做页面装饰。",
+        "section": "colors"
+      },
+      {
+        "name": "The Working-Type Rule",
+        "body": "页面标题不得升级成 hero；先让列表、证据和动作进入首屏，再用字重而非体量建立层级。",
+        "section": "typography"
+      },
+      {
+        "name": "The One Workspace Rule",
+        "body": "手机一次只显示一个工作语境；列表、分段视图或底部操作层之间切换，不复制桌面多栏。",
+        "section": "layout"
+      },
+      {
+        "name": "The Border Before Shadow Rule",
+        "body": "静态内容先用一条发丝边界分层；只有覆盖现有内容的操作层才使用明显阴影。",
+        "section": "elevation"
+      },
+      {
+        "name": "The Edge-to-Edge Rule",
+        "body": "手机工作列表和时间线以连续行呈现；只有真正独立、需要内部边界的证据或设置对象保留卡片轮廓。",
+        "section": "shapes"
+      }
+    ],
+    "dos": [
+      "**Do** 让用户先扫边到边列表，再聚焦一个事实，最后在同一语境完成一个动作。",
+      "**Do** 在桌面把工作列表、证据与属性横向并置，在手机通过四分段或单一工作区切换。",
+      "**Do** 保持蓝色稀缺，只给选择、活动结构和唯一主动作。",
+      "**Do** 让待处理、设备和提问在手机进入内容自适应底部 dialog，并完整恢复焦点。",
+      "**Do** 在 1024px 使用紧凑单行队列编辑器，在 759px 以下保留固定底部导航和 safe area。",
+      "**Do** 让代码、Diff 与输出在自身区域滚动，并明确展示状态、修订和只读边界。"
+    ],
+    "donts": [
+      "**Don't** 把网页做成带大标题、说明卡和章节导语的协议说明书。",
+      "**Don't** 在手机把桌面列表、内容和检查器从上到下纵向堆叠。",
+      "**Don't** 在手机 Git 中同时显示完整文件列表和代码区；使用单文件选择器。",
+      "**Don't** 把卡片当作每一段内容的默认容器，或把所有元数据变成药丸。",
+      "**Don't** 用蓝色装饰普通信息，或混用 success、warning、danger 与 sensitive 的语义。",
+      "**Don't** 引入令牌之外的品牌色、渐变、玻璃拟态、大面积发光或常驻装饰阴影。",
+      "**Don't** 牺牲 44px 移动触控目标、可见焦点、Escape 关闭或焦点恢复来换取密度。"
+    ]
+  }
+}

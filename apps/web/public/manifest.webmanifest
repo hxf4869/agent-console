@@ -1,0 +1,33 @@
+{
+  "name": "Agent Console",
+  "short_name": "Agent Console",
+  "description": "远程查看并控制 Codex Desktop 任务。",
+  "start_url": "/agent-console/",
+  "scope": "/agent-console/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "background_color": "#151716",
+  "theme_color": "#151716",
+  "lang": "zh-CN",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/agent-console/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "待处理",
+      "short_name": "待处理",
+      "url": "/agent-console/"
+    },
+    {
+      "name": "任务",
+      "short_name": "任务",
+      "url": "/agent-console/tasks"
+    }
+  ]
+}

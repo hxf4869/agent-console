@@ -1,0 +1,200 @@
+// 写命令、回执(§15、§27.4)。
+//
+// 发送语义(§15.4):IDLE 默认 start new turn;RUNNING 默认写单条 next-turn
+// queue;RUNNING 且用户显式选择才 steer;interrupt 必须带 expected turn,
+// 后端不得把普通发送误映射为 interrupt。
+// 业务幂等由 request_id 完成,与流 sequence 无关(§17.5)。
+//
+// 字段号冻结约定见 common.proto 头注释。
+
+syntax = "proto3";
+
+package agent_console.v1;
+
+import "google/protobuf/timestamp.proto";
+import "agent_console/v1/common.proto";
+
+// §27.4 WebSocket 命令操作集合。
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  OPERATION_CREATE_TASK = 1;
+  OPERATION_START_TURN = 2;
+  OPERATION_QUEUE_SET = 3;
+  OPERATION_QUEUE_REPLACE = 4;
+  OPERATION_QUEUE_CANCEL = 5;
+  OPERATION_STEER = 6;
+  OPERATION_INTERRUPT = 7;
+  OPERATION_ANSWER_QUESTION = 8;
+  OPERATION_ANSWER_APPROVAL = 9;
+  OPERATION_UPDATE_SETTINGS = 10;
+  OPERATION_RENAME_TASK = 11;
+  OPERATION_ARCHIVE_TASK = 12;
+  OPERATION_UNARCHIVE_TASK = 13;
+  OPERATION_FORK_TASK = 14;
+  OPERATION_STOP_BACKGROUND_COMMAND = 15;
+  OPERATION_STOP_ALL_BACKGROUND_COMMANDS = 16;
+}
+
+// §15.2 回执状态。Browser 只有收到 ACCEPTED_BY_BRIDGE 才能显示"已发送/已排队";
+// RECEIVED 不得显示为已发送到 Codex。
+enum CommandReceiptStatus {
+  COMMAND_RECEIPT_STATUS_UNSPECIFIED = 0;
+  // Relay 已收到,未到 Bridge。
+  RECEIPT_RECEIVED = 1;
+  // Bridge 已持久化去重记录并接受。
+  RECEIPT_ACCEPTED_BY_BRIDGE = 2;
+  // 已交给 Desktop owner。
+  RECEIPT_DISPATCHED_TO_CODEX = 3;
+  // 操作有明确最终结果。
+  RECEIPT_COMPLETED = 4;
+  // 已拒绝,附稳定错误码。
+  RECEIPT_REJECTED = 5;
+  // 连接中断且无法证明 Desktop 是否执行。
+  RECEIPT_OUTCOME_UNKNOWN = 6;
+}
+
+// 设置更新项(§16.1)。option_id 来自 capability snapshot,value 必须是
+// snapshot.available_values 中列出的原生值标识;不支持的组合返回
+// SETTING_COMBINATION_UNSUPPORTED,不得静默降级。
+message SettingUpdate {
+  string option_id = 1;
+  string value = 2;
+}
+
+// CreateTask:创建 Desktop 任务。workspace 只允许显示名或授权根引用,
+// 禁止本机绝对路径(§17.2)。
+message CreateTaskPayload {
+  string workspace_display_name = 1;
+  // 已授权工作区根的引用(由 Bridge 的 File Grant Manager 签发/识别),
+  // 不是本机路径。
+  string workspace_root_ref = 2;
+  // 新任务的初始设置(§16.1);为空表示继承全局默认。
+  repeated SettingUpdate initial_settings = 3;
+}
+
+message StartTurnPayload {
+  string prompt = 1;
+}
+
+// 队列 payload(§15.3:每 session 最多一条;正文只存 Bridge SQLite,
+// Relay 不代存不落盘)。绑定 after_turn_id 与接受时的 runtime revision。
+message QueueSetPayload {
+  string prompt = 1;
+  TurnId after_turn_id = 2;
+  // 提交时看到的 runtime revision。
+  uint64 runtime_revision = 3;
+}
+
+message QueueReplacePayload {
+  string prompt = 1;
+  TurnId after_turn_id = 2;
+  uint64 runtime_revision = 3;
+}
+
+message QueueCancelPayload {}
+
+// Steer 当前 turn;expected_turn 必填。
+message SteerPayload {
+  string prompt = 1;
+  TurnId expected_turn = 2;
+}
+
+// Interrupt;expected_turn 必填(§15.4,前端负责二次确认)。
+message InterruptPayload {
+  TurnId expected_turn = 1;
+}
+
+// 回答问题(§16.3)。只允许按原生 question ID 回答;必须发送 option ID
+// 或明确自由文本,不能只发送展示文案。
+message AnswerQuestionPayload {
+  string question_id = 1;
+  repeated string option_ids = 2;
+  // allow_free_text 时允许的自由文本答案。
+  string free_text = 3;
+}
+
+// 回答审批(§16.4)。只允许按原生 approval ID 与原生 decision ID 决定;
+// Bridge 不得创造"永远允许"或扩大范围的选项。
+message AnswerApprovalPayload {
+  string approval_id = 1;
+  string decision_id = 2;
+}
+
+message UpdateSettingsPayload {
+  repeated SettingUpdate updates = 1;
+}
+
+message RenameTaskPayload {
+  string new_title = 1;
+}
+
+message ForkTaskPayload {
+  // fork 出的新标题;为空表示沿用原标题。
+  string new_title = 1;
+}
+
+message ArchiveTaskPayload {}
+
+message UnarchiveTaskPayload {}
+
+// 停止单个后台命令。仅当 command ID 稳定可识别时支持(§9.2);
+// 无法稳定识别时 capability 不提供本操作,前端只能使用全局停止。
+message StopBackgroundCommandPayload {
+  string command_id = 1;
+}
+
+message StopAllBackgroundCommandsPayload {}
+
+// §15.1 写命令公共字段 + 操作 payload。
+message CommandRequest {
+  // 调用方生成的 UUID。相同 ID 与相同 target/operation/payload 重试时返回
+  // 已有回执,不重复执行;相同 ID 不同内容返回 DUPLICATE_REQUEST_MISMATCH。
+  string request_id = 1;
+  Operation operation = 2;
+  SessionKey session_key = 3;
+  // 目标 turn;不适用时缺省。
+  TurnId expected_turn_id = 4;
+  // 期望的 runtime revision;不适用时缺省(optional 区分"未提供"与 0)。
+  optional uint64 expected_runtime_revision = 5;
+  // payload 的本地规范化摘要(SHA-256,hex 编码)。
+  // 固定摘要仅用于协议去重比较,不用于内容真实性证明;Relay 不保存正文(§15.1)。
+  string payload_digest = 6;
+
+  oneof payload {
+    CreateTaskPayload create_task = 7;
+    StartTurnPayload start_turn = 8;
+    QueueSetPayload queue_set = 9;
+    QueueReplacePayload queue_replace = 10;
+    QueueCancelPayload queue_cancel = 11;
+    SteerPayload steer = 12;
+    InterruptPayload interrupt = 13;
+    AnswerQuestionPayload answer_question = 14;
+    AnswerApprovalPayload answer_approval = 15;
+    UpdateSettingsPayload update_settings = 16;
+    RenameTaskPayload rename_task = 17;
+    ArchiveTaskPayload archive_task = 18;
+    UnarchiveTaskPayload unarchive_task = 19;
+    ForkTaskPayload fork_task = 20;
+    StopBackgroundCommandPayload stop_background_command = 21;
+    StopAllBackgroundCommandsPayload stop_all_background_commands = 22;
+  }
+}
+
+// 回执(§15.2)。CommandAccepted 表示已受理(幂等回执),
+// CommandResult 表示最终结果或拒绝。
+message CommandAccepted {
+  string request_id = 1;
+  CommandReceiptStatus status = 2;
+  google.protobuf.Timestamp accepted_at = 3;
+}
+
+message CommandResult {
+  string request_id = 1;
+  CommandReceiptStatus status = 2;
+  // REJECTED 或失败时的稳定错误码;成功为 UNSPECIFIED。
+  StableErrorCode error_code = 3;
+  // 附加上下文;前端不得依赖其中的自由文本判断流程(§27.5)。
+  map<string, string> details = 4;
+  // 从收到请求到得出结果的总耗时(毫秒);未知时缺省。
+  optional uint64 duration_ms = 5;
+}

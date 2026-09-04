@@ -1,0 +1,2080 @@
+# =============================================================================
+# Agent Console HTTP API 契约(OpenAPI 3.1)
+#
+# 与实现的对应关系(路由真相源):
+#   - Relay 路由装配:apps/relay/src/lib.rs(nest("/agent-console/api") +
+#     根级 bridge/transfers/ws/health);各模块 .route():
+#     apps/relay/src/{devices/mod.rs,devices/pairing.rs,sessions/mod.rs,
+#     transfers/mod.rs,push/mod.rs,audit/mod.rs,auth/browser_ws.rs}。
+#   - dev-toolbox 路由:apps/api/internal/auth/agent_console.go
+#     (POST /api/v1/agent-console/ws-tickets 与 /internal/agent-console/*)。
+#   - Bridge 端点路径常量(新 URL 合同):apps/bridge/src/config/mod.rs 的
+#     RelayUrls(AGENT_CONSOLE_RELAY_URL = 公网基地址 origin,5 条派生路径)。
+#   - JSON 形状真相:apps/relay/src/sessions/json.rs(RuntimeSnapshot/HistoryPage
+#     的 camelCase 映射,与 Protobuf JSON 映射一致)。
+#   - 错误形状:apps/relay/src/state.rs api_error()/status_for_code()。
+#
+# 部署拓扑(重要):
+#   - "browser" 标签的端点真实路径为 /agent-console/api/*,公网经 dev-toolbox
+#     网关同域访问;网关 forward-auth 后以受信身份头(X-Agent-Console-Session-Id /
+#     X-Agent-Console-Owner-Id / 可选 X-Agent-Console-Session-Expires)向 Relay
+#     传递身份,浏览器不直接接触 Relay,Cookie 不转发给 Relay。
+#   - "bridge-device" 标签是 Relay 设备面(公网网关可达、无浏览器 Cookie):
+#     Bridge 以 Bearer 设备凭据/挑战认证。设备面端点也是 AGENT_CONSOLE_RELAY_URL
+#     派生路径(见 info.description)。
+#   - "internal" 标签的端点只允许内部网络访问,使用独立内部服务 Token
+#     (Authorization: Bearer),公网无路由(dev-toolbox 网关对 /internal/* 一律 404)。
+# =============================================================================
+
+openapi: 3.1.0
+info:
+  title: Agent Console API
+  version: 1.1.0
+  description: |
+    Agent Console 后端 HTTP 契约(Relay 浏览器面 + Relay 设备面 + dev-toolbox 认证面)。
+
+    统一错误对象:`{"error":{"code","message","requestId","details"}}`,
+    `code` 取自稳定错误码集合(见 contracts/error-codes.md;proto
+    `agent_console.v1.StableErrorCode` 与 HTTP 使用同一集合)。
+
+    分页:SessionSummary 与 HistoryPage 默认 50、最大 200,使用稳定 keyset
+    cursor(不透明字符串),不用页码。完整命令输出单页最大 256 KiB;
+    单个 Diff 响应最大 2 MiB(由 Bridge 侧约束)。
+
+    多维状态:会话不存在单一 status 枚举;DeviceConnection × ControlMode ×
+    CompatibilityState × ActiveTurnPhase × PendingAttention × QueueState ×
+    LastTurnOutcome × BackgroundCommandState 分别携带(规格 §10)。
+
+    ## 配对 v2(Bridge 发起,规格 §21)
+
+    1. 未绑定的 Bridge 本地生成 32 字节高熵 challenge,调用
+       `POST /agent-console/bridge/pairing/register`(设备面)拿到
+       `{challengeId, shortCode, expiresAt}`;CLI 打印短码与二维码数据。
+    2. 已登录浏览器输入短码或打开配对深链
+       **`{origin}/agent-console/pair?code=<shortCode>`**(前端页面,
+       origin 即用户访问的同域站点),先
+       `POST /agent-console/api/pairing/lookup` 显示设备信息,再
+       `POST /agent-console/api/pairing/approve` 批准(单赢家,owner 在批准时回填)。
+    3. Bridge 轮询 `POST /agent-console/bridge/pairing/claim`:未批准返回
+       `{status:"pending"}`;批准后单次返回
+       `{status:"ready", deviceId, deviceCredential}`(凭据明文只此一次,
+       Bridge 写入 macOS Keychain;重复 claim 409,过期 410)。
+    4. 浏览器侧 `GET /agent-console/api/pairing/challenges` 列出已批准但 Bridge
+       尚未领取的挑战;`DELETE /agent-console/api/pairing/challenges/{challengeId}` 取消。
+       短码错误有尝试上限,超限挑战锁定(429)。
+
+    ## AGENT_CONSOLE_RELAY_URL 基地址语义(URL 合同)
+
+    `AGENT_CONSOLE_RELAY_URL` 是 **Relay 公网基地址(纯 origin)**:
+    scheme 允许 http/https/ws/wss(ws/wss 内部规范化),path 必须为空或 `/`
+    (带 `/agent-console/...` 会被识别为误填完整 WS 地址并专门报错)。
+    Bridge 由 `apps/bridge/src/config/mod.rs` 的 `RelayUrls` 统一派生全部
+    5 条出站路径:
+
+    | 派生路径 | 用途 |
+    |---|---|
+    | `{origin}/agent-console/bridge/ws` | Bridge WSS 长连接 |
+    | `{origin}/agent-console/bridge/pairing/register` | 配对注册 |
+    | `{origin}/agent-console/bridge/pairing/claim` | 配对轮询领取 |
+    | `{origin}/agent-console/transfers/producer/{transferId}` | 文件字节流出站(POST) |
+    | `{origin}/agent-console/transfers/consumer/{transferId}` | 上传字节流入站(GET) |
+
+    配对深链 `{origin}/agent-console/pair?code=<shortCode>` 亦由该 origin 派生
+    (`RelayUrls::pairing_deep_link`)。浏览器流量不走该变量。
+
+servers:
+  # 浏览器面与设备面端点都经公网网关同域访问;生产 server 即 AGENT_CONSOLE_RELAY_URL。
+  - url: https://toolbox.example.com
+    description: 生产公网网关(同域 origin;浏览器面 /agent-console/api/* 与
+      Bridge 设备面 /agent-console/bridge/*、/agent-console/transfers/* 均由此访问)
+  - url: http://127.0.0.1:8081
+    description: 本地直连 Relay(开发;承载 /agent-console/* 全部路径与 /health)
+
+tags:
+  - name: browser
+    description: Relay 浏览器面(真实路径 /agent-console/api/*,经网关 forward-auth 可信身份头认证)
+  - name: bridge-device
+    description: |
+      Relay 设备面(Bridge 出站调用;公网网关可达,无浏览器 Cookie/forward-auth)。
+      鉴权:pairing register/claim 持挑战明文 + 来源限速;bridge/ws 与 transfers
+      用 `Authorization: Bearer <deviceCredential>`。
+  - name: devtoolbox-auth
+    description: dev-toolbox 认证面(公开登录态端点;与 Relay 同域经网关访问)
+  - name: internal
+    description: |
+      内部端点(仅内网 + 内部服务 Token;公网无路由,网关对 /internal/* 一律 404)。
+      仅可在 internal server(dev-toolbox 内网地址)访问,不可从公网网关到达。
+  - name: ops
+    description: 运维探针(仅 Relay 本机/内网)
+
+security:
+  - gatewayIdentity: []
+
+paths:
+  # ---------------------------------------------------------------------------
+  # dev-toolbox:浏览器认证面(公开;网关同域)
+  # ---------------------------------------------------------------------------
+  /api/v1/agent-console/ws-tickets:
+    post:
+      operationId: createWsTicket
+      tags: [devtoolbox-auth]
+      summary: 签发一次性 WebSocket 连接 ticket
+      description: |
+        dev-toolbox 侧实现。复用现有 session-only AuthenticateMutation:
+        校验 Cookie、Origin 与 CSRF(非 GET 请求需 `X-CSRF-Token`)。
+        ticket 为 32 字节高熵随机值,Base64URL 明文只返回一次,服务端只存
+        SHA-256 摘要;默认 30 秒过期、单次消费。响应 `Cache-Control: no-store`。
+        未登录/过期/撤销 session 由现有中间件以 AUTH_REQUIRED 拒绝;
+        Origin/CSRF 失败返回现有 FORBIDDEN 语义。
+      security:
+        - toolboxSessionCookie: []
+      responses:
+        "200":
+          description: ticket 已签发(明文仅此一次)
+          headers:
+            Cache-Control:
+              schema: { type: string }
+              description: 恒为 no-store
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ticket, expiresAt, audience]
+                properties:
+                  ticket: { type: string, description: Base64URL 明文 ticket }
+                  expiresAt: { type: string, format: date-time }
+                  audience:
+                    type: string
+                    enum: [relay]
+        "401":
+          description: 未登录(AUTH_REQUIRED,现有中间件语义)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # dev-toolbox:内部认证端点(仅内网;Relay / 网关调用;公网 404)
+  # ---------------------------------------------------------------------------
+  /internal/agent-console/ws-tickets/consume:
+    post:
+      operationId: consumeWsTicket
+      tags: [internal]
+      summary: "[内部] 原子消费一次性 WS ticket"
+      description: |
+        dev-toolbox 侧。仅内部网络可达,`Authorization: Bearer <AGENT_CONSOLE_INTERNAL_TOKEN>`。
+        原子消费(UPDATE ... RETURNING),并发消费只有一个成功;对应 auth session
+        已失效时拒绝且 ticket 不复活。
+      security:
+        - internalToken: []
+      servers:
+        - url: http://api:8080
+          description: 生产 compose 内网服务名(dev-toolbox api;不可公网路由)
+        - url: http://127.0.0.1:8080
+          description: 本地直连 dev-toolbox API(内网)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ticket]
+              properties:
+                ticket: { type: string }
+      responses:
+        "200":
+          description: 消费结果(valid=false 时携带 reason)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [valid, authSessionId, ownerId, expiresAt]
+                    properties:
+                      valid: { type: boolean, const: true }
+                      authSessionId: { type: string, format: uuid }
+                      ownerId: { type: string, format: uuid }
+                      expiresAt: { type: string, format: date-time }
+                  - type: object
+                    required: [valid, reason]
+                    properties:
+                      valid: { type: boolean, const: false }
+                      reason:
+                        type: string
+                        enum: [CONSUMED, EXPIRED, NOT_FOUND, SESSION_INVALID]
+        "401":
+          description: 内部 Token 无效
+        "503":
+          description: 未配置内部 Token(fail closed)
+
+  /internal/agent-console/auth-sessions/introspect:
+    post:
+      operationId: introspectAuthSession
+      tags: [internal]
+      summary: "[内部] 无 touch auth session introspection"
+      description: |
+        dev-toolbox 侧。按 session ID 检查 revoked、expires、24 小时 idle 与
+        password_changed_at;**不得更新 last_seen_at**(区别于现有浏览器接口的
+        5 分钟 touch 行为)。Relay 每 60 秒对活跃 Browser WS 调用一次(§20.5)。
+      security:
+        - internalToken: []
+      servers:
+        - url: http://api:8080
+          description: 生产 compose 内网服务名(dev-toolbox api;不可公网路由)
+        - url: http://127.0.0.1:8080
+          description: 本地直连 dev-toolbox API(内网)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [authSessionId]
+              properties:
+                authSessionId: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 校验结果
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [valid, ownerId, expiresAt]
+                    properties:
+                      valid: { type: boolean, const: true }
+                      ownerId: { type: string, format: uuid }
+                      expiresAt: { type: string, format: date-time }
+                  - type: object
+                    required: [valid, revokedReason]
+                    properties:
+                      valid: { type: boolean, const: false }
+                      revokedReason:
+                        type: string
+                        enum: [REVOKED, EXPIRED, IDLE_TIMEOUT, PASSWORD_CHANGED, NOT_FOUND]
+        "401":
+          description: 内部 Token 无效
+        "503":
+          description: 未配置内部 Token(fail closed)
+
+  /internal/agent-console/auth-sessions/verify:
+    get:
+      operationId: forwardAuthVerify
+      tags: [internal]
+      summary: "[内部] HTTP forward-auth verify(网关同域路由调用)"
+      description: |
+        dev-toolbox 侧。Caddy `forward_auth`(固定 GET)/Nginx `auth_request` 调用。
+        请求头携带浏览器原始 `Cookie`、`Origin`、`X-CSRF-Token`,以及
+        `X-Agent-Console-Method`(原始方法;非 GET/HEAD/OPTIONS 或未知值按写请求
+        处理,要求 Origin+CSRF)。执行与浏览器接口相同的 session 验证,
+        不含 last_seen touch。
+        有效:200 + JSON,并附带 `X-Agent-Console-Session-Id`、
+        `X-Agent-Console-Owner-Id` 身份头(网关 copy 到上游请求、删除客户端伪造头;
+        Cookie/CSRF/Origin/Authorization 不转发给 Relay)。
+        无效:401(网关直接拦截,不触达 Relay)。
+        身份头 `X-Agent-Console-Session-Expires` 为可选:Relay 侧已将其改为
+        可选头(缺失时跳过本地预过期检查;过期拦截由 verify 与 WS introspection
+        负责),verify 只需返回 Session-Id/Owner-Id 两个头即可打通。
+      security:
+        - internalToken: []
+      servers:
+        - url: http://api:8080
+          description: 生产 compose 内网服务名(dev-toolbox api;不可公网路由)
+        - url: http://127.0.0.1:8080
+          description: 本地直连 dev-toolbox API(内网)
+      parameters:
+        - name: X-Agent-Console-Method
+          in: header
+          required: false
+          schema: { type: string }
+          description: 浏览器原始 HTTP 方法(写请求校验 Origin+CSRF)
+      responses:
+        "200":
+          description: 会话有效;身份经响应头返回
+          headers:
+            X-Agent-Console-Session-Id:
+              schema: { type: string, format: uuid }
+            X-Agent-Console-Owner-Id:
+              schema: { type: string, format: uuid }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [valid, authSessionId, ownerId, expiresAt]
+                properties:
+                  valid: { type: boolean, const: true }
+                  authSessionId: { type: string, format: uuid }
+                  ownerId: { type: string, format: uuid }
+                  expiresAt: { type: string, format: date-time }
+        "401":
+          description: 会话无效/过期/撤销(AUTH_REQUIRED;网关拦截)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 设备面:配对 v2 Bridge 发起端点(§21;公网网关可达,无浏览器 Cookie)
+  # ---------------------------------------------------------------------------
+  /agent-console/bridge/pairing/register:
+    post:
+      operationId: bridgePairingRegister
+      tags: [bridge-device]
+      summary: Bridge 发起配对:注册挑战并领取 6 位短码
+      description: |
+        Bridge 本地生成 32 字节 challenge(base64url 无填充 43 字符)后调用。
+        Relay 只存 challenge/短码的 SHA-256 摘要;短码明文仅在本响应出现,
+        由 Bridge CLI 展示(短码横幅 + 二维码深链
+        `{origin}/agent-console/pair?code=<shortCode>`)。TTL 5 分钟;
+        按来源 IP 限速(429)。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challenge, deviceName, platform, arch, bridgeVersion]
+              properties:
+                challenge:
+                  type: string
+                  maxLength: 43
+                  minLength: 43
+                  description: Bridge 本地生成的 32 字节 base64url 无填充 challenge
+                deviceName: { type: string, maxLength: 128 }
+                platform: { type: string, example: macos }
+                arch: { type: string, example: arm64 }
+                bridgeVersion: { type: string }
+      responses:
+        "200":
+          description: 已注册;短码只在此响应出现
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [challengeId, shortCode, expiresAt]
+                properties:
+                  challengeId: { type: string, format: uuid }
+                  shortCode:
+                    type: string
+                    description: 6 位数字(含前导零);用户在浏览器输入或扫码
+                  expiresAt: { type: string, format: date-time }
+        "401":
+          description: challenge 格式无效(AUTH_REQUIRED,details.reason=INVALID_CHALLENGE)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: 来源限速(RATE_LIMITED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/bridge/pairing/claim:
+    post:
+      operationId: bridgePairingClaim
+      tags: [bridge-device]
+      summary: Bridge 轮询领取设备凭据(单次交付)
+      description: |
+        Bridge 持 challengeId + challenge 明文轮询。未批准:200
+        `{status:"pending"}`;已批准且未发放:事务内生成 device_id 与高熵
+        device_credential(库内只存摘要),200 `{status:"ready", deviceId,
+        deviceCredential}`(明文仅此一次,随后 Bridge 写入 Keychain 并以
+        `Authorization: Bearer <deviceCredential>` 连接 /agent-console/bridge/ws)。
+        凭据已被领取 → 409(details.reason=CONSUMED);过期 → 410(EXPIRED)。
+        claim 亦按来源限速(防暴力)。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challengeId, challenge]
+              properties:
+                challengeId: { type: string, format: uuid }
+                challenge: { type: string, description: register 时提交的同一 challenge 明文 }
+      responses:
+        "200":
+          description: 轮询结果(pending 或单次交付 ready)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [status]
+                    properties:
+                      status: { type: string, const: pending }
+                  - type: object
+                    required: [status, deviceId, deviceCredential]
+                    properties:
+                      status: { type: string, const: ready }
+                      deviceId: { type: string, format: uuid }
+                      deviceCredential:
+                        type: string
+                        description: 高熵凭据明文;仅此一次,Bridge 立即写入 macOS Keychain
+        "401":
+          description: challenge 不匹配(AUTH_REQUIRED,details.reason=CHALLENGE_MISMATCH)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: 配对请求不存在(SESSION_NOT_FOUND,details.reason=NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: 凭据已被领取(单次交付;DUPLICATE_REQUEST_MISMATCH,details.reason=CONSUMED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "410":
+          description: 配对请求已过期(APPROVAL_EXPIRED,details.reason=EXPIRED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: 来源限速(RATE_LIMITED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 设备面:Bridge WSS(公网网关可达;Bearer 设备凭据)
+  # ---------------------------------------------------------------------------
+  /agent-console/bridge/ws:
+    get:
+      operationId: bridgeWebSocket
+      tags: [bridge-device]
+      summary: Bridge WebSocket 长连接(命令/事件/快照;非 JSON API)
+      description: |
+        WebSocket 升级端点(协议细节见本文 x-websocket-and-data-plane 的
+        bridge-ws 段)。鉴权:`Authorization: Bearer <deviceCredential>`;
+        Relay 以 SHA-256 摘要查库 + 常量时间比较,不要求浏览器 Cookie,
+        网关不做 forward-auth。撤销设备立即关闭 socket(close reason
+        DEVICE_REVOKED)。首条 ClientHello(client_kind=CLIENT_BRIDGE)
+        协商协议版本。
+      security:
+        - deviceCredential: []
+      responses:
+        "101":
+          description: 切换为 WebSocket 协议
+        "401":
+          description: 设备凭据缺失/无效(AUTH_REQUIRED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 设备面:文件数据面 producer/consumer(§22;公网网关可达,无 Cookie)
+  # ---------------------------------------------------------------------------
+  /agent-console/transfers/producer/{transferId}:
+    post:
+      operationId: transferProducer
+      tags: [bridge-device]
+      summary: Bridge 出站:推送文件字节流给浏览器(非 JSON API)
+      description: |
+        preview/download 时由 Bridge 主动 POST 文件正文;Relay 经内存有界
+        channel 直接 pipe 给浏览器,不落盘。鉴权 = Bearer 设备凭据 +
+        `X-Transfer-Token` 头 + 方向/目标设备校验(无浏览器 Cookie,网关
+        流式转发不缓冲)。元数据经 `X-Transfer-Content-Type` /
+        `X-Transfer-Disposition` / `X-Transfer-Content-Range` /
+        `X-Transfer-Total-Length` 头携带。
+      security:
+        - deviceCredential: []
+      parameters:
+        - name: transferId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: 正文已接收并 pipe 给浏览器
+        "4xx":
+          description: transfer 不存在/过期/取消或凭据、token、方向校验失败
+            (统一错误对象;稳定码如 TRANSFER_EXPIRED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/transfers/consumer/{transferId}:
+    get:
+      operationId: transferConsumer
+      tags: [bridge-device]
+      summary: Bridge 出站:接收浏览器上传字节流(非 JSON API)
+      description: |
+        上传第二步时由 Bridge 主动 GET 拉取上传正文;Relay 将浏览器 PUT 的
+        流式请求体经内存 channel 直接 pipe 给 Bridge,不落盘。
+        鉴权同 producer(Bearer 设备凭据 + X-Transfer-Token + 方向/目标校验)。
+      security:
+        - deviceCredential: []
+      parameters:
+        - name: transferId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 上传字节流(application/octet-stream)
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "4xx":
+          description: transfer 不存在/过期/取消或凭据、token、方向校验失败
+            (统一错误对象;稳定码如 TRANSFER_EXPIRED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 浏览器面:Browser WSS(ticket 认证;公网网关可达,无 forward-auth)
+  # ---------------------------------------------------------------------------
+  /agent-console/ws:
+    get:
+      operationId: browserWebSocket
+      tags: [browser]
+      summary: 浏览器 WebSocket 长连接(订阅/命令;非 JSON API)
+      description: |
+        WebSocket 升级端点(协议细节见 x-websocket-and-data-plane 的 browser-ws
+        段)。一次性 ticket 经 `Sec-WebSocket-Protocol` 携带(不进 URL):
+        客户端同时提供 `agent-console.v1` 与
+        `agent-console.ticket-<Base64URL(ticket)>` 两个子协议;Relay 升级前调
+        dev-toolbox /internal/agent-console/ws-tickets/consume 原子消费,
+        拒绝时以 HTTP 401 + WS_TICKET_INVALID / EXPIRED / CONSUMED 失败。
+        网关不做 forward-auth,只剥离 Cookie 与伪造身份头。
+      security:
+        - wsTicket: []
+      responses:
+        "101":
+          description: 切换为 WebSocket 协议
+        "401":
+          description: ticket 无效/过期/已消费(WS_TICKET_INVALID / WS_TICKET_EXPIRED / WS_TICKET_CONSUMED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 浏览器面:设备管理(§27.2;真实路径 /agent-console/api/*)
+  # ---------------------------------------------------------------------------
+  /agent-console/api/devices:
+    get:
+      operationId: listDevices
+      tags: [browser]
+      summary: 列出当前用户的设备
+      responses:
+        "200":
+          description: 设备列表(按配对时间升序)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [devices]
+                properties:
+                  devices:
+                    type: array
+                    items: { $ref: "#/components/schemas/Device" }
+        "401":
+          description: 缺少有效网关身份(AUTH_REQUIRED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/devices/{id}:
+    patch:
+      operationId: patchDevice
+      tags: [browser]
+      summary: 重命名设备 / 更新隐私开关(是否隐藏任务标题)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                displayName:
+                  type: string
+                  maxLength: 128
+                  description: 空/超长值被忽略(不更新)
+                privacyHideTitles: { type: boolean }
+      responses:
+        "200":
+          description: 已更新
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, displayName, privacyHideTitles]
+                properties:
+                  id: { type: string, format: uuid }
+                  displayName: { type: string }
+                  privacyHideTitles: { type: boolean }
+        "404":
+          description: 设备不存在(以 SESSION_NOT_FOUND 承载;无独立 DEVICE_NOT_FOUND 码)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      operationId: revokeDevice
+      tags: [browser]
+      summary: 撤销设备(立即关闭其 Bridge socket,后续凭据认证失败)
+      responses:
+        "204":
+          description: 已撤销
+        "404":
+          description: 设备不存在(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 浏览器面:设备配对 v2 浏览器侧(§21;Bridge 已先行 register)
+  # ---------------------------------------------------------------------------
+  /agent-console/api/pairing/lookup:
+    post:
+      operationId: pairingLookup
+      tags: [browser]
+      summary: 按短码查询配对请求(设备信息确认用)
+      description: |
+        配对深链 `{origin}/agent-console/pair?code=<shortCode>` 的页面即以此
+        接口取设备信息。找不到/过期/取消/已批准 → 404(details.reason =
+        NOT_FOUND / EXPIRED / CANCELLED / ALREADY_APPROVED);
+        短码尝试超限锁定 → 429(details.reason=LOCKED);来源限速 → 429
+        (details.reason=RATE_LIMITED)。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [shortCode]
+              properties:
+                shortCode: { type: string, description: Bridge CLI 展示的 6 位短码 }
+      responses:
+        "200":
+          description: 配对请求有效,回显设备信息供确认
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [challengeId, expiresAt]
+                properties:
+                  challengeId: { type: string, format: uuid }
+                  deviceName: { type: [string, "null"] }
+                  platform: { type: [string, "null"] }
+                  arch: { type: [string, "null"] }
+                  bridgeVersion: { type: [string, "null"] }
+                  expiresAt: { type: string, format: date-time }
+        "401":
+          description: 缺少有效网关身份(AUTH_REQUIRED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: 短码无效/已过期/已取消/已批准(SESSION_NOT_FOUND;原因见 details.reason)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: 来源限速或短码尝试锁定(RATE_LIMITED;details.reason=RATE_LIMITED/LOCKED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/pairing/approve:
+    post:
+      operationId: pairingApprove
+      tags: [browser]
+      summary: 批准配对(单赢家;owner 在批准时回填)
+      description: |
+        并发批准只有一个成功(原子 UPDATE ... RETURNING)。批准后 Bridge 经
+        claim 单次领取凭据;本响应不包含凭据。建议携带 lookup 返回的
+        challengeId:短码输错可归因计数,每 challenge 超上限即锁定。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [shortCode]
+              properties:
+                shortCode: { type: string }
+                challengeId:
+                  type: string
+                  format: uuid
+                  description: lookup 返回的挑战 ID(可选;用于短码错误归因计数)
+      responses:
+        "200":
+          description: 已批准;Bridge 将领取凭据
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [challengeId, approvedAt]
+                properties:
+                  challengeId: { type: string, format: uuid }
+                  approvedAt: { type: string, format: date-time }
+        "401":
+          description: 短码不正确(AUTH_REQUIRED,details.reason=CODE_MISMATCH)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: 短码无效/已取消(SESSION_NOT_FOUND,details.reason=NOT_FOUND/CANCELLED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: 已被批准(并发单赢家;DUPLICATE_REQUEST_MISMATCH,details.reason=ALREADY_APPROVED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "410":
+          description: 配对请求已过期(APPROVAL_EXPIRED,details.reason=EXPIRED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: 来源限速或短码尝试锁定(RATE_LIMITED;details.reason=RATE_LIMITED/LOCKED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/pairing/challenges:
+    get:
+      operationId: listPairingChallenges
+      tags: [browser]
+      summary: 列出本用户已批准但 Bridge 尚未领取的配对挑战(最多 20 条)
+      description: |
+        v2(Bridge 发起)语义:owner 在浏览器批准时回填,故列表内容为
+        approved_at 非空、未取消、凭据未领取且未过期的挑战(Bridge 端
+        pending claim / 已批准待领取)。短码本身不出现在此响应。
+      responses:
+        "200":
+          description: 挑战列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [challenges]
+                properties:
+                  challenges:
+                    type: array
+                    items: { $ref: "#/components/schemas/PairingChallenge" }
+        "401":
+          description: 缺少有效网关身份
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/pairing/challenges/{challengeId}:
+    delete:
+      operationId: cancelPairingChallenge
+      tags: [browser]
+      summary: 取消配对挑战(标记 consumed,Bridge claim 将失败)
+      parameters:
+        - name: challengeId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204":
+          description: 已取消
+        "404":
+          description: 配对请求不存在或不属于当前用户(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 浏览器面:会话列表与偏好(§11/§27.2/§27.5)
+  # ---------------------------------------------------------------------------
+  /agent-console/api/sessions:
+    get:
+      operationId: listSessions
+      tags: [browser]
+      summary: SessionSummary 分页(默认 50、最大 200;稳定 keyset cursor)
+      description: |
+        数据来自 Relay PostgreSQL(唯一允许从库返回的会话数据)。
+        `archived` 缺省时返回未归档会话;`cursor` 来自上一页 `nextCursor`。
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: 不透明 keyset cursor
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+        - name: archived
+          in: query
+          schema: { type: boolean }
+      responses:
+        "200":
+          description: 会话摘要页
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions, nextCursor]
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/SessionSummary" }
+                  nextCursor:
+                    type: [string, "null"]
+                    description: null 表示已到末尾
+        "401":
+          description: 缺少有效网关身份
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/sessions/{id}:
+    patch:
+      operationId: patchSessionPrefs
+      tags: [browser]
+      summary: 置顶 / 静音 / 归档(Relay 自身偏好,不写回 Codex)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pinned: { type: boolean }
+                muted: { type: boolean }
+                archived: { type: boolean }
+      responses:
+        "204":
+          description: 已更新
+        "404":
+          description: 会话不存在或不属于当前用户(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 浏览器面:在线查询(§27.3;全部转发到在线 Bridge,离线返回 DEVICE_OFFLINE)
+  # ---------------------------------------------------------------------------
+  /agent-console/api/sessions/{id}/runtime:
+    get:
+      operationId: getSessionRuntime
+      tags: [browser]
+      summary: RuntimeSnapshot(在线 Bridge 提供)
+      description: |
+        形状由 apps/relay/src/sessions/json.rs 的 runtime_snapshot_json() 决定
+        (camelCase,与 Protobuf JSON 映射一致)。设备离线/查询失败时返回稳定
+        错误(DEVICE_OFFLINE 等),不返回服务器陈旧正文。
+      responses:
+        "200":
+          description: 运行快照
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runtimeSnapshot]
+                properties:
+                  runtimeSnapshot: { $ref: "#/components/schemas/RuntimeSnapshot" }
+        "404":
+          description: 会话不存在(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: 设备离线或 Bridge 未返回(DEVICE_OFFLINE / CODEX_UNAVAILABLE)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/sessions/{id}/history:
+    get:
+      operationId: getSessionHistory
+      tags: [browser]
+      summary: HistoryPage 分页(默认从最新向前读取;单页上限 200)
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: pageSize
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: 历史页
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [historyPage]
+                properties:
+                  historyPage: { $ref: "#/components/schemas/HistoryPage" }
+        "404":
+          description: 会话不存在(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: 设备离线(DEVICE_OFFLINE)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/sessions/{id}/output:
+    get:
+      operationId: getCommandOutputPage
+      tags: [browser]
+      summary: 完整 command output 分页(单页最大 256 KiB;bytes 为标准 Base64)
+      parameters:
+        - name: itemId
+          in: query
+          required: true
+          schema: { type: string }
+          description: 输出 item 的稳定 ID
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: pageSize
+          in: query
+          schema: { type: integer }
+      responses:
+        "200":
+          description: 输出页
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [commandOutputPage]
+                properties:
+                  commandOutputPage: { $ref: "#/components/schemas/CommandOutputPage" }
+        "404":
+          description: 会话不存在(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: 设备离线(DEVICE_OFFLINE)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/sessions/{id}/git:
+    get:
+      operationId: getSessionGitSummary
+      tags: [browser]
+      summary: Git 只读摘要(仅 session cwd 所属已授权 worktree)
+      responses:
+        "200":
+          description: Git 摘要
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [gitSummary]
+                properties:
+                  gitSummary: { $ref: "#/components/schemas/GitSummary" }
+        "404":
+          description: 会话不存在(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: 设备离线(DEVICE_OFFLINE)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/sessions/{id}/git/diff:
+    get:
+      operationId: getSessionGitDiff
+      tags: [browser]
+      summary: 单文件 staged/unstaged Diff(单响应最大 2 MiB,超限 truncated=true)
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+          description: 相对仓库根路径
+        - name: staged
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: 单文件 Diff
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [gitFileDiff]
+                properties:
+                  gitFileDiff: { $ref: "#/components/schemas/GitFileDiff" }
+        "404":
+          description: 会话不存在(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: 设备离线(DEVICE_OFFLINE)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/sessions/{id}/files/metadata:
+    get:
+      operationId: getFileMetadata
+      tags: [browser]
+      summary: 按 file_handle 读取文件元数据(Browser 不提交本机路径)
+      parameters:
+        - name: handle
+          in: query
+          required: true
+          schema: { type: string }
+          description: Bridge 签发的高熵 file handle
+      responses:
+        "200":
+          description: 文件元数据
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [fileMetadata]
+                properties:
+                  fileMetadata: { $ref: "#/components/schemas/FileMetadata" }
+        "404":
+          description: 会话不存在(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: 设备离线(DEVICE_OFFLINE)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 浏览器面:命令回执查询(§15.2)
+  # ---------------------------------------------------------------------------
+  /agent-console/api/sessions/{id}/requests:
+    get:
+      operationId: listSessionRequests
+      tags: [browser]
+      summary: 会话命令回执列表(或按 requestId 查单条)
+      parameters:
+        - name: requestId
+          in: query
+          schema: { type: string }
+          description: 提供时返回单条回执对象(非数组)
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+      responses:
+        "200":
+          description: |
+            默认 `{receipts:[...]}`;带 `requestId` 时直接返回单个回执对象。
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [receipts]
+                    properties:
+                      receipts:
+                        type: array
+                        items: { $ref: "#/components/schemas/Receipt" }
+                  - $ref: "#/components/schemas/Receipt"
+        "404":
+          description: 会话或回执不存在(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/requests/{requestId}:
+    get:
+      operationId: getRequestReceipt
+      tags: [browser]
+      summary: 单条命令回执
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 回执对象
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Receipt" }
+        "404":
+          description: 回执不存在(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 浏览器面:文件数据面 Browser 端点(§22.3-§22.5)
+  # ---------------------------------------------------------------------------
+  /agent-console/api/sessions/{id}/files/preview:
+    post:
+      operationId: previewFile
+      tags: [browser]
+      summary: 内联预览文件(流式;不落盘)
+      description: |
+        正文经 Relay 内存有界 channel 直接 pipe 给浏览器。响应头由 Bridge
+        producer 元数据透传:`X-Content-Type-Options: nosniff`、
+        `Content-Security-Policy: default-src 'none'`、
+        `Cache-Control: private, no-store`、正确 Content-Disposition。
+        带 Range 时返回 206 + Content-Range。HTML/SVG 按源码文本返回,
+        不作为活动页面执行。取消方式:直接 abort 请求(三端联动取消)。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FileRequest" }
+      responses:
+        "200":
+          description: 文件字节流
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "206":
+          description: Range 命中(Partial Content)
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "400":
+          description: 请求体/Range 无效或缺少 file handle(INTERNAL_ERROR / TRANSFER_RANGE_INVALID / FILE_HANDLE_INVALID)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: 设备离线(DEVICE_OFFLINE)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "504":
+          description: 等待设备响应超时(TRANSFER_EXPIRED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/sessions/{id}/files/download:
+    post:
+      operationId: downloadFile
+      tags: [browser]
+      summary: 下载文件(attachment;支持单 Range)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FileRequest" }
+      responses:
+        "200":
+          description: "文件字节流(Content-Disposition: attachment)"
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "206":
+          description: Range 命中
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "400":
+          description: 请求体/Range 无效
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: 设备离线
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "504":
+          description: 等待设备响应超时
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/sessions/{id}/files/upload:
+    post:
+      operationId: declareUpload
+      tags: [browser]
+      summary: 上传第一步:声明文件名/MIME/长度,领取 transfer
+      description: |
+        单文件上限 20 MiB(TRANSFER_TOO_LARGE,413)。每 browser / 每 device
+        并发各 2 条(超限 RATE_LIMITED)。Bridge 拒绝时 transfer 被取消,
+        后续 PUT 以稳定错误码失败。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fileName, length]
+              properties:
+                fileName: { type: string, maxLength: 128 }
+                mime: { type: string, default: application/octet-stream }
+                length: { type: integer, format: int64, maximum: 20971520 }
+      responses:
+        "201":
+          description: transfer 已创建并通知 Bridge
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transferId, uploadUrl]
+                properties:
+                  transferId: { type: string }
+                  uploadUrl:
+                    type: string
+                    description: 第二步 PUT 的相对地址(/agent-console/api/sessions/{id}/files/upload/{transferId})
+        "404":
+          description: 会话不存在(SESSION_NOT_FOUND)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413":
+          description: 文件超过上传上限(TRANSFER_TOO_LARGE)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: 并发 transfer 超限(RATE_LIMITED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: 设备离线
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/sessions/{id}/files/upload/{transferId}:
+    put:
+      operationId: streamUpload
+      tags: [browser]
+      summary: 上传第二步:流式传输正文
+      description: |
+        请求体即文件字节流。Bridge 校验实际大小与 MIME 后写入私有临时目录,
+        成功后签发只属于当前 session/turn 的 upload handle;transfer TTL 10 分钟。
+        取消方式:abort 该请求(三端联动)。
+      parameters:
+        - name: transferId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: 上传终态(outcome 透传 Bridge 结果)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transferId, outcome, errorCode, uploadFileHandle]
+                properties:
+                  transferId: { type: string }
+                  outcome:
+                    type: string
+                    enum: [TRANSFER_OUTCOME_COMPLETED, TRANSFER_OUTCOME_CANCELLED, TRANSFER_OUTCOME_FAILED, TRANSFER_OUTCOME_UNSPECIFIED]
+                  errorCode:
+                    type: [string, "null"]
+                    description: 失败/取消时的稳定错误码名;成功为 null
+                  uploadFileHandle:
+                    type: [string, "null"]
+                    description: 成功时由 Bridge 签发、仅绑定当前 session/turn 的 upload handle
+        "404":
+          description: transfer 不存在或已过期(TRANSFER_EXPIRED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413":
+          description: 实际字节超过声明上限(TRANSFER_TOO_LARGE)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "504":
+          description: 设备未就绪/未回传结果(TRANSFER_EXPIRED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 浏览器面:Web Push(§24)
+  # ---------------------------------------------------------------------------
+  /agent-console/api/push/subscriptions:
+    post:
+      operationId: createPushSubscription
+      tags: [browser]
+      summary: 注册/更新 Push 订阅(同 owner+endpoint 幂等覆盖)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PushSubscriptionInput" }
+      responses:
+        "201":
+          description: 已保存
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id: { type: string, format: uuid }
+        "400":
+          description: 订阅参数无效(INTERNAL_ERROR 承载参数校验失败)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    get:
+      operationId: listPushSubscriptions
+      tags: [browser]
+      summary: 列出当前用户 Push 订阅
+      responses:
+        "200":
+          description: 订阅列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [subscriptions]
+                properties:
+                  subscriptions:
+                    type: array
+                    items: { $ref: "#/components/schemas/PushSubscription" }
+
+  /agent-console/api/push/subscriptions/{id}:
+    put:
+      operationId: updatePushSubscription
+      tags: [browser]
+      summary: 更新订阅密钥(并清除失效标记)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PushSubscriptionInput" }
+      responses:
+        "204":
+          description: 已更新
+        "404":
+          description: 订阅不存在(SESSION_NOT_FOUND 承载)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      operationId: deletePushSubscription
+      tags: [browser]
+      summary: 删除订阅
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204":
+          description: 已删除
+        "404":
+          description: 订阅不存在(SESSION_NOT_FOUND 承载)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /agent-console/api/push/settings:
+    get:
+      operationId: getPushSettings
+      tags: [browser]
+      summary: 读取通知设置(默认:全部事件开、不显示 title)
+      responses:
+        "200":
+          description: 当前设置
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PushSettings" }
+    put:
+      operationId: updatePushSettings
+      tags: [browser]
+      summary: 更新通知设置(部分字段省略时保持当前值)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                showTitle: { type: boolean }
+                events:
+                  type: object
+                  properties:
+                    turnCompleted: { type: boolean }
+                    turnFailed: { type: boolean }
+                    turnInterrupted: { type: boolean }
+                    waitingQuestion: { type: boolean }
+                    waitingApproval: { type: boolean }
+      responses:
+        "200":
+          description: 更新后的完整设置
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PushSettings" }
+
+  # ---------------------------------------------------------------------------
+  # Relay 浏览器面:审计(§18.7/§27.2)
+  # ---------------------------------------------------------------------------
+  /agent-console/api/audit:
+    get:
+      operationId: listAuditEvents
+      tags: [browser]
+      summary: 审计事件分页(keyset cursor,默认 50、最大 200;仅元数据)
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+      responses:
+        "200":
+          description: 审计事件页(按 created_at 倒序;不含标题/路径/正文)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events, nextCursor]
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuditEvent" }
+                  nextCursor:
+                    type: [string, "null"]
+        "400":
+          description: cursor 无效(以 INTERNAL_ERROR 承载参数校验失败)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ---------------------------------------------------------------------------
+  # 运维
+  # ---------------------------------------------------------------------------
+  /health:
+    get:
+      operationId: health
+      tags: [ops]
+      summary: Relay 存活探针
+      security: []
+      responses:
+        "200":
+          description: 恒为纯文本 ok
+          content:
+            text/plain:
+              schema: { type: string, enum: [ok] }
+
+# =============================================================================
+# WebSocket 协议细节(browser-ws / bridge-ws 为真实 path item 的补充说明;
+# output-gap 等 WS 事件无独立 HTTP 形状)
+# =============================================================================
+x-websocket-and-data-plane:
+  browser-ws:
+    path: /agent-console/ws (WSS)
+    auth: |
+      一次性 ticket 经 Sec-WebSocket-Protocol 携带,不进 URL:
+      客户端同时提供两个子协议 `agent-console.v1` 与
+      `agent-console.ticket-<Base64URL(ticket)>`;Relay 只回显固定协议名,
+      不在日志记录完整 header。升级前 Relay 调 dev-toolbox
+      /internal/agent-console/ws-tickets/consume 原子消费 ticket;
+      拒绝时以对应稳定码返回 HTTP 错误(WS_TICKET_INVALID / EXPIRED / CONSUMED)。
+    hello: |
+      二进制 Protobuf Envelope(agent_console.v1,protocol_version=1)。
+      首条必须是 ClientHello(client_kind=CLIENT_BROWSER),10 秒超时;
+      版本不匹配 → ProtocolError(INTERNAL_ERROR)+ close 1002
+      PROTOCOL_VERSION_MISMATCH。服务端回 ServerHello
+      (capabilities=["list","session","query","command"])。
+    sequence: |
+      Subscribe(list 或 session)→ Subscribed(stream_id/stream_epoch/base_sequence)
+      → RuntimeSnapshot 或 SessionSummaryBatch(snapshot=true)→ EventBatch(按 sequence)
+      → Ack(stream_id, sequence)。缺口窗口内补发;超出窗口 / epoch 变化 /
+      Relay 重启 → ResyncRequired(stream_id, reason_code=RESYNC_REQUIRED),
+      Browser 重新 Subscribe。本地状态可疑时 Browser 可发 ResyncRequest。
+      重复 sequence 幂等忽略;业务幂等由 CommandRequest.request_id 承担。
+    commands: |
+      CommandRequest(request_id 必填,UUID;operation 见 Operation 枚举;
+      expected_turn_id / expected_runtime_revision / payload_digest 按 §15.1)。
+      回执:CommandAccepted(status=RECEIVED→ACCEPTED_BY_BRIDGE→…);
+      CommandResult 终态 COMPLETED / REJECTED(附稳定码)/ OUTCOME_UNKNOWN。
+      Browser 只有收到 ACCEPTED_BY_BRIDGE 才能显示"已发送/已排队"。
+    close-reasons: |
+      auth 失效类关闭用 close code 1008 + 稳定 reason(如 AUTH_EXPIRED、
+      DEVICE_REVOKED);auth 后端不可达宽限 2 分钟结束同样以 AUTH_EXPIRED 关闭。
+    heartbeat: 15 秒;Relay 对 Heartbeat 回 HeartbeatAck;约 45 秒无心跳判定离线。
+  bridge-ws:
+    path: /agent-console/bridge/ws (WSS;公网经网关可达)
+    auth: "Authorization: Bearer <deviceCredential>(SHA-256 摘要查库 + 常量时间比较;
+      不要求浏览器 Cookie,网关无 forward-auth);
+      撤销设备立即关闭 socket(DEVICE_REVOKED)。首条 ClientHello
+      (client_kind=CLIENT_BRIDGE)协商协议版本。"
+  transfers-data-plane:
+    producer: POST /agent-console/transfers/producer/{transferId}
+      (Bridge 出站调用;请求体=文件字节流。鉴权 = Bearer 设备凭据 +
+      X-Transfer-Token 头 + 方向/目标设备校验;元数据经 X-Transfer-Content-Type /
+      X-Transfer-Disposition / X-Transfer-Content-Range / X-Transfer-Total-Length 头)。
+    consumer: GET /agent-console/transfers/consumer/{transferId}
+      (Bridge 出站调用;响应体=上传字节流;鉴权同上)。
+    note: 两端点公网经网关可达但不做浏览器会话鉴权;网关不落盘、不缓冲;
+      任一端取消/超时,三端立即取消(§22.4 第 6 步)。
+
+# =============================================================================
+# Components
+# =============================================================================
+components:
+  securitySchemes:
+    gatewayIdentity:
+      type: apiKey
+      in: header
+      name: X-Agent-Console-Session-Id
+      description: |
+        由网关 forward-auth 注入的受信身份头组:
+        X-Agent-Console-Session-Id / X-Agent-Console-Owner-Id
+        (X-Agent-Console-Session-Expires 可选;缺失时 Relay 跳过本地预过期
+        检查,过期拦截由 verify 与 WS introspection 负责)。浏览器不得自行伪造:
+        网关会先删除客户端提交的同名头再注入;非可信网段携带这些头一律视为未认证。
+    toolboxSessionCookie:
+      type: apiKey
+      in: cookie
+      name: dev-toolbox session cookie
+      description: 现有 dev-toolbox session-only Cookie + Origin + CSRF。
+    internalToken:
+      type: http
+      scheme: bearer
+      description: AGENT_CONSOLE_INTERNAL_TOKEN(与 dev-toolbox 侧同值;≥32 字符)。
+    deviceCredential:
+      type: http
+      scheme: bearer
+      description: 设备凭据(配对 claim 单次交付后存于 macOS Keychain;Relay 只存摘要)。
+    wsTicket:
+      type: apiKey
+      in: header
+      name: Sec-WebSocket-Protocol
+      description: 一次性 ticket 经子协议 `agent-console.ticket-<Base64URL(ticket)>` 携带,不进 URL。
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId, details]
+          properties:
+            code:
+              type: string
+              description: 稳定错误码名(与 proto StableErrorCode 同集合,见 contracts/error-codes.md)
+              example: DEVICE_OFFLINE
+            message:
+              type: string
+              description: 面向用户的简体中文说明;前端不得依赖自由文本判断流程
+            requestId:
+              type: string
+              description: Relay 生成的 UUID
+            details:
+              type: object
+              additionalProperties: true
+              description: 配对端点额外携带 details.reason(NOT_FOUND/EXPIRED/CANCELLED/
+                ALREADY_APPROVED/CONSUMED/LOCKED/CODE_MISMATCH/CHALLENGE_MISMATCH 等),
+                供 CLI/前端判定流程;其余端点通常为空对象
+
+    Device:
+      type: object
+      required: [id, displayName, platform, arch, bridgeVersion, connection, pairedAt, revoked, compatibilityState, controlMode, privacyHideTitles]
+      properties:
+        id: { type: string, format: uuid }
+        displayName: { type: string }
+        platform: { type: string }
+        arch: { type: string }
+        bridgeVersion: { type: string }
+        connection:
+          type: string
+          enum: [CONNECTION_ONLINE, CONNECTION_OFFLINE]
+          description: 由 Relay Hub 实时在线状态推导(非持久枚举全集)
+        lastSeenAt: { type: [string, "null"], format: date-time }
+        pairedAt: { type: string, format: date-time }
+        revoked: { type: boolean }
+        compatibilityState:
+          type: string
+          enum: [COMPATIBILITY_VERIFIED, COMPATIBILITY_DEGRADED, COMPATIBILITY_UNSUPPORTED, COMPATIBILITY_STATE_UNSPECIFIED]
+        controlMode:
+          type: string
+          enum: [CONTROL_MODE_FULL_CONTROL, CONTROL_MODE_LIMITED_CONTROL, CONTROL_MODE_READ_ONLY, CONTROL_MODE_UNAVAILABLE, CONTROL_MODE_UNSPECIFIED]
+        privacyHideTitles: { type: boolean }
+
+    PairingChallenge:
+      type: object
+      description: 配对 v2 浏览器侧挑战视图(已批准、Bridge 尚未领取)
+      required: [challengeId, expiresAt]
+      properties:
+        challengeId: { type: string, format: uuid }
+        deviceName: { type: [string, "null"] }
+        platform: { type: [string, "null"] }
+        arch: { type: [string, "null"] }
+        bridgeVersion: { type: [string, "null"] }
+        expiresAt: { type: string, format: date-time }
+        approvedAt: { type: [string, "null"], format: date-time }
+
+    SessionSummary:
+      type: object
+      description: 多维状态摘要(§10;禁止合并成单一状态枚举)
+      required: [id, deviceId, agentKind, nativeSessionId, title, projectDisplayName, currentBranch, deviceConnection, degradedReason, controlMode, compatibilityState, activeTurnPhase, pendingAttentionCount, pendingAttentionKinds, queueState, lastTurnOutcome, lastUpdatedAt, pinned, muted, archived]
+      properties:
+        id: { type: string, format: uuid, description: Relay 内部 session UUID(deep link 用) }
+        deviceId: { type: string, format: uuid }
+        agentKind: { type: string, enum: [CODEX_DESKTOP] }
+        nativeSessionId: { type: string, description: Codex 原生 session/thread ID }
+        title:
+          type: string
+          description: 设备隐私模式开启时为空字符串
+        projectDisplayName:
+          type: string
+          description: 工作区显示名,非本机绝对路径;隐私模式时为空
+        currentBranch: { type: string }
+        deviceConnection:
+          type: string
+          enum: [CONNECTION_CONNECTING, CONNECTION_ONLINE, CONNECTION_DEGRADED, CONNECTION_OFFLINE, DEVICE_CONNECTION_UNSPECIFIED]
+        deviceLastSeenAt: { type: [string, "null"], format: date-time }
+        degradedReason: { type: string, description: DEGRADED 原因;OFFLINE 时为空(不猜测) }
+        controlMode:
+          type: string
+          enum: [CONTROL_MODE_FULL_CONTROL, CONTROL_MODE_LIMITED_CONTROL, CONTROL_MODE_READ_ONLY, CONTROL_MODE_UNAVAILABLE, CONTROL_MODE_UNSPECIFIED]
+        compatibilityState:
+          type: string
+          enum: [COMPATIBILITY_VERIFIED, COMPATIBILITY_DEGRADED, COMPATIBILITY_UNSUPPORTED, COMPATIBILITY_STATE_UNSPECIFIED]
+        activeTurnPhase:
+          type: string
+          enum: [TURN_PHASE_IDLE, TURN_PHASE_RUNNING, TURN_PHASE_FINISHING, ACTIVE_TURN_PHASE_UNSPECIFIED]
+        pendingAttentionCount: { type: integer, description: 问题 + 审批总数 }
+        pendingAttentionKinds:
+          type: array
+          items:
+            type: string
+            enum: [ATTENTION_USER_QUESTION, ATTENTION_RISK_APPROVAL, PENDING_ATTENTION_KIND_UNSPECIFIED]
+        queueState:
+          type: string
+          enum: [QUEUE_STATE_EMPTY, QUEUE_STATE_QUEUED, QUEUE_STATE_PAUSED, QUEUE_STATE_UNSPECIFIED]
+        lastTurnOutcome:
+          type: string
+          enum: [TURN_OUTCOME_COMPLETED, TURN_OUTCOME_FAILED, TURN_OUTCOME_INTERRUPTED, TURN_OUTCOME_UNKNOWN, LAST_TURN_OUTCOME_UNSPECIFIED]
+          description: 只描述上一轮,不把任务永久标成失败
+        lastUpdatedAt: { type: string, format: date-time }
+        pinned: { type: boolean }
+        muted: { type: boolean }
+        archived: { type: boolean }
+
+    RuntimeSnapshot:
+      type: object
+      description: 形状 = sessions/json.rs runtime_snapshot_json()(camelCase)
+      required: [runtimeRevision, pendingQuestions, pendingApprovals, runningCommands, backgroundCommands, backgroundCommandCount, recentOutputCursors]
+      properties:
+        runtimeRevision: { type: integer, format: int64, description: 写命令 expected_runtime_revision 与之比较 }
+        currentTurn:
+          type: [object, "null"]
+          properties:
+            turn:
+              type: [object, "null"]
+              properties:
+                id: { type: string }
+                synthetic: { type: boolean }
+            phase:
+              type: string
+              enum: [TURN_PHASE_IDLE, TURN_PHASE_RUNNING, TURN_PHASE_FINISHING, ACTIVE_TURN_PHASE_UNSPECIFIED]
+            startedAt: { type: [string, "null"], format: date-time }
+        plan:
+          type: [object, "null"]
+          properties:
+            steps:
+              type: array
+              items:
+                type: object
+                required: [stepId, title, status]
+                properties:
+                  stepId: { type: string }
+                  title: { type: string }
+                  status:
+                    type: string
+                    enum: [PLAN_STEP_PENDING, PLAN_STEP_IN_PROGRESS, PLAN_STEP_COMPLETED, PLAN_STEP_STATUS_UNSPECIFIED]
+        pendingQuestions:
+          type: array
+          items: { $ref: "#/components/schemas/PendingQuestion" }
+        pendingApprovals:
+          type: array
+          items: { $ref: "#/components/schemas/PendingApproval" }
+        runningCommands:
+          type: array
+          items:
+            type: object
+            required: [commandId]
+            properties:
+              commandId: { type: string }
+              itemId:
+                type: [object, "null"]
+                properties:
+                  id: { type: string }
+                  synthetic: { type: boolean }
+              startedAt: { type: [string, "null"], format: date-time }
+        backgroundCommands:
+          type: array
+          items:
+            type: object
+            required: [commandId, state]
+            properties:
+              commandId: { type: string }
+              itemId:
+                type: [object, "null"]
+                properties:
+                  id: { type: string }
+                  synthetic: { type: boolean }
+              state:
+                type: string
+                enum: [BACKGROUND_CMD_RUNNING, BACKGROUND_CMD_COMPLETED, BACKGROUND_CMD_FAILED, BACKGROUND_CMD_STOPPED, BACKGROUND_CMD_UNKNOWN, BACKGROUND_COMMAND_STATE_UNSPECIFIED]
+              startedAt: { type: [string, "null"], format: date-time }
+              finishedAt: { type: [string, "null"], format: date-time }
+        backgroundCommandCount: { type: integer }
+        queue:
+          type: [object, "null"]
+          description: 正文只存 Bridge SQLite;此对象不携带 prompt
+          properties:
+            state:
+              type: string
+              enum: [QUEUE_STATE_EMPTY, QUEUE_STATE_QUEUED, QUEUE_STATE_PAUSED, QUEUE_STATE_UNSPECIFIED]
+            afterTurnId:
+              type: [object, "null"]
+              properties:
+                id: { type: string }
+                synthetic: { type: boolean }
+            acceptedRuntimeRevision: { type: integer, format: int64 }
+        capabilities:
+          type: [object, "null"]
+          properties:
+            controlMode:
+              type: string
+              enum: [CONTROL_MODE_FULL_CONTROL, CONTROL_MODE_LIMITED_CONTROL, CONTROL_MODE_READ_ONLY, CONTROL_MODE_UNAVAILABLE, CONTROL_MODE_UNSPECIFIED]
+            compatibilityState:
+              type: string
+              enum: [COMPATIBILITY_VERIFIED, COMPATIBILITY_DEGRADED, COMPATIBILITY_UNSUPPORTED, COMPATIBILITY_STATE_UNSPECIFIED]
+            codexVersion: { type: string }
+            supportedOperations:
+              type: array
+              items:
+                type: string
+                enum:
+                  [OPERATION_CREATE_TASK, OPERATION_START_TURN, OPERATION_QUEUE_SET, OPERATION_QUEUE_REPLACE, OPERATION_QUEUE_CANCEL, OPERATION_STEER, OPERATION_INTERRUPT, OPERATION_ANSWER_QUESTION, OPERATION_ANSWER_APPROVAL, OPERATION_UPDATE_SETTINGS, OPERATION_RENAME_TASK, OPERATION_ARCHIVE_TASK, OPERATION_UNARCHIVE_TASK, OPERATION_FORK_TASK, OPERATION_STOP_BACKGROUND_COMMAND, OPERATION_STOP_ALL_BACKGROUND_COMMANDS, OPERATION_UNSPECIFIED]
+              description: 当前 capability probe 已验证的写操作;UI 控件显隐以此为准
+            settings:
+              type: array
+              items:
+                type: object
+                required: [optionId, kind, label, currentValue, availableValues, mutable]
+                properties:
+                  optionId: { type: string }
+                  kind:
+                    type: string
+                    enum: [SETTING_KIND_MODEL, SETTING_KIND_REASONING_EFFORT, SETTING_KIND_SERVICE_TIER, SETTING_KIND_PERMISSION_MODE, SETTING_KIND_COLLABORATION_MODE, SETTING_KIND_UNSPECIFIED]
+                  label: { type: string }
+                  currentValue: { type: string }
+                  availableValues:
+                    type: array
+                    items:
+                      type: object
+                      required: [value, label]
+                      properties:
+                        value: { type: string }
+                        label: { type: string }
+                  mutable: { type: boolean }
+            transferLimits:
+              type: [object, "null"]
+              properties:
+                textInlineMaxBytes: { type: integer, format: int64, example: 2097152 }
+                imageInlineMaxBytes: { type: integer, format: int64, example: 26214400 }
+                pdfRangeMaxBytes: { type: integer, format: int64, example: 104857600 }
+                downloadMaxBytes: { type: integer, format: int64, example: 536870912 }
+                uploadMaxBytes: { type: integer, format: int64, example: 20971520 }
+                maxConcurrentPerBrowser: { type: integer, example: 2 }
+                maxConcurrentPerDevice: { type: integer, example: 2 }
+                previewableMimePrefixes:
+                  type: array
+                  items: { type: string }
+        recentOutputCursors:
+          type: array
+          items:
+            type: object
+            required: [revision, byteLength, isFinal]
+            properties:
+              itemId:
+                type: [object, "null"]
+                properties:
+                  id: { type: string }
+                  synthetic: { type: boolean }
+              revision: { type: integer, format: int64 }
+              byteLength: { type: integer, format: int64 }
+              isFinal: { type: boolean }
+              channel:
+                type: string
+                enum: [OUTPUT_CHANNEL_STDOUT, OUTPUT_CHANNEL_STDERR, OUTPUT_CHANNEL_COMBINED, OUTPUT_CHANNEL_UNSPECIFIED]
+
+    PendingQuestion:
+      type: object
+      required: [questionId, title, description, options, allowMultiple, allowFreeText, valid]
+      properties:
+        questionId: { type: string, description: 原生 question ID;回答只允许按此 ID }
+        title: { type: string }
+        description: { type: string }
+        options:
+          type: array
+          items:
+            type: object
+            required: [optionId, label]
+            properties:
+              optionId: { type: string }
+              label: { type: string }
+        allowMultiple: { type: boolean }
+        allowFreeText: { type: boolean }
+        turn:
+          type: [object, "null"]
+          properties:
+            id: { type: string }
+            synthetic: { type: boolean }
+        createdAt: { type: [string, "null"], format: date-time }
+        valid: { type: boolean, description: 失效后前端不得再提交 }
+
+    PendingApproval:
+      type: object
+      required: [approvalId, riskDescription, requestedAction, decisions, scope, valid]
+      properties:
+        approvalId: { type: string, description: 原生 approval ID }
+        riskDescription: { type: string }
+        requestedAction: { type: string }
+        decisions:
+          type: array
+          items:
+            type: object
+            required: [decisionId, label]
+            properties:
+              decisionId: { type: string, description: 原生 decision ID;Bridge 不得创造扩大范围选项 }
+              label: { type: string }
+        scope: { type: string }
+        turn:
+          type: [object, "null"]
+          properties:
+            id: { type: string }
+            synthetic: { type: boolean }
+        createdAt: { type: [string, "null"], format: date-time }
+        valid: { type: boolean }
+
+    HistoryPage:
+      type: object
+      required: [entries, nextCursor, hasMore]
+      properties:
+        entries:
+          type: array
+          items:
+            type: object
+            properties:
+              turn:
+                type: [object, "null"]
+                properties:
+                  id: { type: string }
+                  synthetic: { type: boolean }
+              item:
+                type: [object, "null"]
+                description: 内容 oneof 以单键包装(content.userMessage / assistantMessage / reasoningSummary / plan / toolCall / commandStatus / fileChange / subagentStatus / question / approval / tokenUsage)
+                properties:
+                  itemId:
+                    type: [object, "null"]
+                    properties:
+                      id: { type: string }
+                      synthetic: { type: boolean }
+                  turn:
+                    type: [object, "null"]
+                    properties:
+                      id: { type: string }
+                      synthetic: { type: boolean }
+                  revision: { type: integer, format: int64 }
+                  createdAt: { type: [string, "null"], format: date-time }
+                  content:
+                    type: object
+                    description: oneof 包装键之一;形状见 contracts/fixtures 与 docs/FRONTEND-INTEGRATION.md 第 6 节
+                    additionalProperties: true
+        nextCursor:
+          type: [string, "null"]
+          description: null 表示已到最早端
+        hasMore: { type: boolean }
+
+    CommandOutputPage:
+      type: object
+      required: [bytesBase64, isFinal, channel]
+      properties:
+        itemId:
+          type: [object, "null"]
+          properties:
+            id: { type: string }
+            synthetic: { type: boolean }
+        nextCursor:
+          type: [string, "null"]
+        bytesBase64:
+          type: string
+          contentEncoding: base64
+          description: 标准 Base64;单页最大 256 KiB
+        isFinal: { type: boolean }
+        channel:
+          type: string
+          enum: [OUTPUT_CHANNEL_STDOUT, OUTPUT_CHANNEL_STDERR, OUTPUT_CHANNEL_COMBINED, OUTPUT_CHANNEL_UNSPECIFIED]
+
+    GitSummary:
+      type: object
+      required: [branch, detachedHead, headShort, headFull, rootDisplayName, entries, insertions, deletions, binaryFiles]
+      properties:
+        branch: { type: string, description: detached HEAD 时为空 }
+        detachedHead: { type: boolean }
+        headShort: { type: string }
+        headFull: { type: string }
+        rootDisplayName: { type: string, description: 仓库根安全显示名(尾段),不含绝对路径 }
+        entries:
+          type: array
+          items:
+            type: object
+            required: [relativePath, status, staged]
+            properties:
+              relativePath: { type: string }
+              status:
+                type: string
+                description: staged/unstaged/untracked/added/modified/deleted/renamed
+              staged: { type: boolean }
+        insertions: { type: integer, format: int64, description: 总增行(不含二进制) }
+        deletions: { type: integer, format: int64 }
+        binaryFiles:
+          type: array
+          items: { type: string }
+
+    GitFileDiff:
+      type: object
+      required: [relativePath, staged, patchText, truncated, totalBytes, binary]
+      properties:
+        relativePath: { type: string }
+        staged: { type: boolean }
+        patchText: { type: string, maxLength: 2097152 }
+        truncated: { type: boolean, description: 超限时 true,patchText 为截断结果 }
+        totalBytes: { type: integer, format: int64, description: 未截断时的完整字节数(估算) }
+        binary: { type: boolean }
+
+    FileMetadata:
+      type: object
+      required: [displayName, mimeType, sizeBytes, previewKind, notPreviewableReason, fileHandle]
+      properties:
+        displayName: { type: string }
+        mimeType: { type: string, description: Bridge 实测 MIME(嗅探优先) }
+        sizeBytes: { type: integer, format: int64 }
+        previewKind:
+          type: string
+          enum: [text, image, pdf, none]
+          description: 是否可内联预览及预览类型
+        notPreviewableReason:
+          type: [string, "null"]
+          description: 不可预览时的稳定原因(如 FILE_TYPE_NOT_PREVIEWABLE 的大小原因)
+        fileHandle: { type: string, description: 可继续用于 preview/download 的句柄(可能已刷新) }
+
+    Receipt:
+      type: object
+      required: [requestId, sessionId, operation, status, errorCode, createdAt, updatedAt]
+      properties:
+        requestId: { type: string }
+        sessionId: { type: string, format: uuid }
+        operation:
+          type: string
+          enum:
+            [OPERATION_CREATE_TASK, OPERATION_START_TURN, OPERATION_QUEUE_SET, OPERATION_QUEUE_REPLACE, OPERATION_QUEUE_CANCEL, OPERATION_STEER, OPERATION_INTERRUPT, OPERATION_ANSWER_QUESTION, OPERATION_ANSWER_APPROVAL, OPERATION_UPDATE_SETTINGS, OPERATION_RENAME_TASK, OPERATION_ARCHIVE_TASK, OPERATION_UNARCHIVE_TASK, OPERATION_FORK_TASK, OPERATION_STOP_BACKGROUND_COMMAND, OPERATION_STOP_ALL_BACKGROUND_COMMANDS, OPERATION_UNSPECIFIED]
+        status:
+          type: string
+          enum: [RECEIVED, ACCEPTED_BY_BRIDGE, DISPATCHED_TO_CODEX, COMPLETED, REJECTED, OUTCOME_UNKNOWN]
+          description: 前端只有收到 ACCEPTED_BY_BRIDGE 才能显示"已发送/已排队"
+        errorCode:
+          type: [string, "null"]
+          description: REJECTED/失败时的稳定错误码名;否则为空串或 null
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    FileRequest:
+      type: object
+      required: [fileHandle]
+      properties:
+        fileHandle: { type: string }
+        fileName: { type: string, description: 可选;缺省 "file"(经 sanitize) }
+        range:
+          type: [object, "null"]
+          description: JSON Range 或 HTTP Range 头二选一;仅支持单 Range
+          properties:
+            start: { type: integer, format: int64 }
+            endInclusive: { type: [integer, "null"], format: int64 }
+
+    PushSubscriptionInput:
+      type: object
+      required: [endpoint, keys]
+      properties:
+        endpoint: { type: string, minLength: 1, description: 敏感数据;日志不得输出 }
+        keys:
+          type: object
+          required: [p256dh, auth]
+          properties:
+            p256dh: { type: string, minLength: 1 }
+            auth: { type: string, minLength: 1 }
+
+    PushSubscription:
+      type: object
+      required: [id, endpoint, keys, createdAt, invalidatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        endpoint: { type: string }
+        keys:
+          type: object
+          required: [p256dh, auth]
+          properties:
+            p256dh: { type: string }
+            auth: { type: string }
+        createdAt: { type: string, format: date-time }
+        invalidatedAt: { type: [string, "null"], format: date-time }
+
+    PushSettings:
+      type: object
+      required: [showTitle, events]
+      properties:
+        showTitle:
+          type: boolean
+          description: 默认 false;开启后通知可含 title,仍不含正文
+        events:
+          type: object
+          required: [turnCompleted, turnFailed, turnInterrupted, waitingQuestion, waitingApproval]
+          properties:
+            turnCompleted: { type: boolean }
+            turnFailed: { type: boolean }
+            turnInterrupted: { type: boolean }
+            waitingQuestion: { type: boolean }
+            waitingApproval: { type: boolean }
+
+    AuditEvent:
+      type: object
+      description: 仅元数据;不含标题/项目路径/prompt/输出/文件名(§18.7)
+      required: [id, operation, result, createdAt]
+      properties:
+        id: { type: integer, format: int64 }
+        deviceId: { type: [string, "null"], format: uuid }
+        sessionId: { type: [string, "null"], format: uuid }
+        requestId: { type: [string, "null"] }
+        operation: { type: string, example: session_prefs }
+        result: { type: string, example: "OK" }
+        latencyMs: { type: [integer, "null"] }
+        createdAt: { type: string, format: date-time }

@@ -1,0 +1,36 @@
+{
+  "runtimeSnapshot": {
+    "runtimeRevision": 7,
+    "currentTurn": null,
+    "plan": null,
+    "pendingQuestions": [],
+    "pendingApprovals": [],
+    "runningCommands": [],
+    "backgroundCommands": [],
+    "backgroundCommandCount": 0,
+    "queue": null,
+    "capabilities": {
+      "controlMode": "CONTROL_MODE_READ_ONLY",
+      "compatibilityState": "COMPATIBILITY_DEGRADED",
+      "codexVersion": "0.999.0-unknown-fixture",
+      "supportedOperations": [],
+      "settings": [],
+      "transferLimits": {
+        "textInlineMaxBytes": 2097152,
+        "imageInlineMaxBytes": 26214400,
+        "pdfRangeMaxBytes": 104857600,
+        "downloadMaxBytes": 536870912,
+        "uploadMaxBytes": 20971520,
+        "maxConcurrentPerBrowser": 2,
+        "maxConcurrentPerDevice": 2,
+        "previewableMimePrefixes": [
+          "text/",
+          "application/json",
+          "image/",
+          "application/pdf"
+        ]
+      }
+    },
+    "recentOutputCursors": []
+  }
+}

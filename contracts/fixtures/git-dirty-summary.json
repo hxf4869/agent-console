@@ -1,0 +1,36 @@
+{
+  "gitSummary": {
+    "branch": "feature/fixture-1",
+    "detachedHead": false,
+    "headShort": "f1e2a3b",
+    "headFull": "f1e2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0",
+    "rootDisplayName": "fixture-workspace",
+    "entries": [
+      {
+        "relativePath": "src/export.ts",
+        "status": "modified",
+        "staged": false
+      },
+      {
+        "relativePath": "src/new-module.ts",
+        "status": "added",
+        "staged": true
+      },
+      {
+        "relativePath": "src/old-helper.ts",
+        "status": "deleted",
+        "staged": false
+      },
+      {
+        "relativePath": "assets/logo.png",
+        "status": "modified",
+        "staged": false
+      }
+    ],
+    "insertions": 128,
+    "deletions": 34,
+    "binaryFiles": [
+      "assets/logo.png"
+    ]
+  }
+}

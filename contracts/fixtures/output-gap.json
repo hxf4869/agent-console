@@ -1,0 +1,34 @@
+{
+  "streamId": "fixture-stream-0001",
+  "streamEpoch": 2,
+  "events": [
+    {
+      "emittedAt": "2026-09-04T10:12:00+00:00",
+      "outputAppend": {
+        "itemId": {
+          "id": "fixture-item-output-2",
+          "synthetic": false
+        },
+        "expectedOffset": 0,
+        "bytesBase64": "Zml4dHVyZS1saW5lLTEK",
+        "channel": "OUTPUT_CHANNEL_COMBINED"
+      }
+    },
+    {
+      "emittedAt": "2026-09-04T10:12:01+00:00",
+      "outputAppend": {
+        "itemId": {
+          "id": "fixture-item-output-2",
+          "synthetic": false
+        },
+        "expectedOffset": 2048,
+        "bytesBase64": "Zml4dHVyZS1saW5lLTQK",
+        "channel": "OUTPUT_CHANNEL_COMBINED"
+      }
+    },
+    {
+      "emittedAt": "2026-09-04T10:12:02+00:00",
+      "resyncHint": "offset 0+17 -> 2048 出现缺口:前端应丢弃本地预览,等待 OutputReplace(pageCursor/bytes) 或发送 ResyncRequest(streamId) 重新拿 snapshot"
+    }
+  ]
+}

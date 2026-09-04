@@ -1,0 +1,56 @@
+[package]
+name = "bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bridge"
+path = "src/main.rs"
+
+[dependencies]
+agent_console_protocol = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+directories = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+infer = { workspace = true }
+keyring = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+# ReaderStream(tokio-stream 的 io wrappers)在 "fs" feature 下。
+tokio-stream = { workspace = true, features = ["fs"] }
+# 文件 producer/consumer 传输:取消令牌(CancellationToken,rt)与
+# ReaderStream(io)。
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+tokio-tungstenite = { workspace = true }
+# tungstenite 自定义请求头(WebSocket 认证)需要 http 类型(与 tokio-tungstenite 同版本树)。
+http = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# 集成测试:临时数据目录与本地 axum WS 测试服务器(仅 dev,不进生产依赖)。
+tempfile = "3"
+axum = { workspace = true }

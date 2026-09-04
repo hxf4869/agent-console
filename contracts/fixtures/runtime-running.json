@@ -1,0 +1,123 @@
+{
+  "runtimeSnapshot": {
+    "runtimeRevision": 42,
+    "currentTurn": {
+      "turn": {
+        "id": "fixture-turn-1",
+        "synthetic": false
+      },
+      "phase": "TURN_PHASE_RUNNING",
+      "startedAt": "2026-09-04T09:58:00+00:00"
+    },
+    "plan": {
+      "steps": [
+        {
+          "stepId": "fixture-step-1",
+          "title": "梳理现有调用点",
+          "status": "PLAN_STEP_COMPLETED"
+        },
+        {
+          "stepId": "fixture-step-2",
+          "title": "修改导出实现",
+          "status": "PLAN_STEP_IN_PROGRESS"
+        },
+        {
+          "stepId": "fixture-step-3",
+          "title": "运行测试",
+          "status": "PLAN_STEP_PENDING"
+        }
+      ]
+    },
+    "pendingQuestions": [],
+    "pendingApprovals": [],
+    "runningCommands": [
+      {
+        "commandId": "fixture-command-1",
+        "itemId": {
+          "id": "fixture-item-output-1",
+          "synthetic": false
+        },
+        "startedAt": "2026-09-04T09:58:10+00:00"
+      }
+    ],
+    "backgroundCommands": [],
+    "backgroundCommandCount": 0,
+    "queue": null,
+    "capabilities": {
+      "controlMode": "CONTROL_MODE_LIMITED_CONTROL",
+      "compatibilityState": "COMPATIBILITY_VERIFIED",
+      "codexVersion": "fixture-only",
+      "supportedOperations": [
+        "OPERATION_START_TURN",
+        "OPERATION_QUEUE_SET",
+        "OPERATION_QUEUE_REPLACE",
+        "OPERATION_QUEUE_CANCEL",
+        "OPERATION_STEER",
+        "OPERATION_INTERRUPT"
+      ],
+      "settings": [
+        {
+          "optionId": "fixture-setting-model",
+          "kind": "SETTING_KIND_MODEL",
+          "label": "模型",
+          "currentValue": "fixture-model-medium",
+          "availableValues": [
+            {
+              "value": "fixture-model-small",
+              "label": "小型(仅示例)"
+            },
+            {
+              "value": "fixture-model-medium",
+              "label": "中型(仅示例)"
+            }
+          ],
+          "mutable": true
+        },
+        {
+          "optionId": "fixture-setting-effort",
+          "kind": "SETTING_KIND_REASONING_EFFORT",
+          "label": "思考深度",
+          "currentValue": "medium",
+          "availableValues": [
+            {
+              "value": "low",
+              "label": "低"
+            },
+            {
+              "value": "medium",
+              "label": "中"
+            }
+          ],
+          "mutable": false
+        }
+      ],
+      "transferLimits": {
+        "textInlineMaxBytes": 2097152,
+        "imageInlineMaxBytes": 26214400,
+        "pdfRangeMaxBytes": 104857600,
+        "downloadMaxBytes": 536870912,
+        "uploadMaxBytes": 20971520,
+        "maxConcurrentPerBrowser": 2,
+        "maxConcurrentPerDevice": 2,
+        "previewableMimePrefixes": [
+          "text/",
+          "application/json",
+          "image/",
+          "application/pdf"
+        ]
+      }
+    },
+    "recentOutputCursors": [
+      {
+        "itemId": {
+          "id": "fixture-item-output-1",
+          "synthetic": false
+        },
+        "revision": 7,
+        "byteLength": 2048,
+        "isFinal": false,
+        "channel": "OUTPUT_CHANNEL_COMBINED"
+      }
+    ]
+  }
+}

@@ -1,0 +1,100 @@
+# ============================================================================
+# Agent Console 同域路由片段(Caddy 模板,与 dev-toolbox deploy/Caddyfile 中
+# 的实际生效配置保持同构;本文件只是 agent-console 侧参考模板,不是生效配置)
+#
+# 占位符(使用前替换):
+#   {$DEVTOOLBOX_INTERNAL_BASE_URL}  dev-toolbox 内部服务基地址(如 http://api:8080,
+#                                    与 relay 同网时按 dev-toolbox api 服务名解析)
+#   {$AGENT_CONSOLE_INTERNAL_TOKEN}  与 dev-toolbox 共享的内部服务 Token(gateway 环境注入)
+#   {$AGENT_CONSOLE_RELAY}           relay 服务地址(默认 agent-console-relay:8081,
+#                                    生产由 agent-console compose 生产 overlay 以
+#                                    网络别名加入 dev-toolbox_frontend 网络)
+#
+# 契约要点(docs/ZCODE-BACKEND-EXECUTION-SPEC.md 第 20/22 节):
+#   1. 网关必须覆盖并删除客户端伪造的内部身份 header,verify 通过后再注入。
+#   2. Cookie 不转发给 relay;relay 响应不得设置或修改 dev-toolbox Cookie。
+#   3. 写请求的原始 Origin 与 X-CSRF-Token 交给 dev-toolbox verify 校验:
+#      forward_auth 以 GET 克隆原请求头,Cookie/Origin/X-CSRF-Token 随克隆请求
+#      自行携带;原始方法经 X-Agent-Console-Method 递交,非读方法按写 fail-closed。
+#   4. relay 内部端口不直接暴露公网,只经本路由访问。
+#   5. verify 端点为 GET /internal/agent-console/auth-sessions/verify
+#      (内部 Token Bearer 鉴权),返回 X-Agent-Console-Session-Id / -Owner-Id。
+#   6. Bridge 数据面(/agent-console/bridge/*、/agent-console/transfers/*)无浏览器
+#      会话,一律不做 Cookie forward_auth;Authorization Bearer(设备凭据/transfer
+#      token)必须原样到达 relay,由 relay 校验。
+# ============================================================================
+
+# ---------- REST API:/agent-console/api/* ----------
+handle /agent-console/api/* {
+	# 1) 删除客户端伪造的内部身份 header(先于 forward_auth 执行)
+	request_header -X-Agent-Console-Session-Id
+	request_header -X-Agent-Console-Owner-Id
+	# 2) forward_auth 到 dev-toolbox 无 touch 会话验证(GET + 克隆头输入)
+	forward_auth {$DEVTOOLBOX_INTERNAL_BASE_URL} {
+		uri /internal/agent-console/auth-sessions/verify
+		method GET
+		# 浏览器原始 Cookie/Origin/X-CSRF-Token 随克隆请求递交;
+		# 写语义由方法号表达(非 GET/HEAD/OPTIONS 按写 fail-closed)
+		header_up X-Agent-Console-Method {method}
+		header_up Authorization "Bearer {$AGENT_CONSOLE_INTERNAL_TOKEN}"
+		# 从 verify 响应复制身份 header 给上游
+		copy_headers X-Agent-Console-Session-Id X-Agent-Console-Owner-Id
+	}
+	# 3) 转发 relay:剥离 Cookie/CSRF/Origin/Authorization,保持 /agent-console 前缀
+	reverse_proxy {$AGENT_CONSOLE_RELAY} {
+		header_up -Cookie
+		header_up -X-CSRF-Token
+		header_up -Origin
+		header_up -Authorization
+	}
+}
+
+# ---------- WebSocket:/agent-console/ws ----------
+handle /agent-console/ws {
+	# 删除客户端伪造的内部身份 header
+	request_header -X-Agent-Console-Session-Id
+	request_header -X-Agent-Console-Owner-Id
+	# WebSocket 升级由 Caddy 反代自动处理。
+	# 一次性连接 ticket 通过 Sec-WebSocket-Protocol 子协议传递(固定协议名
+	# agent-console.v1 + Base64URL ticket,见规格 20.2),必须原样转发给 relay——
+	# relay 通过 dev-toolbox 内部接口原子消费 ticket;网关不得记录该 header。
+	# relay 的握手响应只回显固定协议名,不会泄露 ticket;长连接撤销由 relay 的
+	# 60s introspection 循环负责(规格 20.5)。
+	reverse_proxy {$AGENT_CONSOLE_RELAY} {
+		header_up -Cookie
+	}
+}
+
+# ---------- Bridge 数据面:/agent-console/bridge/* ----------
+handle /agent-console/bridge/ws {
+	# Bridge WSS:Authorization Bearer 设备凭据必须原样到达 relay,不做
+	# Cookie forward_auth;身份头只用于浏览器路径,仍删除防伪造。
+	request_header -X-Agent-Console-Session-Id
+	request_header -X-Agent-Console-Owner-Id
+	reverse_proxy {$AGENT_CONSOLE_RELAY}
+}
+
+@agent_console_pairing path /agent-console/bridge/pairing/register /agent-console/bridge/pairing/claim
+handle @agent_console_pairing {
+	# 配对注册/认领:短码即凭证,限速由 relay 按来源执行;网关只加 4KiB
+	# 保守请求体上限,防止该公网入口被用来缓冲大请求。
+	request_header -X-Agent-Console-Session-Id
+	request_header -X-Agent-Console-Owner-Id
+	request_body {
+		max_size 4KiB
+	}
+	reverse_proxy {$AGENT_CONSOLE_RELAY}
+}
+
+# ---------- 文件数据面:/agent-console/transfers/* ----------
+handle /agent-console/transfers/* {
+	# Bridge 主动出站 producer/consumer(device credential + 短期 transfer token)
+	# 与浏览器流式上传/下载都经此路由;不做 Cookie forward_auth,Authorization
+	# 必须原样到达 relay(凭据+transfer token+目标设备+方向由 relay 校验);
+	# 网关不落盘、不缓冲。
+	request_header -X-Agent-Console-Session-Id
+	request_header -X-Agent-Console-Owner-Id
+	reverse_proxy {$AGENT_CONSOLE_RELAY} {
+		flush_interval -1
+	}
+}

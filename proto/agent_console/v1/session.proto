@@ -1,0 +1,57 @@
+// 会话摘要(§11.1 数据接口 1/4)。
+//
+// SessionSummary 是唯一允许 Relay 从 PostgreSQL 直接返回的会话数据;
+// RuntimeSnapshot、HistoryPage、OnDemandDetail 必须由在线 Bridge 提供。
+//
+// 字段号冻结约定见 common.proto 头注释。多值字段删除必须 reserved。
+
+syntax = "proto3";
+
+package agent_console.v1;
+
+import "google/protobuf/timestamp.proto";
+import "agent_console/v1/common.proto";
+
+// 会话列表条目(§11.1)。多维状态必须分开携带,禁止合并成单一状态枚举让前端猜。
+message SessionSummary {
+  // 原生复合键(§9.1)。
+  SessionKey session_key = 1;
+
+  // 标题(Codex 任务标题)。
+  string title = 2;
+  // Agent 种类。首版恒为 CODEX_DESKTOP。
+  AgentKind agent_kind = 3;
+  // 项目显示名(工作区显示名,非本机绝对路径)。
+  string project_display_name = 4;
+  // 当前 Git 分支;不可用时为空。
+  string current_branch = 5;
+  // 最近更新时间。
+  google.protobuf.Timestamp updated_at = 6;
+
+  // ---- 多维状态摘要(§10) ----
+  DeviceConnection device_connection = 7;
+  google.protobuf.Timestamp device_last_seen_at = 8;
+  // DEGRADED 原因;OFFLINE 时为空(不猜测)。
+  string degraded_reason = 9;
+  ControlMode control_mode = 10;
+  CompatibilityState compatibility_state = 11;
+  ActiveTurnPhase active_turn_phase = 12;
+  // 待处理关注数量(问题 + 审批),供列表角标显示。
+  uint32 pending_attention_count = 13;
+  // 待处理关注的具体类型列表。
+  repeated PendingAttentionKind pending_attention_kinds = 14;
+  QueueState queue_state = 15;
+  LastTurnOutcome last_turn_outcome = 16;
+
+  // ---- 用户标记(§27.2) ----
+  bool pinned = 17;
+  bool muted = 18;
+  bool archived = 19;
+}
+
+// SessionSummaryBatch:列表订阅的快照或增量推送(§17.4 列表订阅只含 SessionSummary)。
+message SessionSummaryBatch {
+  repeated SessionSummary summaries = 1;
+  // true 表示全量快照(订阅建立或 Resync 后);false 表示增量更新。
+  bool snapshot = 2;
+}

@@ -1,0 +1,149 @@
+// 详情订阅的领域事件(§13 实时输出真实性合同、§17.4)。
+//
+// 列表订阅只含 SessionSummary;详情订阅才包含 RuntimeSnapshot、item 变化、
+// 输出和 attention(§17.4)。
+//
+// 输出真实性(§13):实时输出是 LIVE_PREVIEW(允许延迟、合并或暂时缺片),
+// 不是逐字节无损终端;命令或 turn 进入终态后由 Bridge 以 OutputReplace 校正为
+// AUTHORITATIVE_FINAL。前端游标与 expected_offset 不一致时不得盲目拼接,
+// 应请求 item snapshot 或返回 RESYNC_REQUIRED。
+//
+// 输出分块约束(§13.2):
+//   * 单个分块默认不超过 64 KiB(编解码助手常量 MAX_OUTPUT_CHUNK_BYTES)。
+//   * 所有分块必须在 UTF-8 边界切分,禁止把多字节字符劈成两半;
+//     二进制输出只提供受限字节预览或下载句柄,不伪装成文本。
+//   * 文件正文禁止进入 Protobuf(§22.1);OutputAppend.bytes 仅限命令/工具的
+//     文本输出流。
+//
+// 字段号冻结约定见 common.proto 头注释。
+
+syntax = "proto3";
+
+package agent_console.v1;
+
+import "google/protobuf/timestamp.proto";
+import "agent_console/v1/common.proto";
+import "agent_console/v1/session.proto";
+import "agent_console/v1/runtime.proto";
+
+// ---------------------------------------------------------------------------
+// 输出事件(§13.2)
+// ---------------------------------------------------------------------------
+
+// 增量追加。前端本地 offset 与 expected_offset 不一致时不得拼接。
+message OutputAppend {
+  ItemId item_id = 1;
+  // 期望的写入起始偏移(相对该 item 输出流起点,字节)。
+  uint64 expected_offset = 2;
+  // UTF-8 边界对齐的分块(≤64 KiB)。
+  bytes bytes = 3;
+  OutputChannel channel = 4;
+}
+
+// 修正/替换(§13.3 结束校正):内容为完整替换或指向完整内容的分页 cursor。
+message OutputReplace {
+  ItemId item_id = 1;
+  uint64 revision = 2;
+  oneof content {
+    // 小输出直接内联完整内容(UTF-8 边界对齐)。
+    bytes bytes = 3;
+    // 大输出指向可分页读取的完整内容 cursor(经 QueryRequest.command_output_page)。
+    string page_cursor = 4;
+  }
+  OutputChannel channel = 5;
+}
+
+// 输出定稿(§13.3)。revision/byte_length 供前端核对本地预览是否完整;
+// 最终结果仍无法读取时由 Bridge 标记 FINAL_OUTPUT_UNAVAILABLE
+// (以 ProtocolError/QueryResponse 的稳定错误码表达),不得把预览冒充完整结果。
+message OutputFinal {
+  ItemId item_id = 1;
+  uint64 revision = 2;
+  uint64 byte_length = 3;
+  OutputChannel channel = 4;
+}
+
+// ---------------------------------------------------------------------------
+// 领域事件
+// ---------------------------------------------------------------------------
+
+// Turn 生命周期(§10.4):idle/running/finishing 与终态+结果。
+// 生命周期与 attention 属于不可静默丢弃的第 1 优先级(§17.6)。
+message TurnLifecycle {
+  TurnId turn = 1;
+  ActiveTurnPhase phase = 2;
+  // 终态(IDLE 之外的落定)时携带上一轮结果;其余为 UNSPECIFIED。
+  LastTurnOutcome outcome = 3;
+  google.protobuf.Timestamp finished_at = 4;
+}
+
+// Item 新建或内容更新(§9.3 可见内容)。
+message ItemUpsert {
+  Item item = 1;
+}
+
+// 问题/审批出现(第 1 优先级,不可静默丢弃)。
+message PendingAttentionAdded {
+  oneof attention {
+    PendingAttentionQuestion question = 1;
+    PendingAttentionApproval approval = 2;
+  }
+}
+
+// 问题/审批移除(回答、失效或 turn 结束)。
+message PendingAttentionRemoved {
+  PendingAttentionKind kind = 1;
+  // 原生 ID(question_id 或 approval_id)。
+  string native_id = 2;
+  TurnId turn = 3;
+}
+
+// 队列状态变化(§15.3;正文不进入本事件)。
+message QueueStateChanged {
+  QueueStatus queue = 1;
+}
+
+// 后台命令变化(§10.8)。
+message BackgroundCommandChanged {
+  BackgroundCommand command = 1;
+}
+
+// 设备 presence 变化(第 3 优先级,可合并)。
+message DevicePresenceChanged {
+  DevicePresence presence = 1;
+}
+
+// 能力变化(probe 结果变化、设置可选值变化等)。
+message CapabilityChanged {
+  CapabilitySnapshot capabilities = 1;
+}
+
+// 单个领域事件。
+message DomainEvent {
+  // Bridge 产生事件的时间。
+  google.protobuf.Timestamp emitted_at = 1;
+
+  oneof event {
+    TurnLifecycle turn_lifecycle = 2;
+    ItemUpsert item_upsert = 3;
+    OutputAppend output_append = 4;
+    OutputReplace output_replace = 5;
+    OutputFinal output_final = 6;
+    // 摘要变化直接携带完整 SessionSummary(第 1 优先级,不可丢弃)。
+    SessionSummary session_summary_changed = 7;
+    PendingAttentionAdded pending_attention_added = 8;
+    PendingAttentionRemoved pending_attention_removed = 9;
+    QueueStateChanged queue_state_changed = 10;
+    BackgroundCommandChanged background_command_changed = 11;
+    DevicePresenceChanged device_presence_changed = 12;
+    CapabilityChanged capability_changed = 13;
+  }
+}
+
+// 事件批次。批内事件顺序即同一 stream 内的应用顺序;
+// 流级顺序与幂等由 Envelope 的 stream_id/stream_epoch/sequence 保证(§17.5)。
+message EventBatch {
+  // 批次所属流(Browser 详情订阅为单会话流)。
+  string stream_id = 1;
+  repeated DomainEvent events = 2;
+}

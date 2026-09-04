@@ -1,0 +1,15 @@
+# 缩小 deploy/Dockerfile.relay 的构建上下文;仅影响 docker 构建
+.git/
+target/
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+coverage/
+**/coverage/
+data/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store

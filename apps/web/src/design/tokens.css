@@ -1,0 +1,83 @@
+:root,
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg-app: #151716;
+  --bg-nav: #191b1a;
+  --bg-surface: #1f2220;
+  --bg-elevated: #272a28;
+  --bg-code: #171918;
+  --border-subtle: #343835;
+  --border-strong: #4a504c;
+  --text-primary: #f1f4f2;
+  --text-secondary: #b5bbb7;
+  --text-muted: #8a928d;
+  --accent: #6e9bff;
+  --accent-contrast: #101b31;
+  --accent-soft: #243557;
+  --success: #58b879;
+  --warning: #e0a34a;
+  --danger: #e36b63;
+  --sensitive: #f07a45;
+  --focus-ring: #8db0ff;
+  --scrim: rgb(0 0 0 / 64%);
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg-app: #f4f6f5;
+  --bg-nav: #ecefee;
+  --bg-surface: #ffffff;
+  --bg-elevated: #f7f9f8;
+  --bg-code: #f1f3f2;
+  --border-subtle: #d9dedb;
+  --border-strong: #b8c0bb;
+  --text-primary: #1b201d;
+  --text-secondary: #4e5751;
+  --text-muted: #626b66;
+  --accent: #2e65d5;
+  --accent-contrast: #ffffff;
+  --accent-soft: #e7eeff;
+  --success: #247a43;
+  --warning: #9a5b00;
+  --danger: #b42318;
+  --sensitive: #b54708;
+  --focus-ring: #245fd1;
+  --scrim: rgb(21 23 22 / 48%);
+}
+
+:root {
+  --font-ui: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas,
+    'Liberation Mono', monospace;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  --radius-control: 6px;
+  --radius-card: 8px;
+  --radius-dialog: 12px;
+  --shadow-overlay: 0 16px 40px rgb(0 0 0 / 22%);
+
+  --motion-fast: 120ms;
+  --motion-base: 160ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+
+  --global-header-height: 64px;
+  --module-nav-width: clamp(236px, 16vw, 292px);
+  --task-list-width: clamp(280px, 21vw, 336px);
+  --inspector-width: clamp(292px, 22vw, 340px);
+  --page-gutter: clamp(16px, 1.6vw, 32px);
+  --configuration-max: 1760px;
+  --content-max: 1440px;
+  --layer-focus: 10;
+  --layer-sticky: 20;
+  --layer-overlay: 40;
+  --layer-toast: 100;
+}

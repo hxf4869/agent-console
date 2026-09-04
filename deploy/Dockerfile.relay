@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+# ============================================================================
+# Relay 服务镜像(多阶段构建)
+# - TLS 全部走 rustls(sqlx/reqwest/tokio-tungstenite),无需 openssl 与 pkg-config
+# - proto 编译使用纯 Rust 的 protox(build.rs),无需 protoc
+# - 运行镜像使用 distroless cc(nonroot,UID 65532)
+# ============================================================================
+
+# ---------- 构建阶段 ----------
+FROM rust:1-slim AS builder
+WORKDIR /build
+
+# 复制整个 workspace(上下文由根 .dockerignore 裁剪掉 .git/target 等)。
+# 依赖规模变大后,relay workstream 可改为“仅清单 + 占位 src”两级缓存以加速重建。
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY proto ./proto
+COPY apps ./apps
+RUN cargo build --release -p relay --locked
+
+# ---------- 运行阶段 ----------
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /build/target/release/relay /usr/local/bin/relay
+# 迁移文件随镜像分发;运行时路径以 relay workstream 的迁移加载实现为准
+COPY --from=builder /build/apps/relay/migrations /app/migrations
+
+ENV RELAY_BIND_ADDR=0.0.0.0:8081
+EXPOSE 8081
+
+# 数据库连接、内部 Token、VAPID 私钥等一律由运行时环境变量/secret 注入,不写入镜像
+ENTRYPOINT ["/usr/local/bin/relay"]

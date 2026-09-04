@@ -1,0 +1,45 @@
+# ============================================================================
+# Agent Console 生产 overlay(叠加在 compose.yaml 之上)
+#
+# 用法:
+#   docker compose --env-file .env \
+#     -f deploy/compose.yaml -f deploy/compose.production.yaml up -d
+#
+# 网络契约:relay 不自建公网入口,而是以 external 方式加入 dev-toolbox 反代的
+# frontend 网络(dev-toolbox compose 项目名 dev-toolbox + 网络 frontend,实际
+# 网络名 dev-toolbox_frontend),并在该网络上以别名 agent-console-relay 暴露;
+# dev-toolbox Caddy 上游默认 agent-console-relay:8081。部署环境网络名不同时,
+# 用 AGENT_CONSOLE_GATEWAY_NETWORK 覆盖,无需手工建网。
+#
+# 安全要求(规格第 25.4 节):
+#   - relay 非 root、只读根文件系统,仅必要临时目录。
+#   - 不映射任何宿主机端口;公网 80/443 只由 gateway 暴露。
+# ============================================================================
+services:
+  postgres:
+    restart: always
+    # 生产不放开 ports;数据库只在 compose 内部网络中被 relay 访问。
+
+  relay:
+    read_only: true
+    tmpfs:
+      - /tmp
+    # 镜像基础为 distroless nonroot(UID 65532),此处显式声明以防镜像更换
+    user: "65532:65532"
+    restart: always
+    environment:
+      # 生产环境 relay 经共享 gateway 网络按 dev-toolbox api 的服务名回调
+      # 内部端点(ticket 消费、session introspection,Bearer 内部令牌)。
+      DEVTOOLBOX_INTERNAL_BASE_URL: ${DEVTOOLBOX_INTERNAL_BASE_URL:-http://api:8080}
+    networks:
+      default: {}
+      gateway:
+        aliases:
+          # dev-toolbox Caddy 上游(AGENT_CONSOLE_RELAY_UPSTREAM 默认值)按此别名解析;
+          # relay 服务名保持 relay,监听 8081,不映射宿主机端口。
+          - agent-console-relay
+
+networks:
+  gateway:
+    name: ${AGENT_CONSOLE_GATEWAY_NETWORK:-dev-toolbox_frontend}
+    external: true

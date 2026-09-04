@@ -1,0 +1,59 @@
+{
+  "runtimeSnapshot": {
+    "runtimeRevision": 43,
+    "currentTurn": {
+      "turn": {
+        "id": "fixture-turn-1",
+        "synthetic": false
+      },
+      "phase": "TURN_PHASE_RUNNING",
+      "startedAt": "2026-09-04T09:58:00+00:00"
+    },
+    "plan": null,
+    "pendingQuestions": [
+      {
+        "questionId": "fixture-question-1",
+        "title": "选择实现方式",
+        "description": "两种方案都能满足当前需求,请选择偏好(合成数据)",
+        "options": [
+          {
+            "optionId": "fixture-option-a",
+            "label": "方案 A:保持现有结构"
+          },
+          {
+            "optionId": "fixture-option-b",
+            "label": "方案 B:拆分模块"
+          }
+        ],
+        "allowMultiple": false,
+        "allowFreeText": true,
+        "turn": {
+          "id": "fixture-turn-1",
+          "synthetic": false
+        },
+        "createdAt": "2026-09-04T09:59:00+00:00",
+        "valid": true
+      }
+    ],
+    "pendingApprovals": [],
+    "runningCommands": [],
+    "backgroundCommands": [],
+    "backgroundCommandCount": 0,
+    "queue": null,
+    "capabilities": {
+      "controlMode": "CONTROL_MODE_LIMITED_CONTROL",
+      "compatibilityState": "COMPATIBILITY_VERIFIED",
+      "codexVersion": "fixture-only",
+      "supportedOperations": [
+        "OPERATION_START_TURN",
+        "OPERATION_QUEUE_SET",
+        "OPERATION_STEER",
+        "OPERATION_INTERRUPT",
+        "OPERATION_ANSWER_QUESTION"
+      ],
+      "settings": [],
+      "transferLimits": null
+    },
+    "recentOutputCursors": []
+  }
+}

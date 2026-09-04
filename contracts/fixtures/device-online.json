@@ -1,0 +1,18 @@
+{
+  "devices": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "displayName": "fixture-macbook",
+      "platform": "macos",
+      "arch": "arm64",
+      "bridgeVersion": "0.1.0",
+      "connection": "CONNECTION_ONLINE",
+      "lastSeenAt": "2026-09-04T10:00:00+00:00",
+      "pairedAt": "2026-08-01T08:00:00+00:00",
+      "revoked": false,
+      "compatibilityState": "COMPATIBILITY_VERIFIED",
+      "controlMode": "CONTROL_MODE_LIMITED_CONTROL",
+      "privacyHideTitles": false
+    }
+  ]
+}

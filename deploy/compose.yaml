@@ -1,0 +1,56 @@
+# ============================================================================
+# Agent Console 开发环境 Compose(dev)
+#
+# 用法(在仓库根目录执行,使根 .env 生效):
+#   docker compose --env-file .env -f deploy/compose.yaml up -d
+#
+# 安全要求(见 docs/ZCODE-BACKEND-EXECUTION-SPEC.md 第 25.4 节):
+#   - Relay 内部端口不映射宿主机;开发调试时再临时放开(见下方注释)。
+#   - PostgreSQL 与 Relay 使用独立凭据,不与 dev-toolbox 共用。
+# ============================================================================
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agent_console
+      POSTGRES_USER: agent_console
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_console -d agent_console"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    # 开发时如需宿主机直连数据库调试(如本机直跑 relay),再临时放开:
+    # ports:
+    #   - "127.0.0.1:5433:5432"
+
+  relay:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.relay
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # 容器内监听全部网卡;公网入口只经 dev-toolbox gateway 反代,不映射宿主机
+      RELAY_BIND_ADDR: 0.0.0.0:8081
+      RELAY_DATABASE_URL: postgres://agent_console:${POSTGRES_PASSWORD}@postgres:5432/agent_console
+      RELAY_INTERNAL_TOKEN: ${RELAY_INTERNAL_TOKEN:?请在 .env 中设置 RELAY_INTERNAL_TOKEN}
+      RELAY_PUBLIC_WS_PATH: ${RELAY_PUBLIC_WS_PATH:-/agent-console/ws}
+      # 开发时 dev-toolbox 通常跑在宿主机;按实际端口调整
+      DEVTOOLBOX_INTERNAL_BASE_URL: ${DEVTOOLBOX_INTERNAL_BASE_URL:-http://host.docker.internal:8080}
+      DEVTOOLBOX_PUBLIC_ORIGIN: ${DEVTOOLBOX_PUBLIC_ORIGIN:-http://localhost:8080}
+    restart: unless-stopped
+    # 开发时如需宿主机直连 relay 调试,再临时放开(仅绑定回环):
+    # ports:
+    #   - "127.0.0.1:8081:8081"
+    # 开发时 dev-toolbox 网关若以 Docker 运行(而非宿主机直跑),参照
+    # deploy/compose.production.yaml 让 relay 以 external 方式加入
+    # dev-toolbox_frontend 网络并加别名 agent-console-relay,本机直连调试
+    # 则用上面的临时端口映射(默认两者都不启用)。
+
+volumes:
+  postgres-data:

@@ -1,0 +1,185 @@
+// WebSocket Envelope 与连接级消息(§17)。
+//
+// 权威规格:docs/ZCODE-BACKEND-EXECUTION-SPEC.md §17(Protobuf 与 WebSocket 合同)。
+// 一旦前端消费,本文件字段号不得复用;删除字段必须 reserved(§17.1)。
+//
+// 隐私边界(§17.2):不得把 Cookie、设备明文凭据、文件正文或任意本机绝对路径
+// 放入 Envelope。producer/consumer transfer token 等短期凭据也不经 Envelope 传递。
+
+syntax = "proto3";
+
+package agent_console.v1;
+
+import "google/protobuf/timestamp.proto";
+import "agent_console/v1/common.proto";
+import "agent_console/v1/session.proto";
+import "agent_console/v1/runtime.proto";
+import "agent_console/v1/events.proto";
+import "agent_console/v1/commands.proto";
+import "agent_console/v1/transfers.proto";
+
+// ---------------------------------------------------------------------------
+// Envelope(§17.2)
+// ---------------------------------------------------------------------------
+
+// WebSocket 上所有消息的唯一帧格式。
+//
+// sequence 语义(§17.5):
+//   * sequence 只保证同一 stream_id + stream_epoch 内的单调顺序;
+//   * epoch 变化必须从新 snapshot 开始;
+//   * 重复 sequence 幂等忽略;缺口在 Relay 内存窗口内补发;
+//     超出窗口、Relay 重启或 epoch 变化时发送 ResyncRequired;
+//   * sequence 不承担业务幂等;业务幂等由 request_id 完成。
+message Envelope {
+  // 当前协议主版本,与 PROTOCOL_VERSION 常量一致。
+  uint32 protocol_version = 1;
+  // 每条消息唯一 ID(UUID v4)。
+  string message_id = 2;
+  // 关联 ID:命令/查询的响应回填 request 的 message_id 或 request_id;
+  // 无关联时为空。
+  string correlation_id = 3;
+  // 发送方时间戳。
+  google.protobuf.Timestamp sent_at = 4;
+  // 设备 ID;Browser 发出的消息可为空。
+  string device_id = 5;
+  // Agent 种类。首版恒为 CODEX_DESKTOP;接收方必须容忍未知枚举值
+  // (proto3 未知枚举保留数值,不得当作解码失败)。
+  AgentKind agent_kind = 6;
+  // 订阅流 ID(Subscribed 下发);非流消息可为空。
+  string stream_id = 7;
+  // 流纪元:快照起点标识,epoch 变化必须从新 snapshot 开始(§17.5)。
+  uint64 stream_epoch = 8;
+  // 同一 stream_id + stream_epoch 内单调递增的序列号(§17.5)。
+  uint64 sequence = 9;
+
+  // payload 集合 = §17.3 第一版清单,逐字实现;禁止为未来 Agent 预留专属消息。
+  oneof payload {
+    ClientHello client_hello = 10;
+    ServerHello server_hello = 11;
+    CapabilitySnapshot capability_snapshot = 12;
+    DevicePresence device_presence = 13;
+    Subscribe subscribe = 14;
+    Subscribed subscribed = 15;
+    Unsubscribe unsubscribe = 16;
+    Ack ack = 17;
+    SessionSummaryBatch session_summary_batch = 18;
+    RuntimeSnapshot runtime_snapshot = 19;
+    EventBatch event_batch = 20;
+    ResyncRequired resync_required = 21;
+    ResyncRequest resync_request = 22;
+    QueryRequest query_request = 23;
+    QueryResponse query_response = 24;
+    CommandRequest command_request = 25;
+    CommandAccepted command_accepted = 26;
+    CommandResult command_result = 27;
+    TransferOffer transfer_offer = 28;
+    TransferReady transfer_ready = 29;
+    TransferResult transfer_result = 30;
+    Heartbeat heartbeat = 31;
+    HeartbeatAck heartbeat_ack = 32;
+    ProtocolError protocol_error = 33;
+  }
+
+  // Provider 扩展槽(§17.3):首版仅 Codex Adapter 写入;消费方对无法识别的
+  // critical 扩展不得执行。其余发送方必须留空。
+  ProviderExtension provider_extension = 34;
+}
+
+// ---------------------------------------------------------------------------
+// Hello 握手(连接建立后双方第一条消息)
+// ---------------------------------------------------------------------------
+
+message ClientHello {
+  uint32 protocol_version = 1;
+  ClientKind client_kind = 2;
+  // Bridge 必填;Browser 为空(设备归属由 WS ticket 认证结果决定)。
+  string device_id = 3;
+  // dev-toolbox 用户标识(opaque subject),仅作日志关联;
+  // 这是自述性元数据,真实授权以 WS ticket 认证为准。
+  string auth_subject = 4;
+  // 客户端能力声明(如支持的订阅类型),取值约定见
+  // docs/FRONTEND-INTEGRATION.md;未知值必须忽略。
+  repeated string capabilities = 5;
+}
+
+message ServerHello {
+  // 服务端接受的协议版本(版本不匹配时服务端直接关闭连接)。
+  uint32 accepted_protocol_version = 1;
+  google.protobuf.Timestamp server_time = 2;
+  // 服务端能力(如支持的订阅类型、查询类型);未知值必须忽略。
+  repeated string capabilities = 3;
+}
+
+// ---------------------------------------------------------------------------
+// 订阅与流控制(§17.4)
+// ---------------------------------------------------------------------------
+
+// 空消息:订阅会话列表(只含 SessionSummary,§17.4)。
+message SessionList {}
+
+message Subscribe {
+  oneof target {
+    // 列表订阅:SessionSummary 快照 + 摘要变化。
+    SessionList list = 1;
+    // 详情订阅:RuntimeSnapshot、item 变化、输出和 attention。
+    SessionKey session = 2;
+  }
+}
+
+// 订阅确认。固定本流的快照起点(§17.4 步骤 3):
+// snapshot 期间的新事件进入缓冲,Relay 先发 RuntimeSnapshot(或列表快照),
+// 再发 base_sequence 之后的事件;Browser 应用后发送 Ack。
+message Subscribed {
+  string stream_id = 1;
+  uint64 stream_epoch = 2;
+  // 本流第一个事件的 sequence(snapshot 对应的起点)。
+  uint64 base_sequence = 3;
+}
+
+message Unsubscribe {
+  string stream_id = 1;
+}
+
+// Browser 应用 snapshot/事件后的确认(§17.4 步骤 6)。
+message Ack {
+  string stream_id = 1;
+  // 已连续应用到本条(含)的 sequence。
+  uint64 sequence = 2;
+}
+
+// 服务端 → Browser:sequence 缺口超出窗口、Relay 重启或 epoch 变化,
+// 要求 Browser 放弃本地状态并重新订阅(§17.5)。
+message ResyncRequired {
+  string stream_id = 1;
+  // 稳定原因码(RESYNC_REQUIRED)。
+  StableErrorCode reason_code = 2;
+}
+
+// Browser → 服务端:主动请求重新同步(本地状态可疑时)。
+// 服务端响应新的 Subscribed + RuntimeSnapshot/列表快照。
+message ResyncRequest {
+  string stream_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// 心跳(§26.2 连接与心跳;双向保活,第 3 优先级可合并)
+// ---------------------------------------------------------------------------
+
+message Heartbeat {}
+
+message HeartbeatAck {}
+
+// ---------------------------------------------------------------------------
+// 协议级错误(§27.5:与 HTTP code 使用同一稳定 code 集合)
+// ---------------------------------------------------------------------------
+
+message ProtocolError {
+  StableErrorCode error_code = 1;
+  // 面向用户的简体中文说明;前端不得依赖自由文本判断流程。
+  string message = 2;
+  // 关联的命令/查询 request_id(若有)。
+  string request_id = 3;
+  // 关联的流 ID(若有)。
+  string stream_id = 4;
+  map<string, string> details = 5;
+}

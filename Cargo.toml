@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = ["apps/bridge", "apps/relay", "crates/protocol"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "private"
+
+[workspace.dependencies]
+# ---------------------------------------------------------------- 异步运行时与 Web 框架
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+hyper = "1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+http-body-util = "0.1"
+futures = "0.3"
+tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+
+# ---------------------------------------------------------------- 序列化与数据结构
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+url = "2"
+
+# ---------------------------------------------------------------- 错误处理与并发工具
+thiserror = "2"
+anyhow = "1"
+parking_lot = "0.12"
+async-trait = "0.1"
+
+# ---------------------------------------------------------------- 标识、时间与随机
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+
+# ---------------------------------------------------------------- 摘要、编码与常量时间比较
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+subtle = "2"
+
+# ---------------------------------------------------------------- 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ---------------------------------------------------------------- Protobuf(prost-build/protox 仅作 build-dependencies)
+prost = "0.13"
+prost-types = "0.13"
+prost-build = "0.13"
+protox = "0.7"
+
+# ---------------------------------------------------------------- 数据库
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "sqlite",
+    "migrate",
+    "chrono",
+    "uuid",
+] }
+
+# ---------------------------------------------------------------- HTTP 客户端与 CLI
+reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"] }
+clap = { version = "4", features = ["derive"] }
+
+# ---------------------------------------------------------------- Mac 本机能力
+directories = "5"
+keyring = "3"
+infer = "0.16"
+
+# ---------------------------------------------------------------- Web Push 后端
+web-push = "0.10"
+
+# ---------------------------------------------------------------- 内部 crate
+agent_console_protocol = { path = "crates/protocol" }

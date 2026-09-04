@@ -1,0 +1,501 @@
+// 运行快照、历史分页与查询(§11.1 数据接口 2-3、§10、§16.1 动态设置)。
+//
+// RuntimeSnapshot、HistoryPage 必须由在线 Bridge 提供;设备离线时返回稳定
+// DEVICE_OFFLINE,不得用服务器陈旧正文代替(§11.1)。
+//
+// 字段号冻结约定见 common.proto 头注释。
+
+syntax = "proto3";
+
+package agent_console.v1;
+
+import "google/protobuf/timestamp.proto";
+import "agent_console/v1/common.proto";
+import "agent_console/v1/commands.proto";
+
+// ---------------------------------------------------------------------------
+// 当前 turn
+// ---------------------------------------------------------------------------
+
+message CurrentTurn {
+  TurnId turn = 1;
+  ActiveTurnPhase phase = 2;
+  google.protobuf.Timestamp started_at = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Plan(§9.3 可见内容)
+// ---------------------------------------------------------------------------
+
+message PlanStep {
+  // 步骤稳定 ID(原生或 Adapter synthetic,§9.2)。
+  string step_id = 1;
+  string title = 2;
+  PlanStepStatus status = 3;
+}
+
+enum PlanStepStatus {
+  PLAN_STEP_STATUS_UNSPECIFIED = 0;
+  PLAN_STEP_PENDING = 1;
+  PLAN_STEP_IN_PROGRESS = 2;
+  PLAN_STEP_COMPLETED = 3;
+}
+
+message Plan {
+  repeated PlanStep steps = 1;
+}
+
+// ---------------------------------------------------------------------------
+// PendingAttention(§10.5、§16.3 问题、§16.4 审批)
+// ---------------------------------------------------------------------------
+
+message QuestionOption {
+  // 原生选项 ID。Browser 回答必须发送 option ID,不能只发送展示文案。
+  string option_id = 1;
+  // 展示标签。
+  string label = 2;
+}
+
+message PendingAttentionQuestion {
+  // 原生 question ID。回答只允许按原生 ID。
+  string question_id = 1;
+  string title = 2;
+  string description = 3;
+  repeated QuestionOption options = 4;
+  bool allow_multiple = 5;
+  bool allow_free_text = 6;
+  TurnId turn = 7;
+  google.protobuf.Timestamp created_at = 8;
+  // 失效状态(§16.3):回答后、turn 结束或超时后置 false;前端不得再提交。
+  bool valid = 9;
+}
+
+message ApprovalDecision {
+  // 原生 decision ID。Bridge 只能调用 Desktop 提供的原生决定,
+  // 不得创造"永远允许"或扩大范围的选项(§16.4)。
+  string decision_id = 1;
+  string label = 2;
+}
+
+message PendingAttentionApproval {
+  // 原生 approval ID。
+  string approval_id = 1;
+  // 风险说明(面向用户)。
+  string risk_description = 2;
+  // 请求动作的描述。
+  string requested_action = 3;
+  // 可用决定列表。
+  repeated ApprovalDecision decisions = 4;
+  // 作用范围(如本次命令/本会话),由 Desktop 原生提供。
+  string scope = 5;
+  TurnId turn = 6;
+  google.protobuf.Timestamp created_at = 7;
+  // 失效状态(§16.4)。
+  bool valid = 8;
+}
+
+// ---------------------------------------------------------------------------
+// 设置(§16.1 动态能力;option ID 与可选值来自 Adapter capability snapshot,
+// 不得在协议或前端硬编码具体模型列表)
+// ---------------------------------------------------------------------------
+
+enum SettingKind {
+  SETTING_KIND_UNSPECIFIED = 0;
+  SETTING_KIND_MODEL = 1;
+  SETTING_KIND_REASONING_EFFORT = 2;
+  SETTING_KIND_SERVICE_TIER = 3;
+  SETTING_KIND_PERMISSION_MODE = 4;
+  SETTING_KIND_COLLABORATION_MODE = 5;
+}
+
+message SettingValue {
+  // 原生值标识。
+  string value = 1;
+  // 展示标签。
+  string label = 2;
+}
+
+message SettingOption {
+  // 原生 option ID。
+  string option_id = 1;
+  SettingKind kind = 2;
+  string label = 3;
+  // 当前生效值(原生值标识)。
+  string current_value = 4;
+  // 当前可选值列表。
+  repeated SettingValue available_values = 5;
+  // 当前是否可变更(如运行中锁定)。
+  bool mutable = 6;
+}
+
+// ---------------------------------------------------------------------------
+// 命令与队列
+// ---------------------------------------------------------------------------
+
+// 正在运行的主 turn 命令(状态层面;命令输出属于 item/输出游标)。
+message RunningCommand {
+  // 稳定 command ID(§9.2)。
+  string command_id = 1;
+  // 关联输出 item(若有)。
+  ItemId item_id = 2;
+  google.protobuf.Timestamp started_at = 3;
+}
+
+// 后台命令(§10.8)。command_id 无法稳定识别时,RuntimeSnapshot 不提供单项
+// 条目、只提供 background_command_count 总数与全局停止 capability(§9.2),
+// 不伪造单项停止。
+message BackgroundCommand {
+  string command_id = 1;
+  ItemId item_id = 2;
+  BackgroundCommandState state = 3;
+  google.protobuf.Timestamp started_at = 4;
+  google.protobuf.Timestamp finished_at = 5;
+}
+
+// 单条下一轮队列状态(§15.3)。正文只保存在 Bridge SQLite,
+// 本消息不携带队列 prompt 正文。
+message QueueStatus {
+  QueueState state = 1;
+  // 队列绑定的目标 turn。
+  TurnId after_turn_id = 2;
+  // 接受队列时的 runtime revision;变化即 STALE_TURN/PAUSED 的判定依据。
+  uint64 accepted_runtime_revision = 3;
+}
+
+// ---------------------------------------------------------------------------
+// 输出游标(§13.2)
+// ---------------------------------------------------------------------------
+
+// 每个可输出 item 至少维护的游标信息。
+message OutputCursor {
+  ItemId item_id = 1;
+  uint64 revision = 2;
+  uint64 byte_length = 3;
+  bool is_final = 4;
+  // 原生可区分时为 STDOUT/STDERR;不可区分时只能 COMBINED,不得猜测。
+  OutputChannel channel = 5;
+}
+
+// ---------------------------------------------------------------------------
+// CapabilitySnapshot(Envelope payload 与 RuntimeSnapshot 共用;§16.1、§22.3、§5)
+// ---------------------------------------------------------------------------
+
+message CapabilitySnapshot {
+  ControlMode control_mode = 1;
+  CompatibilityState compatibility_state = 2;
+  // Codex Desktop/CLI 探测到的版本;版本会变化,只作显示与兼容判断,
+  // 不得用固定字符串匹配开启写能力(§5)。
+  string codex_version = 3;
+  // 当前 capability probe 已验证可用的写操作集合(§5:任何写能力只有
+  // probe 通过后才能开启;未知版本默认只读)。
+  repeated Operation supported_operations = 4;
+  // 会话级可变更设置(§16.1)。option ID/可选值动态读取,不得硬编码。
+  repeated SettingOption settings = 5;
+  // 文件预览/下载/上传限制(§22.3 集中定义)。
+  TransferLimits transfer_limits = 6;
+}
+
+// ---------------------------------------------------------------------------
+// RuntimeSnapshot(§11.1 数据接口 2/4;§17.4 详情订阅快照)
+// ---------------------------------------------------------------------------
+
+message RuntimeSnapshot {
+  // 快照对应的运行时修订号;写命令的 expected_runtime_revision 与之比较。
+  uint64 runtime_revision = 1;
+
+  // 当前 turn;idle 时缺省。
+  CurrentTurn current_turn = 2;
+  Plan plan = 3;
+
+  // 待处理关注(§10.5)。生命周期必须可靠恢复,不能按最佳努力处理(§13.1)。
+  repeated PendingAttentionQuestion pending_questions = 4;
+  repeated PendingAttentionApproval pending_approvals = 5;
+
+  // 正在运行的命令。
+  repeated RunningCommand running_commands = 6;
+
+  // 后台命令(单项条目仅在 command ID 稳定可识别时提供)。
+  repeated BackgroundCommand background_commands = 7;
+  // 后台命令总数(§9.2:无法稳定识别单项时只提供总数)。
+  uint32 background_command_count = 8;
+
+  QueueStatus queue = 9;
+
+  // 能力摘要。
+  CapabilitySnapshot capabilities = 10;
+
+  // 最近输出 item 的游标列表,供前端对齐本地状态(§13.2)。
+  repeated OutputCursor recent_output_cursors = 11;
+}
+
+// ---------------------------------------------------------------------------
+// HistoryPage(§11.1 数据接口 3/4;§27.5 分页默认 50、最大 200)
+// ---------------------------------------------------------------------------
+
+// 历史条目:turn 内的可见 item,内容与实时 ItemUpsert 相同(§9.3)。
+message HistoryEntry {
+  TurnId turn = 1;
+  Item item = 2;
+}
+
+message HistoryPage {
+  repeated HistoryEntry entries = 1;
+  // 继续向前读取的稳定 cursor;为空表示已到最早端。
+  // 禁止使用页码加可变排序(§27.5)。
+  string next_cursor = 2;
+  bool has_more = 3;
+}
+
+// ---------------------------------------------------------------------------
+// 领域条目 Item(§9.3 可见内容边界)
+//
+// 实时事件(events.proto 的 ItemUpsert)与历史分页共用同一结构。
+// 只允许标准化 §9.3 列出的用户可见内容;不得传输隐藏 chain-of-thought、
+// 私有系统提示、原始 IPC 调试字段或不面向用户的凭据。
+// ---------------------------------------------------------------------------
+
+message Item {
+  ItemId item_id = 1;
+  TurnId turn = 2;
+  // 条目修订号;输出类条目随内容追加递增(§13.2)。
+  uint64 revision = 3;
+  google.protobuf.Timestamp created_at = 4;
+
+  oneof content {
+    // 用户消息。
+    UserMessage user_message = 5;
+    // Assistant commentary/final;final=true 区分最终回复。
+    AssistantMessage assistant_message = 6;
+    // Codex 提供给用户的可见 reasoning summary;不得含隐藏思维链。
+    ReasoningSummary reasoning_summary = 7;
+    // Plan 及步骤状态。
+    Plan plan = 8;
+    // 工具调用记录(名称、状态、时长、用户可见输出)。
+    ToolCall tool_call = 9;
+    // 命令状态变化。
+    CommandStatusItem command_status = 10;
+    // 文件变化(时间线只传 metadata 与受限摘要;正文走 OnDemandDetail/文件面)。
+    FileChangeSet file_change = 11;
+    // 子 Agent 状态(必须带父 turn 关系,§9.2)。
+    SubAgentStatus subagent_status = 12;
+    // 问题出现。
+    PendingAttentionQuestion question = 13;
+    // 审批出现。
+    PendingAttentionApproval approval = 14;
+    // Token/context 用量。
+    TokenUsage token_usage = 15;
+  }
+}
+
+message UserMessage {
+  string text = 1;
+}
+
+message AssistantMessage {
+  string text = 1;
+  // true = final 回复;false = commentary。
+  bool final = 2;
+}
+
+message ReasoningSummary {
+  string text = 1;
+}
+
+message ToolCall {
+  // 工具调用稳定 ID(原生或 synthetic)。
+  string tool_call_id = 1;
+  // 工具名(如 shell、apply_patch)。
+  string name = 2;
+  PlanStepStatus status = 3;
+  // 用户可见的参数摘要;不得包含敏感参数原文或本机绝对路径。
+  string summary = 4;
+  // 执行时长(毫秒);未结束时为 0。
+  uint64 duration_ms = 5;
+}
+
+message CommandStatusItem {
+  string command_id = 1;
+  BackgroundCommandState state = 2;
+  google.protobuf.Timestamp started_at = 3;
+  google.protobuf.Timestamp finished_at = 4;
+  uint64 duration_ms = 5;
+}
+
+enum FileChangeKind {
+  FILE_CHANGE_KIND_UNSPECIFIED = 0;
+  FILE_CHANGE_ADDED = 1;
+  FILE_CHANGE_MODIFIED = 2;
+  FILE_CHANGE_DELETED = 3;
+  FILE_CHANGE_RENAMED = 4;
+}
+
+message FileChange {
+  // 相对授权根的路径;禁止本机绝对路径(§17.2)。
+  string path = 1;
+  FileChangeKind kind = 2;
+  // 重命名后的新路径(仅 RENAMED)。
+  string new_path = 3;
+  // 小型 Diff 可内联;必须按 UTF-8 边界截断,并置 diff_truncated=true。
+  // 大 Diff 不内联,走 OnDemandDetail 查询(单 Diff 响应最大 2 MiB,§27.5)。
+  bytes inline_diff = 4;
+  bool diff_truncated = 5;
+}
+
+message FileChangeSet {
+  repeated FileChange files = 1;
+}
+
+message SubAgentStatus {
+  // 子 Agent 自身的稳定 turn ID。
+  TurnId subagent_turn = 1;
+  // 父任务/父 turn 关系(§9.2 必须携带)。
+  TurnId parent_turn = 2;
+  // 展示名称。
+  string label = 3;
+  ActiveTurnPhase phase = 4;
+  // 终态时的结果;未结束时为 UNSPECIFIED。
+  LastTurnOutcome outcome = 5;
+}
+
+message TokenUsage {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  // 当前上下文已用量与窗口大小。
+  uint64 context_used_tokens = 3;
+  uint64 context_window_tokens = 4;
+}
+
+// ---------------------------------------------------------------------------
+// 在线查询(§11.1 数据接口 4/4 OnDemandDetail 的读取入口;§27.3)
+// ---------------------------------------------------------------------------
+
+message CommandOutputPage {
+  ItemId item_id = 1;
+  // 稳定续读 cursor;为空表示已到末尾。
+  string next_cursor = 2;
+  // 本页字节。单页最大 256 KiB(§27.5)。
+  bytes bytes = 3;
+  bool is_final = 4;
+  OutputChannel channel = 5;
+}
+
+message QueryRequest {
+  // 查询目标会话;缺省表示设备级查询。
+  SessionKey session_key = 1;
+  oneof query {
+    // 请求当前 RuntimeSnapshot(§17.4 Resync 时也由此取新快照)。
+    RuntimeSnapshotQuery runtime_snapshot = 2;
+    // 从 cursor 向前读取历史;cursor 为空表示从最新开始。
+    HistoryPageQuery history_page = 3;
+    // 完整命令输出分页读取。
+    CommandOutputPageQuery command_output_page = 4;
+    // 当前会话 cwd 所属已授权 worktree 的 Git 只读摘要(§23.1)。
+    GitSummaryQuery git_summary = 5;
+    // 单文件 staged/unstaged Diff(§23.1)。
+    GitFileDiffQuery git_file_diff = 6;
+    // 按 Bridge 签发的 file_handle 读取文件元数据(§22.2/§27.3)。
+    FileMetadataQuery file_metadata = 7;
+  }
+}
+
+message RuntimeSnapshotQuery {}
+
+message HistoryPageQuery {
+  // 起点 cursor;为空表示从最新向前读取。
+  string cursor = 1;
+  // 页大小;0 表示协议默认 50,上限 200(§27.5)。
+  uint32 page_size = 2;
+}
+
+message CommandOutputPageQuery {
+  ItemId item_id = 1;
+  string cursor = 2;
+  uint32 page_size = 3;
+}
+
+message QueryResponse {
+  // 与 QueryRequest 对应的关联 ID(取 Envelope.correlation_id)。
+  string request_id = 1;
+  oneof result {
+    RuntimeSnapshot runtime_snapshot = 2;
+    HistoryPage history_page = 3;
+    CommandOutputPage command_output_page = 4;
+    GitSummaryData git_summary = 6;
+    GitFileDiffData git_file_diff = 7;
+    FileMetadataData file_metadata = 8;
+  }
+  // 查询失败时的稳定错误码(如 DEVICE_OFFLINE、SESSION_NOT_FOUND);
+  // 成功时为 UNSPECIFIED。
+  StableErrorCode error_code = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Git 只读摘要(§23.1;数据由在线 Bridge 提供,Browser 不见本机绝对路径)
+// ---------------------------------------------------------------------------
+
+message GitSummaryQuery {}
+
+message GitStatusEntry {
+  // 相对于仓库根的路径;不含绝对路径。
+  string relative_path = 1;
+  // staged/unstaged/untracked/added/modified/deleted/renamed。
+  string status = 2;
+  bool staged = 3;
+}
+
+message GitSummaryData {
+  // 当前分支;detached HEAD 时为空并置 detached_head=true。
+  string branch = 1;
+  bool detached_head = 2;
+  // HEAD 短 ID 与完整 ID。
+  string head_short = 3;
+  string head_full = 4;
+  // 仓库根的安全显示名(尾段);不含绝对路径。
+  string root_display_name = 5;
+  repeated GitStatusEntry entries = 6;
+  // 总增删行(不含二进制)。
+  int64 insertions = 7;
+  int64 deletions = 8;
+  // 二进制文件相对路径列表。
+  repeated string binary_files = 9;
+}
+
+message GitFileDiffQuery {
+  string relative_path = 1;
+  bool staged = 2;
+}
+
+message GitFileDiffData {
+  string relative_path = 1;
+  bool staged = 2;
+  // Diff 文本;单响应上限 2 MiB(§27.5)。
+  string patch_text = 3;
+  // 超限时为 true,patch_text 为截断结果;前端可选文件下载替代。
+  bool truncated = 4;
+  // 未截断时的完整字节数(估算)。
+  uint64 total_bytes = 5;
+  bool binary = 6;
+}
+
+// ---------------------------------------------------------------------------
+// 文件元数据(§22.2/§22.3;正文一律走 transfer HTTP 流,不进 Protobuf)
+// ---------------------------------------------------------------------------
+
+message FileMetadataQuery {
+  // Bridge 签发的高熵 file_handle;Browser 不能提交本机路径。
+  string file_handle = 1;
+}
+
+message FileMetadataData {
+  // 安全显示名(不含绝对路径)。
+  string display_name = 1;
+  // Bridge 实测 MIME(嗅探优先)。
+  string mime_type = 2;
+  uint64 size_bytes = 3;
+  // 是否可内联预览及预览类型:text/image/pdf/none。
+  string preview_kind = 4;
+  // 不可预览时的稳定原因(如 FILE_TYPE_NOT_PREVIEWABLE 的大小原因)。
+  string not_previewable_reason = 5;
+  // 可继续用于 preview/download 的句柄(可能刷新)。
+  string file_handle = 6;
+}

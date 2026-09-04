@@ -1,0 +1,57 @@
+{
+  "runtimeSnapshot": {
+    "runtimeRevision": 45,
+    "currentTurn": null,
+    "plan": null,
+    "pendingQuestions": [],
+    "pendingApprovals": [],
+    "runningCommands": [],
+    "backgroundCommands": [
+      {
+        "commandId": "fixture-bg-command-1",
+        "itemId": {
+          "id": "fixture-item-bg-1",
+          "synthetic": false
+        },
+        "state": "BACKGROUND_CMD_RUNNING",
+        "startedAt": "2026-09-04T09:50:00+00:00",
+        "finishedAt": null
+      },
+      {
+        "commandId": "fixture-bg-command-2",
+        "itemId": {
+          "id": "fixture-item-bg-2",
+          "synthetic": false
+        },
+        "state": "BACKGROUND_CMD_COMPLETED",
+        "startedAt": "2026-09-04T09:40:00+00:00",
+        "finishedAt": "2026-09-04T09:49:00+00:00"
+      }
+    ],
+    "backgroundCommandCount": 2,
+    "queue": null,
+    "capabilities": {
+      "controlMode": "CONTROL_MODE_LIMITED_CONTROL",
+      "compatibilityState": "COMPATIBILITY_VERIFIED",
+      "codexVersion": "fixture-only",
+      "supportedOperations": [
+        "OPERATION_START_TURN",
+        "OPERATION_QUEUE_SET"
+      ],
+      "settings": [],
+      "transferLimits": null
+    },
+    "recentOutputCursors": [
+      {
+        "itemId": {
+          "id": "fixture-item-output-1",
+          "synthetic": false
+        },
+        "revision": 12,
+        "byteLength": 8832,
+        "isFinal": true,
+        "channel": "OUTPUT_CHANNEL_COMBINED"
+      }
+    ]
+  }
+}

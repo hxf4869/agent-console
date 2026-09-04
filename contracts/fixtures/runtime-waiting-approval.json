@@ -1,0 +1,58 @@
+{
+  "runtimeSnapshot": {
+    "runtimeRevision": 44,
+    "currentTurn": {
+      "turn": {
+        "id": "fixture-turn-2",
+        "synthetic": false
+      },
+      "phase": "TURN_PHASE_RUNNING",
+      "startedAt": "2026-09-04T10:02:00+00:00"
+    },
+    "plan": null,
+    "pendingQuestions": [],
+    "pendingApprovals": [
+      {
+        "approvalId": "fixture-approval-1",
+        "riskDescription": "将修改 2 个源文件(合成场景说明)",
+        "requestedAction": "应用补丁到工作区",
+        "decisions": [
+          {
+            "decisionId": "fixture-decision-approve",
+            "label": "批准一次"
+          },
+          {
+            "decisionId": "fixture-decision-reject",
+            "label": "拒绝"
+          }
+        ],
+        "scope": "本次命令",
+        "turn": {
+          "id": "fixture-turn-2",
+          "synthetic": false
+        },
+        "createdAt": "2026-09-04T10:03:00+00:00",
+        "valid": true
+      }
+    ],
+    "runningCommands": [],
+    "backgroundCommands": [],
+    "backgroundCommandCount": 0,
+    "queue": null,
+    "capabilities": {
+      "controlMode": "CONTROL_MODE_LIMITED_CONTROL",
+      "compatibilityState": "COMPATIBILITY_VERIFIED",
+      "codexVersion": "fixture-only",
+      "supportedOperations": [
+        "OPERATION_START_TURN",
+        "OPERATION_QUEUE_SET",
+        "OPERATION_STEER",
+        "OPERATION_INTERRUPT",
+        "OPERATION_ANSWER_APPROVAL"
+      ],
+      "settings": [],
+      "transferLimits": null
+    },
+    "recentOutputCursors": []
+  }
+}

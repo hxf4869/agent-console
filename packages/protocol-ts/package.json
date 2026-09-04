@@ -1,0 +1,32 @@
+{
+  "name": "@agent-console/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent Console Protobuf TypeScript 类型与窄编解码入口(由仓库根 proto/agent_console/v1 生成,不含任何 UI/网络代码)",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./source": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "generate": "bash ../../scripts/gen-protobuf.sh",
+    "build": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.5.2"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "^2.5.2",
+    "typescript": "^5.8.3"
+  }
+}

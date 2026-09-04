@@ -1,0 +1,4 @@
+# pnpm workspace:仅纳入 packages/*(packages/protocol-ts 由 proto workstream 创建)。
+# 注意:apps/ 归 UI/前端 workstream 所有(apps/web 尚不存在,由前端任务自行管理),此处不纳入。
+packages:
+  - "packages/*"

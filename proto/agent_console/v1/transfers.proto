@@ -1,0 +1,76 @@
+// 文件 transfer 协调消息(§22)。
+//
+// 固定原则(§22.1):WebSocket 只协调 transfer,不传文件正文。
+// 文件正文经 Relay 的临时 HTTPS producer/consumer 流式转发(带 transfer
+// token 与 device credential,均不经 Envelope 传递——§17.2 禁止凭据入帧)。
+// 本文件任何消息禁止携带文件正文、Cookie、凭据或本机绝对路径。
+//
+// 字段号冻结约定见 common.proto 头注释。
+
+syntax = "proto3";
+
+package agent_console.v1;
+
+import "google/protobuf/timestamp.proto";
+import "agent_console/v1/common.proto";
+
+enum TransferDirection {
+  TRANSFER_DIRECTION_UNSPECIFIED = 0;
+  // Browser → Bridge(Bridge 写入私有临时目录,校验后签发 upload handle,§22.5)。
+  TRANSFER_DIRECTION_UPLOAD = 1;
+  // Bridge → Browser(preview/download,§22.4)。
+  TRANSFER_DIRECTION_DOWNLOAD = 2;
+}
+
+enum TransferOutcome {
+  TRANSFER_OUTCOME_UNSPECIFIED = 0;
+  TRANSFER_OUTCOME_COMPLETED = 1;
+  TRANSFER_OUTCOME_CANCELLED = 2;
+  TRANSFER_OUTCOME_FAILED = 3;
+}
+
+// Transfer 协调发起。
+// 下载:Relay 在收到 Browser 已认证 preview/download 请求后创建短期 transfer,
+// 通知对应 Bridge(offer 携带 file_handle 与可选 Range 语义)。
+// 上传:Browser 先声明文件名、MIME 与长度,Relay 通知 Bridge。
+message TransferOffer {
+  // 短期 transfer ID。
+  string transfer_id = 1;
+  TransferDirection direction = 2;
+  // 目标会话(handle 与 transfer 都绑定 session)。
+  SessionKey session_key = 3;
+  // 安全显示名(不来自原始路径的 sanitized 文件名)。
+  string file_name = 4;
+  string mime_type = 5;
+  uint64 size_bytes = 6;
+  // 高熵随机 file handle 引用(§22.2);仅下载方向携带。
+  // Relay 不需要也不得知道本机路径。
+  string file_handle = 7;
+  // HTTP 单 Range 语义(§22.4 仅支持单 Range);协调层只描述,
+  // 实际 Range 校验由 Bridge 复验,无效/多段/越界返回 TRANSFER_RANGE_INVALID。
+  uint64 range_start = 8;
+  optional uint64 range_end_inclusive = 9;
+  google.protobuf.Timestamp expires_at = 10;
+}
+
+// Transfer 就绪/拒绝应答(Bridge → Browser 方向,经 Relay 转发)。
+message TransferReady {
+  string transfer_id = 1;
+  bool ready = 2;
+  // ready=false 时的稳定拒绝码(如 FILE_HANDLE_INVALID、TRANSFER_TOO_LARGE、
+  // DEVICE_OFFLINE、FILE_TYPE_NOT_PREVIEWABLE)。
+  StableErrorCode rejection_code = 3;
+}
+
+// Transfer 终态。任一端取消或超时,另外两端立即取消,不继续读取(§22.4)。
+// Relay 重启或 Bridge 断开时 transfer 失败,前端显示可重试,
+// 不把 transfer 放入离线队列(§22.6)。
+message TransferResult {
+  string transfer_id = 1;
+  TransferOutcome outcome = 2;
+  // 失败/取消原因码;COMPLETED 时为 UNSPECIFIED。
+  StableErrorCode error_code = 3;
+  // 上传成功后 Bridge 签发的 upload handle(§22.5 第 6 步);
+  // 仅 UPLOAD 且 COMPLETED 时携带;Browser 用它把文件提交给会话消息。
+  string upload_file_handle = 4;
+}

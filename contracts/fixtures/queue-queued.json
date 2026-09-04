@@ -1,0 +1,51 @@
+{
+  "runtimeSnapshot": {
+    "runtimeRevision": 46,
+    "currentTurn": {
+      "turn": {
+        "id": "fixture-turn-3",
+        "synthetic": false
+      },
+      "phase": "TURN_PHASE_RUNNING",
+      "startedAt": "2026-09-04T10:10:00+00:00"
+    },
+    "plan": null,
+    "pendingQuestions": [],
+    "pendingApprovals": [],
+    "runningCommands": [
+      {
+        "commandId": "fixture-command-2",
+        "itemId": {
+          "id": "fixture-item-output-2",
+          "synthetic": false
+        },
+        "startedAt": "2026-09-04T10:10:05+00:00"
+      }
+    ],
+    "backgroundCommands": [],
+    "backgroundCommandCount": 0,
+    "queue": {
+      "state": "QUEUE_STATE_QUEUED",
+      "afterTurnId": {
+        "id": "fixture-turn-3",
+        "synthetic": false
+      },
+      "acceptedRuntimeRevision": 45
+    },
+    "capabilities": {
+      "controlMode": "CONTROL_MODE_LIMITED_CONTROL",
+      "compatibilityState": "COMPATIBILITY_VERIFIED",
+      "codexVersion": "fixture-only",
+      "supportedOperations": [
+        "OPERATION_QUEUE_SET",
+        "OPERATION_QUEUE_REPLACE",
+        "OPERATION_QUEUE_CANCEL",
+        "OPERATION_STEER",
+        "OPERATION_INTERRUPT"
+      ],
+      "settings": [],
+      "transferLimits": null
+    },
+    "recentOutputCursors": []
+  }
+}
