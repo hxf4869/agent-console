@@ -252,15 +252,22 @@ async fn watch_session_sweeps_on_turn_terminal_event() {
         }
     }
 
-    assert!(
-        wait_until(
-            || cleaner.sweep_calls.load(Ordering::SeqCst) > 0,
-            Duration::from_secs(10)
-        )
-        .await,
-        "turn 终态应触发上传清理"
-    );
-    let records = store.list_upload_cleanups().await.unwrap();
+    // cleaner 计数先于异步数据库记录递增；直接等待计数会在较慢的 Linux
+    // runner 上抢先读取空表。以最终持久化记录作为完成条件。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let records = loop {
+        let records = store.list_upload_cleanups().await.unwrap();
+        if !records.is_empty() {
+            break records;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "turn 终态应触发上传清理并写入记录"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(cleaner.sweep_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(records.len(), 1);
     assert_eq!(records[0].reason, "turn_completed");
 }
 
