@@ -596,7 +596,9 @@ impl BridgeRuntime {
             if let Ok(queue) = self.queue().queue_status(&summary.session_key).await {
                 summary.queue_state = queue.state;
             }
-            self.attach_session(&summary.session_key).await;
+            // 列表流只发布 catalog 摘要，不为每个任务建立详情 following。
+            // 完整 history snapshot 只在详情订阅/运行态查询时读取，避免一个
+            // 大历史任务阻塞其他任务的首屏与控制命令。
             summaries.push(pm::session_summary_to_proto(&summary));
         }
         let batch = pb::SessionSummaryBatch {
@@ -665,7 +667,7 @@ impl BridgeRuntime {
         self.send_subscribed(&correlation, &stream_id, epoch);
 
         // RuntimeSnapshot(§11.2):在线 Bridge 权威来源;队列状态并入。
-        match self.inner.adapter.runtime_snapshot(&key).await {
+        match self.inner.adapter.refresh_snapshot(&key).await {
             Ok(mut snapshot) => {
                 if let Ok(queue) = self.queue().queue_status(&key).await {
                     snapshot.queue = queue;
@@ -909,7 +911,7 @@ impl BridgeRuntime {
         let mut snapshot = self
             .inner
             .adapter
-            .runtime_snapshot(&key)
+            .refresh_snapshot(&key)
             .await
             .map_err(adapter_err)?;
         if let Ok(queue) = self.queue().queue_status(&key).await {
@@ -962,25 +964,43 @@ impl BridgeRuntime {
         } else {
             (page.page_size as usize).min(OUTPUT_PAGE_MAX)
         };
-        let outputs = self.inner.outputs.lock();
-        let buffer = outputs
-            .get(&key.native_session_id)
-            .and_then(|items| items.get(&item.id))
+        let buffered = {
+            let outputs = self.inner.outputs.lock();
+            outputs
+                .get(&key.native_session_id)
+                .and_then(|items| items.get(&item.id))
+                .map(|buffer| {
+                    let start = (offset as usize).min(buffer.data.len());
+                    let end = start.saturating_add(limit).min(buffer.data.len());
+                    (
+                        buffer.data[start..end].to_vec(),
+                        buffer.data.len(),
+                        buffer.is_final,
+                    )
+                })
+        };
+        let (chunk, total_len, output_final) = buffered
+            .or_else(|| {
+                self.inner.adapter.output_page(
+                    &key,
+                    &dm::ItemId {
+                        id: item.id.clone(),
+                        synthetic: item.synthetic,
+                    },
+                    offset as usize,
+                    limit,
+                )
+            })
             .ok_or_else(|| {
-                // 未持有该 item 投影:要求前端重订阅对齐(§13.2)。
                 dm::BridgeError::new(
                     dm::StableErrorCode::ResyncRequired,
-                    "output not buffered; subscribe the session first",
+                    "output unavailable in current authoritative snapshot",
                 )
             })?;
-        let start = (offset as usize).min(buffer.data.len());
-        let end = (start + limit).min(buffer.data.len());
-        let chunk = buffer.data[start..end].to_vec();
-        let next_cursor = if end < buffer.data.len() {
-            end.to_string()
-        } else {
-            String::new()
-        };
+        let end = (offset as usize).min(total_len).saturating_add(chunk.len());
+        let next_cursor = (end < total_len)
+            .then(|| end.to_string())
+            .unwrap_or_default();
         Ok(pb::query_response::Result::CommandOutputPage(
             pb::CommandOutputPage {
                 item_id: Some(pb::ItemId {
@@ -989,7 +1009,7 @@ impl BridgeRuntime {
                 }),
                 next_cursor,
                 bytes: chunk,
-                is_final: buffer.is_final && end >= buffer.data.len(),
+                is_final: output_final && end >= total_len,
                 channel: pb::OutputChannel::Combined as i32,
             },
         ))

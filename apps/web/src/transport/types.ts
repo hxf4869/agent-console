@@ -124,6 +124,7 @@ export interface OutputState {
   isFinal: boolean
   authority: OutputAuthority
   hasGap: boolean
+  loadState?: 'DEFERRED' | 'LOADING' | 'FAILED'
 }
 
 export type OutputEvent =

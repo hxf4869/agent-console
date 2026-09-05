@@ -32,6 +32,20 @@ pub struct CommandRequest {
     pub payload: CommandPayload,
 }
 
+impl CommandRequest {
+    /// Interrupt 已用强目标 `expected_turn_id` 绑定用户意图。同一 turn
+    /// 运行期间的输出 patch 会推进 Desktop revision，不应单独使中断
+    /// 变成 STALE_TURN；turn 已变化时仍严格拒绝。
+    pub fn permits_revision_drift(&self, current_turn: Option<&TurnId>) -> bool {
+        matches!(self.payload, CommandPayload::Interrupt)
+            && self
+                .expected_turn_id
+                .as_ref()
+                .zip(current_turn)
+                .is_some_and(|(expected, current)| expected == current)
+    }
+}
+
 /// 写命令载荷(领域形态)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "payload", rename_all = "snake_case")]
@@ -110,4 +124,40 @@ pub struct QueuedTurn {
     pub state: QueueState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(payload: CommandPayload, expected_turn_id: Option<TurnId>) -> CommandRequest {
+        CommandRequest {
+            request_id: Uuid::nil(),
+            operation: Operation::InterruptTurn,
+            session_key: SessionKey::codex("device", "session"),
+            expected_turn_id,
+            expected_runtime_revision: Some(1),
+            payload_digest: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn interrupt_only_tolerates_revision_drift_for_the_same_turn() {
+        let current = TurnId::native("turn-current");
+        assert!(request(CommandPayload::Interrupt, Some(current.clone()))
+            .permits_revision_drift(Some(&current)));
+        assert!(!request(
+            CommandPayload::Interrupt,
+            Some(TurnId::native("turn-stale"))
+        )
+        .permits_revision_drift(Some(&current)));
+        assert!(!request(
+            CommandPayload::StartTurn {
+                input: OutputText::new("next")
+            },
+            Some(current.clone())
+        )
+        .permits_revision_drift(Some(&current)));
+    }
 }

@@ -16,7 +16,7 @@ import {
   Settings2,
   X,
 } from 'lucide-vue-next'
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
 import NoticeBanner from '@/components/NoticeBanner.vue'
@@ -35,6 +35,7 @@ type MobileSection = 'activity' | 'plan' | 'files' | 'settings'
 const route = useRoute()
 const {
   state,
+  initialize,
   ensureRuntime,
   loadOlderHistory,
   presenceFor,
@@ -45,6 +46,8 @@ const {
 const loading = ref(true)
 const errorMessage = ref('')
 const mobileSection = ref<MobileSection>('activity')
+const mobileMedia = window.matchMedia('(max-width: 759px)')
+const isMobileViewport = ref(mobileMedia.matches)
 const contentPane = ref<HTMLElement | null>(null)
 const attentionTrigger = ref<HTMLElement | null>(null)
 const { sheetElement, sheetOpen, openSheet, closeSheet, onSheetKeydown } = useBottomSheetFocus(
@@ -75,6 +78,13 @@ const backgroundCommands = computed(() =>
 )
 const lastReceipt = computed(() => state.receipts[0])
 
+function syncMobileViewport(event: MediaQueryListEvent): void {
+  isMobileViewport.value = event.matches
+}
+
+onMounted(() => mobileMedia.addEventListener('change', syncMobileViewport))
+onBeforeUnmount(() => mobileMedia.removeEventListener('change', syncMobileViewport))
+
 watch(
   sessionId,
   async (id) => {
@@ -83,6 +93,7 @@ watch(
     mobileSection.value = 'activity'
     sheetOpen.value = false
     try {
+      await initialize()
       await ensureRuntime(id)
     } catch (error) {
       errorMessage.value = error instanceof Error ? error.message : '无法读取任务运行态。'
@@ -209,7 +220,7 @@ function interruptTurn(): void {
           </UiButton>
         </div>
 
-        <div class="desktop-timeline">
+        <div v-if="!isMobileViewport" class="desktop-timeline">
           <TimelineItemCard
             v-for="item in runtime.timeline"
             :key="item.id"
@@ -218,7 +229,7 @@ function interruptTurn(): void {
           />
         </div>
 
-        <div v-show="mobileSection === 'activity'" class="mobile-section mobile-activity">
+        <div v-if="isMobileViewport" v-show="mobileSection === 'activity'" class="mobile-section mobile-activity">
           <TimelineItemCard
             v-for="item in activityItems"
             :key="item.id"
@@ -227,7 +238,7 @@ function interruptTurn(): void {
           />
         </div>
 
-        <div v-show="mobileSection === 'plan'" class="mobile-section mobile-plan">
+        <div v-if="isMobileViewport" v-show="mobileSection === 'plan'" class="mobile-section mobile-plan">
           <TimelineItemCard
             v-for="item in planItems"
             :key="item.id"
@@ -237,7 +248,7 @@ function interruptTurn(): void {
           <p v-if="!planItems.length" class="section-empty">当前没有计划。</p>
         </div>
 
-        <div v-show="mobileSection === 'files'" class="mobile-section mobile-files">
+        <div v-if="isMobileViewport" v-show="mobileSection === 'files'" class="mobile-section mobile-files">
           <RouterLink v-if="state.fixtureMode" :to="`/tasks/${sessionId}/git`">
             <FileCode2 :size="17" /><span><strong>TaskDetailView.vue</strong><small>已修改 · +286</small></span><ChevronRight :size="15" />
           </RouterLink>
@@ -252,7 +263,7 @@ function interruptTurn(): void {
           </RouterLink>
         </div>
 
-        <div v-show="mobileSection === 'settings'" class="mobile-section mobile-settings">
+        <div v-if="isMobileViewport" v-show="mobileSection === 'settings'" class="mobile-section mobile-settings">
           <section class="mobile-runtime">
             <div><span>连接</span><strong>{{ connectionLabel[presence.connection] }}</strong></div>
             <div><span>控制</span><strong class="mono">{{ presence.controlMode }}</strong></div>

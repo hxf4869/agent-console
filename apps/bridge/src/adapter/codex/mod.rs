@@ -38,7 +38,7 @@ use tokio::task::JoinHandle;
 
 use crate::capabilities::{probe, CapabilityProbeInput, WriteMethodProbes};
 use crate::domain::{
-    CapabilitySet, CommandPayload, CommandReceipt, CommandRequest, DomainEvent, Operation,
+    CapabilitySet, CommandPayload, CommandReceipt, CommandRequest, DomainEvent, ItemId, Operation,
     OutputText, ReceiptState, RuntimeSnapshot, SessionKey, SessionSummary, StableErrorCode,
 };
 
@@ -271,13 +271,7 @@ impl CodexAdapter {
             let events = ipc_events
                 .take()
                 .expect("ipc client implies event receiver");
-            tokio::spawn(pump_loop(
-                client.clone(),
-                sessions.clone(),
-                caps_rx,
-                events,
-                config.device_id.clone(),
-            ))
+            tokio::spawn(pump_loop(client.clone(), sessions.clone(), caps_rx, events))
         } else {
             tokio::spawn(async {})
         };
@@ -431,6 +425,83 @@ impl CodexAdapter {
         }
     }
 
+    /// 通过 Desktop 已验证的 `load-complete-history` 重读权威快照。
+    /// owner 返回的 revision 是本次读取的权威水位；若现有投影已经达到
+    /// 该水位，Desktop 可以不重复推送内容未变化的 snapshot。
+    pub async fn refresh_snapshot(
+        &self,
+        key: &SessionKey,
+    ) -> Result<RuntimeSnapshot, AdapterError> {
+        let ipc = self
+            .inner
+            .ipc
+            .as_ref()
+            .ok_or_else(|| AdapterError::stable(StableErrorCode::CodexUnavailable, "ipc offline"))?
+            .clone();
+        {
+            let mut sessions = self.inner.sessions.lock();
+            let runtime = sessions
+                .entry(key.native_session_id.clone())
+                .or_insert_with(|| SessionRuntime::new(key.clone()));
+            runtime.following = true;
+        }
+
+        // 与后续 request 共用同一 IPC 出站队列；先声明 following，保证
+        // owner 处理 load-complete-history 时已知道回发目标。
+        ipc.set_following(
+            FollowingChangedParams {
+                conversation_id: key.native_session_id.clone(),
+                host_id: LOCAL_HOST_ID.to_string(),
+                following: true,
+            },
+            None,
+        )
+        .await
+        .map_err(AdapterError::from)?;
+        let expected_revision = ipc
+            .load_complete_history(LOCAL_HOST_ID, &key.native_session_id)
+            .await
+            .map_err(AdapterError::from)?;
+        let deadline = tokio::time::Instant::now() + SNAPSHOT_WAIT;
+        loop {
+            let snapshot = {
+                let sessions = self.inner.sessions.lock();
+                sessions
+                    .get(&key.native_session_id)
+                    .and_then(|runtime| runtime.mapper.runtime_snapshot())
+            };
+            if let Some(snapshot) = snapshot {
+                if snapshot.runtime_revision >= expected_revision {
+                    return Ok(snapshot);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AdapterError::stable(
+                    StableErrorCode::CodexUnavailable,
+                    "authoritative snapshot not received before timeout",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 从 Adapter 的当前内存投影按需读取历史命令输出，不触发完整
+    /// 会话落盘或 Relay 持久化。
+    pub fn output_page(
+        &self,
+        key: &SessionKey,
+        item_id: &ItemId,
+        offset: usize,
+        limit: usize,
+    ) -> Option<(Vec<u8>, usize, bool)> {
+        self.inner
+            .sessions
+            .lock()
+            .get(&key.native_session_id)?
+            .mapper
+            .output_page(item_id, offset, limit)
+    }
+
     /// 订阅会话详情事件(§17.4:详情订阅才包含 item 变化、输出和 attention)。
     /// 调用方提供 watcher;adapter 推送 [`DomainEvent`]。
     pub async fn subscribe(
@@ -508,11 +579,13 @@ impl CodexAdapter {
         {
             let sessions = self.inner.sessions.lock();
             if let Some(runtime) = sessions.get(&conversation) {
+                let current_turn = runtime.current_turn_id();
                 if let (Some(expected), Some(current)) = (
                     request.expected_runtime_revision,
                     runtime.mapper.runtime_revision(),
                 ) {
-                    if expected != current {
+                    if expected != current && !request.permits_revision_drift(current_turn.as_ref())
+                    {
                         return Err(AdapterError::stable(
                             StableErrorCode::StaleTurn,
                             format!("runtime revision moved {expected} -> {current}"),
@@ -520,7 +593,7 @@ impl CodexAdapter {
                     }
                 }
                 if let Some(expected_turn) = request.expected_turn_id.as_ref() {
-                    if let Some(current_turn) = runtime.current_turn_id() {
+                    if let Some(current_turn) = current_turn {
                         if expected_turn.id != current_turn.id {
                             return Err(AdapterError::stable(
                                 StableErrorCode::StaleTurn,
@@ -931,7 +1004,6 @@ async fn pump_loop(
     sessions: Arc<parking_lot::Mutex<HashMap<String, SessionRuntime>>>,
     caps_rx: watch::Receiver<CapabilitySet>,
     mut events: mpsc::Receiver<IpcEvent>,
-    device_id: String,
 ) {
     // 输出合并的定时冲刷(§26.3:max_delay 内未被 64KiB 触发的缓冲在此发出)。
     let mut flush_ticker = tokio::time::interval(Duration::from_millis(25));
@@ -952,12 +1024,12 @@ async fn pump_loop(
                 let conversation = params.conversation_id.clone();
                 let (events, watchers) = {
                     let mut sessions = sessions.lock();
-                    let runtime = sessions.entry(conversation.clone()).or_insert_with(|| {
-                        SessionRuntime::new(SessionKey::codex(
-                            device_id.clone(),
-                            conversation.clone(),
-                        ))
-                    });
+                    // Desktop 建连时可能补发多个未订阅会话的完整历史快照。
+                    // 列表页只需要 catalog 摘要；详情会先登记 runtime 再
+                    // following。忽略未登记流，避免单个大历史阻塞目标详情。
+                    let Some(runtime) = sessions.get_mut(&conversation) else {
+                        continue;
+                    };
                     runtime.mapper.set_capabilities(caps_rx.borrow().clone());
                     let events = match &params.change {
                         ipc::messages::StreamChange::Snapshot {

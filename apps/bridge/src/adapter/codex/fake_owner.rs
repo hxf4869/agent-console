@@ -29,6 +29,7 @@
 //!     "reasoningEffort": "medium",
 //!     "latestCollaborationMode": {"mode": "fixture", "settings": {}},
 //!     "approvalPolicy": "untrusted",
+//!     "stableHistoryRefresh": false,
 //!     "pendingQuestions": [],
 //!     "pendingApprovals": [],
 //!     "backgroundCommands": [
@@ -194,7 +195,7 @@ fn initial_state(node: &Value) -> Value {
         "currentPermissions": {
             "approvalPolicy": node.get("approvalPolicy").and_then(Value::as_str).unwrap_or("untrusted")
         },
-        "turns": [],
+        "turns": node.get("turns").cloned().unwrap_or_else(|| json!([])),
         "pendingQuestions": node.get("pendingQuestions").cloned().unwrap_or(json!([])),
         "pendingApprovals": node.get("pendingApprovals").cloned().unwrap_or(json!([])),
         "createdAt": 1_000i64,
@@ -367,7 +368,7 @@ async fn dispatch(
                     interrupt_turn(&server, out_tx, &request_id, &conversation);
                 }
                 "thread-follower-load-complete-history" => {
-                    let revision = {
+                    let (revision, replay_snapshot) = {
                         let mut sessions = server.sessions.lock();
                         let Some(session) = sessions.get_mut(&conversation) else {
                             respond(
@@ -380,8 +381,15 @@ async fn dispatch(
                             );
                             return Ok(());
                         };
-                        session.revision += 1;
-                        session.revision
+                        let stable = session
+                            .script
+                            .get("stableHistoryRefresh")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if !stable {
+                            session.revision += 1;
+                        }
+                        (session.revision, !stable)
                     };
                     respond(
                         out_tx,
@@ -391,18 +399,20 @@ async fn dispatch(
                         json!({"revision": revision}),
                         None,
                     );
-                    let snapshot = {
-                        let sessions = server.sessions.lock();
-                        sessions.get(&conversation).map(|s| {
-                            json!({
-                                "type": "snapshot",
-                                "revision": s.revision,
-                                "conversationState": s.state,
+                    if replay_snapshot {
+                        let snapshot = {
+                            let sessions = server.sessions.lock();
+                            sessions.get(&conversation).map(|s| {
+                                json!({
+                                    "type": "snapshot",
+                                    "revision": s.revision,
+                                    "conversationState": s.state,
+                                })
                             })
-                        })
-                    };
-                    if let Some(change) = snapshot {
-                        broadcast_change(&server, &conversation, change, Some(client_id)).await;
+                        };
+                        if let Some(change) = snapshot {
+                            broadcast_change(&server, &conversation, change, Some(client_id)).await;
+                        }
                     }
                 }
                 // 回答问题 / 审批决策:移除对应 pending 项并广播终态。
@@ -467,24 +477,34 @@ async fn dispatch(
                 let conversation = conversation_of(&params);
                 let following = params.get("following").and_then(Value::as_bool) == Some(true);
                 if following {
-                    server
+                    let newly_following = server
                         .followers
                         .lock()
                         .entry(client_id.to_string())
                         .or_default()
                         .insert(conversation.clone());
-                    let snapshot = {
+                    let stable_refresh = {
                         let sessions = server.sessions.lock();
-                        sessions.get(&conversation).map(|s| {
-                            json!({
-                                "type": "snapshot",
-                                "revision": s.revision,
-                                "conversationState": s.state,
-                            })
-                        })
+                        sessions
+                            .get(&conversation)
+                            .and_then(|session| session.script.get("stableHistoryRefresh"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
                     };
-                    if let Some(change) = snapshot {
-                        broadcast_change(&server, &conversation, change, Some(client_id)).await;
+                    if newly_following || !stable_refresh {
+                        let snapshot = {
+                            let sessions = server.sessions.lock();
+                            sessions.get(&conversation).map(|s| {
+                                json!({
+                                    "type": "snapshot",
+                                    "revision": s.revision,
+                                    "conversationState": s.state,
+                                })
+                            })
+                        };
+                        if let Some(change) = snapshot {
+                            broadcast_change(&server, &conversation, change, Some(client_id)).await;
+                        }
                     }
                     eprintln!("[fake-owner] follower {client_id} -> {conversation}");
                 } else {

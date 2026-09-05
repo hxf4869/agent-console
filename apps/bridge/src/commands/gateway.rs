@@ -326,8 +326,18 @@ impl CommandGateway {
                     return Ok(accepted(rx));
                 }
                 Ok(snapshot) => {
+                    let current_turn = snapshot.current_turn.as_ref().map(|turn| &turn.turn);
                     if let Some(expected) = req.expected_runtime_revision {
-                        if expected != snapshot.runtime_revision {
+                        if expected != snapshot.runtime_revision
+                            && !req.permits_revision_drift(current_turn)
+                        {
+                            tracing::debug!(
+                                operation = ?req.operation,
+                                reason = "revision",
+                                expected,
+                                current = snapshot.runtime_revision,
+                                "command precondition stale"
+                            );
                             self.finalize_rejected(
                                 request_id,
                                 &tx,
@@ -343,12 +353,13 @@ impl CommandGateway {
                     }
                     if let Some(expected_turn) = req.expected_turn_id.as_ref() {
                         // §15.2:目标 turn 已变化(包括已无当前 turn)即 stale。
-                        let still_current = snapshot
-                            .current_turn
-                            .as_ref()
-                            .map(|current| current.turn.id == expected_turn.id)
-                            .unwrap_or(false);
+                        let still_current = current_turn == Some(expected_turn);
                         if !still_current {
+                            tracing::debug!(
+                                operation = ?req.operation,
+                                reason = "turn",
+                                "command precondition stale"
+                            );
                             self.finalize_rejected(
                                 request_id,
                                 &tx,

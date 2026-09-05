@@ -36,6 +36,12 @@ interface ToastMessage {
   tone: 'info' | 'success' | 'warning' | 'danger'
 }
 
+interface PendingCommandContext {
+  sessionId: string
+  operation: ControlOperation
+  baselineRevision: number
+}
+
 interface ConsoleState {
   initialized: boolean
   connection: DeviceConnection
@@ -81,7 +87,10 @@ const state = reactive<ConsoleState>({
 })
 
 let disconnectTransport: (() => void) | undefined
-const pendingCommandContexts = new Map<string, { sessionId: string; baselineRevision: number }>()
+const pendingCommandContexts = new Map<string, PendingCommandContext>()
+const reconcileTimers = new Map<number, () => void>()
+const START_RECONCILE_DELAYS_MS = [0, 150, 300, 600, 1_200] as const
+const INTERRUPT_RECONCILE_DELAYS_MS = [0, 250, 500, 1_000, 2_000, 4_000, 8_000, 12_000] as const
 
 async function initialize(): Promise<void> {
   if (state.initialized) return
@@ -112,6 +121,11 @@ function dispose(): void {
   disconnectTransport?.()
   disconnectTransport = undefined
   pendingCommandContexts.clear()
+  for (const [timer, resolve] of reconcileTimers) {
+    window.clearTimeout(timer)
+    resolve()
+  }
+  reconcileTimers.clear()
   state.initialized = false
 }
 
@@ -158,7 +172,7 @@ async function ensureRuntime(
   if (includeHistory) {
     if (runtime.historyNextCursor) state.historyCursors[sessionId] = runtime.historyNextCursor
     else delete state.historyCursors[sessionId]
-    void hydrateFinalOutputs(runtime)
+    prepareDeferredOutputs(runtime)
   }
   return runtime
 }
@@ -278,6 +292,7 @@ async function sendCommand(
   const requestId = crypto.randomUUID()
   pendingCommandContexts.set(requestId, {
     sessionId,
+    operation,
     baselineRevision: runtime.runtimeRevision,
   })
   try {
@@ -535,9 +550,11 @@ function handleEvent(event: ConsoleEvent): void {
       .filter((item) => item.type === 'command' || item.type === 'outcome-unknown')
       .map((item) => item.output)
       .find((item) => item.itemId === event.event.itemId)
+    if (output?.isFinal && !output.hasGap) delete output.loadState
     if (!output?.hasGap) return
     if (event.event.type === 'final') {
       const finalEvent = event.event
+      output.loadState = 'LOADING'
       void transport
         .getOutputText(event.sessionId, finalEvent.itemId)
         .then((text) => {
@@ -553,7 +570,9 @@ function handleEvent(event: ConsoleEvent): void {
           })
           handleEvent(event)
         })
-        .catch(() => undefined)
+        .catch(() => {
+          output.loadState = 'FAILED'
+        })
     } else {
       transport.requestResync(event.sessionId)
     }
@@ -602,9 +621,13 @@ export function mergeSessions(incoming: SessionSummary[], snapshot: boolean): vo
   }
   if (snapshot) {
     const removedIds = state.sessions
-      .filter((session) => !seenIds.has(session.id))
+      // 列表 snapshot 与详情首屏可能并发到达；已打开详情的 runtime
+      // 不能因分页/ID 归一化时暂未出现在本批列表里而被一起删除。
+      .filter((session) => !seenIds.has(session.id) && !state.runtimes[session.id])
       .map((session) => session.id)
-    state.sessions = state.sessions.filter((session) => seenIds.has(session.id))
+    state.sessions = state.sessions.filter(
+      (session) => seenIds.has(session.id) || Boolean(state.runtimes[session.id]),
+    )
     for (const sessionId of removedIds) {
       delete state.runtimes[sessionId]
       delete state.historyCursors[sessionId]
@@ -684,7 +707,7 @@ function offlineRuntime(summary: SessionSummary): RuntimeSnapshot {
   }
 }
 
-async function hydrateFinalOutputs(runtime: RuntimeSnapshot): Promise<void> {
+export function prepareDeferredOutputs(runtime: RuntimeSnapshot): void {
   for (const cursor of runtime.outputCursors) {
     let item = runtime.timeline.find(
       (
@@ -716,26 +739,46 @@ async function hydrateFinalOutputs(runtime: RuntimeSnapshot): Promise<void> {
       item = created
     }
     if (!shouldHydrateFinalOutput(item.output, cursor)) continue
-    try {
-      const text = await transport.getOutputText(runtime.sessionId, cursor.itemId)
-      handleEvent({
-        type: 'output',
-        sessionId: runtime.sessionId,
-        event: { type: 'replace', itemId: cursor.itemId, revision: cursor.revision, text },
-      })
-      handleEvent({
-        type: 'output',
-        sessionId: runtime.sessionId,
-        event: {
-          type: 'final',
-          itemId: cursor.itemId,
-          revision: cursor.revision,
-          byteLength: cursor.byteLength,
-        },
-      })
-    } catch {
-      // 查询失败时保留 LIVE_PREVIEW；不得把不完整内容标成最终输出。
-    }
+    item.output.revision = cursor.revision
+    item.output.byteLength = cursor.byteLength
+    item.output.isFinal = false
+    item.output.authority = cursor.finalUnavailable ? 'FINAL_OUTPUT_UNAVAILABLE' : 'AUTHORITATIVE_FINAL'
+    item.output.hasGap = Boolean(cursor.finalUnavailable)
+    item.output.loadState = cursor.finalUnavailable ? 'FAILED' : 'DEFERRED'
+  }
+}
+
+async function loadOutput(sessionId: string, itemId: string): Promise<void> {
+  const runtime = state.runtimes[sessionId]
+  const cursor = runtime?.outputCursors.find((item) => item.itemId === itemId)
+  const item = runtime?.timeline.find(
+    (
+      entry,
+    ): entry is Extract<TimelineItem, { type: 'command' }> | Extract<TimelineItem, { type: 'outcome-unknown' }> =>
+      (entry.type === 'command' || entry.type === 'outcome-unknown') &&
+      entry.output.itemId === itemId,
+  )
+  if (!runtime || !cursor || !item || item.output.loadState === 'LOADING') return
+  item.output.loadState = 'LOADING'
+  try {
+    const text = await transport.getOutputText(sessionId, itemId)
+    let output = reduceOutput(item.output, {
+      type: 'replace',
+      itemId,
+      revision: cursor.revision,
+      text,
+    })
+    output = reduceOutput(output, {
+      type: 'final',
+      itemId,
+      revision: cursor.revision,
+      byteLength: cursor.byteLength,
+    })
+    delete output.loadState
+    item.output = output
+  } catch (error) {
+    item.output.loadState = 'FAILED'
+    pushToast(error instanceof Error ? error.message : '最终输出读取失败，可重试。', 'warning')
   }
 }
 
@@ -785,17 +828,51 @@ function recordReceipt(receipt: CommandReceipt): void {
   pendingCommandContexts.delete(receipt.requestId)
   if (!context || !shouldRefreshRuntimeAfterReceipt(receipt.status)) return
 
-  queueMicrotask(() => {
-    void ensureRuntime(context.sessionId, true, false)
-      .then((runtime) => {
-        if (runtime.runtimeRevision <= context.baselineRevision) {
-          transport.requestResync(context.sessionId)
-        }
-      })
-      .catch(() => {
-        transport.requestResync(context.sessionId)
-        pushToast('操作结果已返回，但运行态刷新失败；正在重新同步。', 'warning')
-      })
+  void reconcileRuntimeAfterReceipt(context)
+}
+
+export function commandRuntimeSettled(
+  context: Pick<PendingCommandContext, 'operation' | 'baselineRevision'>,
+  runtime: RuntimeSnapshot,
+): boolean {
+  if (context.operation === 'INTERRUPT') {
+    return runtime.phase === 'IDLE' && !runtime.activeTurnId
+  }
+  if (context.operation === 'START_TURN') {
+    return runtime.phase === 'RUNNING' || runtime.runtimeRevision > context.baselineRevision
+  }
+  return true
+}
+
+async function reconcileRuntimeAfterReceipt(context: PendingCommandContext): Promise<void> {
+  const delays =
+    context.operation === 'INTERRUPT'
+      ? INTERRUPT_RECONCILE_DELAYS_MS
+      : context.operation === 'START_TURN'
+        ? START_RECONCILE_DELAYS_MS
+        : ([0] as const)
+  for (const delay of delays) {
+    if (delay > 0) await waitForReconcile(delay)
+    if (!state.initialized) return
+    try {
+      const runtime = await ensureRuntime(context.sessionId, true, false)
+      if (commandRuntimeSettled(context, runtime)) return
+    } catch {
+      // 后续有界尝试仍会重读；只在全部失败后提示用户。
+    }
+  }
+  transport.requestResync(context.sessionId)
+  pushToast('操作已返回，但 Desktop 运行态仍在同步；已请求重建详情流。', 'warning')
+}
+
+function waitForReconcile(delay: number): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      reconcileTimers.delete(timer)
+      resolve()
+    }
+    const timer = window.setTimeout(done, delay)
+    reconcileTimers.set(timer, done)
   })
 }
 
@@ -841,6 +918,7 @@ export function useConsoleStore() {
     loadDevices,
     ensureRuntime,
     loadOlderHistory,
+    loadOutput,
     presenceFor,
     availability,
     sendCommand,

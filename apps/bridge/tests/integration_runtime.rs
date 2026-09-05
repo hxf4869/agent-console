@@ -324,6 +324,56 @@ fn subscribe_session(conversation: &str) -> pb::Envelope {
     )
 }
 
+fn resync_stream(stream_id: &str) -> pb::Envelope {
+    inbound_envelope(
+        pb::envelope::Payload::ResyncRequest(pb::ResyncRequest {
+            stream_id: stream_id.to_string(),
+        }),
+        "corr-resync",
+    )
+}
+
+fn output_query(conversation: &str, item_id: &str, page_size: u32) -> pb::Envelope {
+    inbound_envelope(
+        pb::envelope::Payload::QueryRequest(pb::QueryRequest {
+            session_key: Some(pb::SessionKey {
+                device_id: DEVICE.to_string(),
+                agent_kind: pb::AgentKind::CodexDesktop as i32,
+                native_session_id: conversation.to_string(),
+                relay_session_uuid: String::new(),
+            }),
+            query: Some(query_request::Query::CommandOutputPage(
+                pb::CommandOutputPageQuery {
+                    item_id: Some(pb::ItemId {
+                        id: item_id.to_string(),
+                        synthetic: false,
+                    }),
+                    cursor: String::new(),
+                    page_size,
+                },
+            )),
+        }),
+        "corr-output",
+    )
+}
+
+fn runtime_query(conversation: &str) -> pb::Envelope {
+    inbound_envelope(
+        pb::envelope::Payload::QueryRequest(pb::QueryRequest {
+            session_key: Some(pb::SessionKey {
+                device_id: DEVICE.to_string(),
+                agent_kind: pb::AgentKind::CodexDesktop as i32,
+                native_session_id: conversation.to_string(),
+                relay_session_uuid: String::new(),
+            }),
+            query: Some(query_request::Query::RuntimeSnapshot(
+                pb::RuntimeSnapshotQuery {},
+            )),
+        }),
+        "corr-runtime",
+    )
+}
+
 fn start_turn_request(conversation: &str, prompt: &str, correlation: &str) -> pb::Envelope {
     inbound_envelope(
         pb::envelope::Payload::CommandRequest(pb::CommandRequest {
@@ -567,6 +617,259 @@ async fn detail_pipeline_outputs_and_command_receipts() {
             last_sequence = e.sequence;
         }
     }
+    ctx.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn detail_resync_starts_new_epoch_with_fresh_snapshot_first() {
+    let mut ctx = setup(
+        "detail-resync",
+        json!({"sessions": [{
+            "conversationId": CONV_FAST,
+            "title": "fixture-resync",
+            "cwd": "/tmp/fixture-resync"
+        }]}),
+        vec![seed(CONV_FAST, "fixture-resync")],
+    )
+    .await;
+
+    ctx.runtime
+        .handle_envelope(subscribe_session(CONV_FAST))
+        .await;
+    let first = ctx
+        .outbox
+        .collect_until(Duration::from_secs(5), |events| {
+            Outbox::find_subscribed(events).is_some()
+                && Outbox::payload_of(events)
+                    .any(|payload| matches!(payload, envelope::Payload::RuntimeSnapshot(_)))
+        })
+        .await;
+    let first_subscribed = Outbox::find_subscribed(&first).expect("first Subscribed");
+    let first_revision = Outbox::payload_of(&first)
+        .find_map(|payload| match payload {
+            envelope::Payload::RuntimeSnapshot(snapshot) => Some(snapshot.runtime_revision),
+            _ => None,
+        })
+        .expect("first RuntimeSnapshot");
+
+    ctx.runtime
+        .handle_envelope(resync_stream(&first_subscribed.stream_id))
+        .await;
+    let refreshed = ctx
+        .outbox
+        .collect_until(Duration::from_secs(5), |events| {
+            Outbox::find_subscribed(events).is_some()
+                && Outbox::payload_of(events)
+                    .any(|payload| matches!(payload, envelope::Payload::RuntimeSnapshot(_)))
+        })
+        .await;
+    let refreshed_subscribed = Outbox::find_subscribed(&refreshed).expect("refreshed Subscribed");
+    let (snapshot_index, snapshot_env, snapshot) = refreshed
+        .iter()
+        .enumerate()
+        .find_map(|(index, env)| match env.payload.as_ref() {
+            Some(envelope::Payload::RuntimeSnapshot(snapshot)) => Some((index, env, snapshot)),
+            _ => None,
+        })
+        .expect("refreshed RuntimeSnapshot");
+
+    assert!(refreshed_subscribed.stream_epoch > first_subscribed.stream_epoch);
+    assert!(
+        snapshot.runtime_revision > first_revision,
+        "resync 必须重读 owner"
+    );
+    assert_eq!(snapshot_env.stream_epoch, refreshed_subscribed.stream_epoch);
+    assert_eq!(snapshot_env.sequence, refreshed_subscribed.base_sequence);
+    assert!(
+        refreshed[..snapshot_index].iter().all(|env| {
+            env.stream_epoch != refreshed_subscribed.stream_epoch || env.sequence == 0
+        }),
+        "新 epoch 内 RuntimeSnapshot 必须是首个有序帧"
+    );
+    let sequenced: Vec<u64> = refreshed
+        .iter()
+        .filter(|env| env.stream_epoch == refreshed_subscribed.stream_epoch && env.sequence > 0)
+        .map(|env| env.sequence)
+        .collect();
+    assert!(
+        sequenced.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "新 epoch sequence 必须连续: {sequenced:?}"
+    );
+    ctx.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn runtime_query_refreshes_the_desktop_owner_snapshot() {
+    let mut ctx = setup(
+        "runtime-query-refresh",
+        json!({"sessions": [{
+            "conversationId": CONV_FAST,
+            "title": "fixture-query-refresh",
+            "cwd": "/tmp/fixture-query-refresh"
+        }]}),
+        vec![seed(CONV_FAST, "fixture-query-refresh")],
+    )
+    .await;
+
+    ctx.runtime
+        .handle_envelope(subscribe_session(CONV_FAST))
+        .await;
+    let initial = ctx
+        .outbox
+        .collect_until(Duration::from_secs(5), |events| {
+            Outbox::payload_of(events)
+                .any(|payload| matches!(payload, envelope::Payload::RuntimeSnapshot(_)))
+        })
+        .await;
+    let initial_revision = Outbox::payload_of(&initial)
+        .find_map(|payload| match payload {
+            envelope::Payload::RuntimeSnapshot(snapshot) => Some(snapshot.runtime_revision),
+            _ => None,
+        })
+        .expect("initial RuntimeSnapshot");
+
+    ctx.runtime.handle_envelope(runtime_query(CONV_FAST)).await;
+    let events = ctx
+        .outbox
+        .collect_until(Duration::from_secs(5), |events| {
+            Outbox::payload_of(events)
+                .any(|payload| matches!(payload, envelope::Payload::QueryResponse(_)))
+        })
+        .await;
+    let response = Outbox::payload_of(&events)
+        .find_map(|payload| match payload {
+            envelope::Payload::QueryResponse(response) => Some(response),
+            _ => None,
+        })
+        .expect("runtime QueryResponse");
+    assert_eq!(response.error_code, 0);
+    let pb::query_response::Result::RuntimeSnapshot(snapshot) =
+        response.result.as_ref().expect("runtime result")
+    else {
+        panic!("expected RuntimeSnapshot")
+    };
+    assert!(
+        snapshot.runtime_revision > initial_revision,
+        "HTTP runtime query 不得返回打开页面时的旧缓存"
+    );
+    ctx.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn runtime_query_accepts_unchanged_authoritative_revision() {
+    let mut ctx = setup(
+        "runtime-query-stable",
+        json!({"sessions": [{
+            "conversationId": CONV_FAST,
+            "title": "fixture-query-stable",
+            "cwd": "/tmp/fixture-query-stable",
+            "stableHistoryRefresh": true
+        }]}),
+        vec![seed(CONV_FAST, "fixture-query-stable")],
+    )
+    .await;
+
+    ctx.runtime
+        .handle_envelope(subscribe_session(CONV_FAST))
+        .await;
+    let initial = ctx
+        .outbox
+        .collect_until(Duration::from_secs(5), |events| {
+            Outbox::payload_of(events)
+                .any(|payload| matches!(payload, envelope::Payload::RuntimeSnapshot(_)))
+        })
+        .await;
+    let initial_revision = Outbox::payload_of(&initial)
+        .find_map(|payload| match payload {
+            envelope::Payload::RuntimeSnapshot(snapshot) => Some(snapshot.runtime_revision),
+            _ => None,
+        })
+        .expect("initial RuntimeSnapshot");
+
+    ctx.runtime.handle_envelope(runtime_query(CONV_FAST)).await;
+    let events = ctx
+        .outbox
+        .collect_until(Duration::from_secs(1), |events| {
+            Outbox::payload_of(events)
+                .any(|payload| matches!(payload, envelope::Payload::QueryResponse(_)))
+        })
+        .await;
+    let response = Outbox::payload_of(&events)
+        .find_map(|payload| match payload {
+            envelope::Payload::QueryResponse(response) => Some(response),
+            _ => None,
+        })
+        .expect("runtime QueryResponse");
+    assert_eq!(response.error_code, 0);
+    let pb::query_response::Result::RuntimeSnapshot(snapshot) =
+        response.result.as_ref().expect("runtime result")
+    else {
+        panic!("expected RuntimeSnapshot")
+    };
+    assert_eq!(snapshot.runtime_revision, initial_revision);
+    ctx.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn preexisting_snapshot_output_is_served_without_resync_error() {
+    let mut ctx = setup(
+        "snapshot-output",
+        json!({"sessions": [{
+            "conversationId": CONV_FAST,
+            "title": "fixture-output",
+            "cwd": "/tmp/fixture-output",
+            "turns": [{
+                "turnId": "turn-existing",
+                "status": "completed",
+                "items": [{
+                    "id": "item-existing-command",
+                    "type": "commandExecution",
+                    "command": "fixture-existing",
+                    "status": "completed",
+                    "aggregatedOutput": "abcdef"
+                }]
+            }]
+        }]}),
+        vec![seed(CONV_FAST, "fixture-output")],
+    )
+    .await;
+
+    ctx.runtime
+        .handle_envelope(subscribe_session(CONV_FAST))
+        .await;
+    let _ = ctx
+        .outbox
+        .collect_until(Duration::from_secs(5), |events| {
+            Outbox::payload_of(events)
+                .any(|payload| matches!(payload, envelope::Payload::RuntimeSnapshot(_)))
+        })
+        .await;
+
+    ctx.runtime
+        .handle_envelope(output_query(CONV_FAST, "item-existing-command", 3))
+        .await;
+    let events = ctx
+        .outbox
+        .collect_until(Duration::from_secs(5), |events| {
+            Outbox::payload_of(events)
+                .any(|payload| matches!(payload, envelope::Payload::QueryResponse(_)))
+        })
+        .await;
+    let response = Outbox::payload_of(&events)
+        .find_map(|payload| match payload {
+            envelope::Payload::QueryResponse(response) => Some(response),
+            _ => None,
+        })
+        .expect("output QueryResponse");
+    assert_eq!(response.error_code, 0);
+    let pb::query_response::Result::CommandOutputPage(page) =
+        response.result.as_ref().expect("output result")
+    else {
+        panic!("expected CommandOutputPage")
+    };
+    assert_eq!(page.bytes, b"abc");
+    assert_eq!(page.next_cursor, "3");
+    assert!(!page.is_final);
     ctx.runtime.shutdown().await;
 }
 

@@ -2,7 +2,13 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import type { RuntimeSnapshot, SessionSummary } from '@/transport/types'
 
-import { mergeSessions, reconcileRuntimeSnapshot, useConsoleStore } from './console'
+import {
+  commandRuntimeSettled,
+  mergeSessions,
+  prepareDeferredOutputs,
+  reconcileRuntimeSnapshot,
+  useConsoleStore,
+} from './console'
 
 function session(id: string, updatedAt: string): SessionSummary {
   return {
@@ -53,6 +59,22 @@ describe('session list snapshots', () => {
     mergeSessions([session('session-page', '2026-09-05T02:00:00Z')], false)
 
     expect(state.sessions.map((item) => item.id)).toEqual(['session-page', 'session-prior'])
+  })
+
+  it('keeps an opened detail when a concurrent list snapshot omits it', () => {
+    const opened = session('session-opened', '2026-09-05T01:00:00Z')
+    state.sessions.push(opened)
+    state.runtimes[opened.id] = {
+      sessionId: opened.id,
+      runtimeRevision: 12,
+      phase: 'IDLE',
+      timeline: [],
+    } as RuntimeSnapshot
+
+    mergeSessions([], true)
+
+    expect(state.sessions.map((item) => item.id)).toEqual(['session-opened'])
+    expect(state.runtimes[opened.id]?.runtimeRevision).toBe(12)
   })
 
   it('does not let a list summary overwrite an opened detail runtime', () => {
@@ -116,5 +138,67 @@ describe('session list snapshots', () => {
     expect(reconciled.runtimeRevision).toBe(13)
     expect(reconciled.phase).toBe('IDLE')
     expect(reconciled.activeTurnId).toBeUndefined()
+  })
+})
+
+describe('detail reconciliation', () => {
+  it('marks historical final output for explicit on-demand loading', () => {
+    const runtime = {
+      sessionId: 'session-current',
+      runtimeRevision: 12,
+      phase: 'IDLE',
+      timeline: [
+        {
+          id: 'command-1',
+          type: 'command',
+          createdAt: '2026-09-05T01:00:00Z',
+          command: 'fixture',
+          cwdDisplay: '',
+          status: 'COMPLETED',
+          elapsed: '1s',
+          output: {
+            itemId: 'command-1',
+            revision: 0,
+            text: '',
+            byteLength: 0,
+            isFinal: true,
+            authority: 'AUTHORITATIVE_FINAL',
+            hasGap: false,
+          },
+        },
+      ],
+      outputCursors: [
+        { itemId: 'command-1', revision: 12, byteLength: 2048, isFinal: true },
+      ],
+    } as RuntimeSnapshot
+
+    prepareDeferredOutputs(runtime)
+
+    const item = runtime.timeline[0]
+    expect(item?.type).toBe('command')
+    if (item?.type !== 'command') throw new Error('expected command')
+    expect(item.output).toMatchObject({
+      revision: 12,
+      byteLength: 2048,
+      isFinal: false,
+      loadState: 'DEFERRED',
+    })
+  })
+
+  it('keeps interrupt reconciliation active until the authoritative turn is idle', () => {
+    const context = { operation: 'INTERRUPT' as const, baselineRevision: 12 }
+    expect(
+      commandRuntimeSettled(context, {
+        runtimeRevision: 13,
+        phase: 'RUNNING',
+        activeTurnId: 'turn-current',
+      } as RuntimeSnapshot),
+    ).toBe(false)
+    expect(
+      commandRuntimeSettled(context, {
+        runtimeRevision: 14,
+        phase: 'IDLE',
+      } as RuntimeSnapshot),
+    ).toBe(true)
   })
 })

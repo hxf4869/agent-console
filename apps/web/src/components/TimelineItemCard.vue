@@ -20,7 +20,7 @@ import { useConsoleStore } from '@/store/console'
 import type { TimelineItem } from '@/transport/types'
 
 const props = defineProps<{ item: TimelineItem; sessionId: string }>()
-const { availability, answerAttention, sendCommand } = useConsoleStore()
+const { availability, answerAttention, loadOutput, sendCommand } = useConsoleStore()
 const stopAvailability = computed(() => availability(props.sessionId, 'STOP_BACKGROUND_COMMAND'))
 </script>
 
@@ -63,7 +63,7 @@ const stopAvailability = computed(() => availability(props.sessionId, 'STOP_BACK
       <code>{{ item.command }}</code>
       <span class="mono">{{ item.cwdDisplay }} · {{ item.elapsed }}</span>
     </div>
-    <OutputBlock :output="item.output" />
+    <OutputBlock :output="item.output" @load="loadOutput(sessionId, item.output.itemId)" />
   </article>
 
   <article v-else-if="item.type === 'background-command'" class="timeline-card timeline-card--background">
@@ -103,7 +103,7 @@ const stopAvailability = computed(() => availability(props.sessionId, 'STOP_BACK
     </header>
     <p>{{ item.description }}</p>
     <div class="request-id mono">request {{ item.requestId }}</div>
-    <OutputBlock :output="item.output" />
+    <OutputBlock :output="item.output" @load="loadOutput(sessionId, item.output.itemId)" />
   </article>
 </template>
 

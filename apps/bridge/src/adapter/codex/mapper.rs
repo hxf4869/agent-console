@@ -192,6 +192,28 @@ impl SessionMapper {
         self.pending_outputs.values().map(|p| p.buffer.len()).sum()
     }
 
+    /// 按需读取当前权威投影中的命令输出分页。首个 snapshot 只建立
+    /// item 轨迹，不重放 OutputReplace 事件；该入口供 OnDemandDetail 在
+    /// runtime 事件缓冲未命中时补读，不落盘。
+    pub fn output_page(
+        &self,
+        item_id: &ItemId,
+        offset: usize,
+        limit: usize,
+    ) -> Option<(Vec<u8>, usize, bool)> {
+        let track = self.items.get(&track_key(item_id))?;
+        if !is_output_item(&track.native_type) || !track.output_present {
+            return None;
+        }
+        let start = offset.min(track.output.len());
+        let end = start.saturating_add(limit).min(track.output.len());
+        Some((
+            track.output[start..end].to_vec(),
+            track.output.len(),
+            command_status_is_terminal(&track.status),
+        ))
+    }
+
     // -----------------------------------------------------------------
     // snapshot 路径
     // -----------------------------------------------------------------
@@ -843,5 +865,33 @@ mod tests {
     fn steer_restore_message_requires_snapshot_cwd() {
         let mapper = SessionMapper::new(SessionKey::codex("dev", "thread-1"));
         assert_eq!(mapper.steer_restore_message(), None);
+    }
+
+    #[test]
+    fn output_page_reads_preexisting_snapshot_output_on_demand() {
+        let mut mapper = SessionMapper::new(SessionKey::codex("dev", "thread-1"));
+        mapper.apply_snapshot(
+            7,
+            &json!({
+                "turns": [{
+                    "turnId": "turn-1",
+                    "status": "completed",
+                    "items": [{
+                        "id": "item-command-1",
+                        "type": "commandExecution",
+                        "status": "completed",
+                        "aggregatedOutput": "abcdef"
+                    }]
+                }]
+            }),
+        );
+
+        let page = mapper
+            .output_page(&ItemId::native("item-command-1"), 2, 3)
+            .expect("snapshot output page");
+        assert_eq!(page, (b"cde".to_vec(), 6, true));
+        assert!(mapper
+            .output_page(&ItemId::native("missing"), 0, 3)
+            .is_none());
     }
 }
