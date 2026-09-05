@@ -104,7 +104,11 @@ function openAttentionSheet(): void {
 }
 
 function interruptTurn(): void {
-  if (window.confirm('确认中断当前轮次？已经产生的输出会保留。')) {
+  if (
+    window.confirm(
+      '确认中断当前 Codex 轮次？已经产生的输出会保留，但 Desktop 已启动的本机命令进程不一定同时停止。',
+    )
+  ) {
     void sendCommand(sessionId.value, 'INTERRUPT')
   }
 }
@@ -142,13 +146,13 @@ function interruptTurn(): void {
         <UiButton
           variant="danger"
           size="small"
-          aria-label="中断当前轮次"
+          aria-label="中断当前 Codex 轮次"
           :disabled="runtime.phase !== 'RUNNING' || !interruptAvailability.enabled"
           :title="interruptAvailability.reason"
           @click="interruptTurn"
         >
           <template #icon><CircleStop aria-hidden="true" /></template>
-          中断
+          中断轮次
         </UiButton>
       </div>
     </header>

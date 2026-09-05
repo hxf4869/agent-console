@@ -33,7 +33,7 @@ export const connectionLabel: Record<DeviceConnection, string> = {
 }
 
 export const authorityLabel: Record<OutputAuthority, string> = {
-  LIVE_PREVIEW: '实时预览',
+  LIVE_PREVIEW: '实时预览（可能延迟）',
   AUTHORITATIVE_FINAL: '最终输出',
   FINAL_OUTPUT_UNAVAILABLE: '最终输出不可用',
 }

@@ -4,7 +4,11 @@ import { getOperationAvailability } from '@/transport/capabilities'
 import { FixtureConsoleTransport } from '@/transport/fixture-transport'
 import { AuthRequiredError, loginUrl, RealConsoleTransport } from '@/transport/real-transport'
 import { reduceOutput, shouldHydrateFinalOutput } from '@/transport/output-reducer'
-import { shouldApplyReceipt } from '@/transport/receipt-policy'
+import {
+  isTerminalReceipt,
+  shouldApplyReceipt,
+  shouldRefreshRuntimeAfterReceipt,
+} from '@/transport/receipt-policy'
 import type {
   AttentionItem,
   CapabilitySnapshot,
@@ -77,6 +81,7 @@ const state = reactive<ConsoleState>({
 })
 
 let disconnectTransport: (() => void) | undefined
+const pendingCommandContexts = new Map<string, { sessionId: string; baselineRevision: number }>()
 
 async function initialize(): Promise<void> {
   if (state.initialized) return
@@ -106,6 +111,7 @@ async function initialize(): Promise<void> {
 function dispose(): void {
   disconnectTransport?.()
   disconnectTransport = undefined
+  pendingCommandContexts.clear()
   state.initialized = false
 }
 
@@ -146,8 +152,8 @@ async function ensureRuntime(
     delete state.historyCursors[sessionId]
     return runtime
   }
-  const runtime = await transport.getRuntimeSnapshot(sessionId, { includeHistory })
-  if (!includeHistory && existing) runtime.timeline = existing.timeline
+  const incoming = await transport.getRuntimeSnapshot(sessionId, { includeHistory })
+  const runtime = reconcileRuntimeSnapshot(state.runtimes[sessionId], incoming, includeHistory)
   state.runtimes[sessionId] = runtime
   if (includeHistory) {
     if (runtime.historyNextCursor) state.historyCursors[sessionId] = runtime.historyNextCursor
@@ -270,6 +276,10 @@ async function sendCommand(
     return undefined
   }
   const requestId = crypto.randomUUID()
+  pendingCommandContexts.set(requestId, {
+    sessionId,
+    baselineRevision: runtime.runtimeRevision,
+  })
   try {
     const receipt = await transport.sendCommand({
       requestId,
@@ -279,7 +289,7 @@ async function sendCommand(
       expectedRuntimeRevision: runtime.runtimeRevision,
       payload,
     })
-    upsertReceipt(receipt)
+    recordReceipt(receipt)
     if (shouldApplyReceipt(receipt.status)) {
       applyLocalCommand(runtime, operation, payload)
       pushToast(
@@ -291,6 +301,7 @@ async function sendCommand(
     }
     return receipt
   } catch (error) {
+    pendingCommandContexts.delete(requestId)
     if (error instanceof AuthRequiredError) redirectToLogin()
     pushToast(error instanceof Error ? error.message : '操作未发送。', 'danger')
     return undefined
@@ -410,7 +421,7 @@ function handleEvent(event: ConsoleEvent): void {
     return
   }
   if (event.type === 'receipt') {
-    upsertReceipt(event.receipt)
+    recordReceipt(event.receipt)
     return
   }
   if (event.type === 'resync-required') {
@@ -437,8 +448,7 @@ function handleEvent(event: ConsoleEvent): void {
 
   const runtime = state.runtimes[event.sessionId]
   if (event.type === 'runtime-snapshot') {
-    const timeline = mergeTimeline(runtime?.timeline ?? [], event.runtime.timeline)
-    state.runtimes[event.sessionId] = { ...event.runtime, timeline }
+    state.runtimes[event.sessionId] = reconcileRuntimeSnapshot(runtime, event.runtime, false)
     return
   }
   if (!runtime) return
@@ -582,11 +592,6 @@ export function mergeSessions(incoming: SessionSummary[], snapshot: boolean): vo
     }
     else state.sessions.push(session)
     seenIds.add(targetId)
-    const runtime = state.runtimes[targetId]
-    if (runtime) {
-      runtime.phase = session.phase
-      if (session.phase === 'IDLE') delete runtime.activeTurnId
-    }
     if (
       session.attentionCount > 0 &&
       session.deviceConnection === 'ONLINE' &&
@@ -607,6 +612,33 @@ export function mergeSessions(incoming: SessionSummary[], snapshot: boolean): vo
     }
   }
   state.sessions.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+}
+
+export function reconcileRuntimeSnapshot(
+  current: RuntimeSnapshot | undefined,
+  incoming: RuntimeSnapshot,
+  historyAuthoritative: boolean,
+): RuntimeSnapshot {
+  if (!current) return incoming
+
+  // TurnLifecycle 不携带 runtime revision；当前详情可能已经应用了同一
+  // revision 之后到达的生命周期事件，因此只有严格更新的快照才能替换状态。
+  const incomingIsStale = incoming.runtimeRevision <= current.runtimeRevision
+  const runtime = {
+    ...(incomingIsStale ? current : incoming),
+    timeline: incomingIsStale
+      ? mergeTimeline(incoming.timeline, current.timeline)
+      : mergeTimeline(current.timeline, incoming.timeline),
+  }
+
+  if (historyAuthoritative) {
+    if (incoming.historyNextCursor) runtime.historyNextCursor = incoming.historyNextCursor
+    else delete runtime.historyNextCursor
+  } else if (current.historyNextCursor) {
+    runtime.historyNextCursor = current.historyNextCursor
+  }
+
+  return runtime
 }
 
 function isUuid(value: string): boolean {
@@ -743,6 +775,28 @@ function upsertReceipt(receipt: CommandReceipt): void {
   const index = state.receipts.findIndex((item) => item.requestId === receipt.requestId)
   if (index >= 0) state.receipts.splice(index, 1)
   state.receipts.unshift(receipt)
+}
+
+function recordReceipt(receipt: CommandReceipt): void {
+  upsertReceipt(receipt)
+  if (!isTerminalReceipt(receipt.status)) return
+
+  const context = pendingCommandContexts.get(receipt.requestId)
+  pendingCommandContexts.delete(receipt.requestId)
+  if (!context || !shouldRefreshRuntimeAfterReceipt(receipt.status)) return
+
+  queueMicrotask(() => {
+    void ensureRuntime(context.sessionId, true, false)
+      .then((runtime) => {
+        if (runtime.runtimeRevision <= context.baselineRevision) {
+          transport.requestResync(context.sessionId)
+        }
+      })
+      .catch(() => {
+        transport.requestResync(context.sessionId)
+        pushToast('操作结果已返回，但运行态刷新失败；正在重新同步。', 'warning')
+      })
+  })
 }
 
 function receiptMessage(receipt: CommandReceipt): string {
