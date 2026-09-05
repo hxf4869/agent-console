@@ -268,18 +268,19 @@ async fn upstream_epoch_change_triggers_resync_and_new_snapshot() {
         other => panic!("expected ResyncRequired, got {other:?}"),
     }
 
-    // Relay 重新发起上游订阅;Bridge 回应新 epoch 并给新 snapshot。
-    // 跳过心跳帧,等待 Relay 的重新订阅请求。
-    let sub_again = loop {
-        let f = tokio::time::timeout(Duration::from_secs(5), bridge.recv(Duration::from_secs(4)))
-            .await
-            .expect("relay did not re-subscribe after epoch change");
-        if matches!(f.payload, Some(envelope::Payload::Subscribe(_))) {
-            break f;
-        }
-    };
-    let _ = sub_again;
-    bridge.send_subscribed(&upstream_id, 9, 300).await;
+    // 当前 Subscribed 已宣告新 epoch，Bridge 的新 snapshot 正在到达；Relay
+    // 不得再次订阅同一 upstream，否则会让每次响应继续生成新 epoch。
+    let unexpected = tokio::time::timeout(
+        Duration::from_millis(300),
+        bridge.recv(Duration::from_secs(4)),
+    )
+    .await;
+    if let Ok(frame) = unexpected {
+        assert!(
+            !matches!(frame.payload, Some(envelope::Payload::Subscribe(_))),
+            "epoch change must not re-subscribe the same upstream"
+        );
+    }
     bridge
         .send(&FakeBridge::list_snapshot_env(
             &device_id.to_string(),

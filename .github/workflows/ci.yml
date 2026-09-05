@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+  bridge-macos:
+    name: Bridge on macOS
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run Bridge tests
+        run: cargo test -p bridge --locked
+      - name: Check installer scripts
+        run: bash -n scripts/install-macos-bridge.sh scripts/uninstall-macos-bridge.sh
+
+  web:
+    name: Web and TypeScript protocol
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            apps/web/pnpm-lock.yaml
+      - name: Build TypeScript protocol
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @agent-console/protocol build
+      - name: Test and build Web
+        run: |
+          pnpm --dir apps/web install --frozen-lockfile
+          pnpm --dir apps/web test
+          pnpm --dir apps/web build
+
+  contracts:
+    name: OpenAPI contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check OpenAPI against Relay routes
+        run: ./scripts/check-openapi.sh

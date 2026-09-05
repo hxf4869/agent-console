@@ -50,6 +50,16 @@ docs/               执行规格、前端对接、本地开发、部署、Codex 
 (PostgreSQL/Relay/真实与 fake Bridge 启动、环境变量、诊断、测试)。
 前端实现入口见 **[docs/FRONTEND-INTEGRATION.md](docs/FRONTEND-INTEGRATION.md)**。
 
+macOS 上可从仓库一条命令构建、配对并安装 Bridge 用户级常驻服务：
+
+```bash
+./scripts/install-macos-bridge.sh --relay-url https://toolbox.example.com
+```
+
+安装器不需要管理员权限，设备凭据仍只写入 Keychain。卸载默认保留绑定数据；
+完整清除使用 `./scripts/uninstall-macos-bridge.sh --purge-data`。路径、日志和
+预构建二进制安装方式见 `docs/LOCAL-DEVELOPMENT.md`。
+
 ## 当前能力状态(摘要)
 
 权威矩阵:`docs/CODEX-COMPATIBILITY.md`(当前验证环境:codex-cli `0.153.1`,

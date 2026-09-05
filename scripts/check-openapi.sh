@@ -21,7 +21,12 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OPENAPI="$REPO_ROOT/contracts/openapi.yaml"
 RELAY_SRC="$REPO_ROOT/apps/relay/src"
-DEVTOOLBOX_GO="$REPO_ROOT/../dev-toolbox/apps/api/internal/auth/agent_console.go"
+DEVTOOLBOX_GO="${AGENT_CONSOLE_DEVTOOLBOX_GO:-$REPO_ROOT/../dev-toolbox/apps/api/internal/auth/agent_console.go}"
+DEVTOOLBOX_OWNED_OPS="$(printf '%s\n' \
+  'post /api/v1/agent-console/ws-tickets' \
+  'post /internal/agent-console/ws-tickets/consume' \
+  'post /internal/agent-console/auth-sessions/introspect' \
+  'get /internal/agent-console/auth-sessions/verify' | sort)"
 
 # --- 1) openapi.yaml 的 method+path 集合 -------------------------------------
 openapi_ops="$(ruby -ryaml -e '
@@ -83,27 +88,52 @@ relay_routes="$(ruby -e '
   end
 ' "$RELAY_SRC" | sed '/^$/d')"
 
-# dev-toolbox:router.Handle("METHOD /path", ...)
-toolbox_routes="$(grep -oE 'Handle\("[A-Za-z]+ [^"]+"' "$DEVTOOLBOX_GO" \
-  | sed -E 's/^Handle\("([A-Za-z]+) ([^"]+)".*$/\1 \2/' \
-  | awk '{print tolower($1), $2}' | sed '/^$/d')"
+# dev-toolbox:router.Handle("METHOD /path", ...)。独立 checkout（CI）没有
+# sibling 仓库时，仍检查全部 Relay 路由，并确认 4 个外部边界操作仍在契约中；
+# 本地存在 dev-toolbox 时自动升级为完整 39 路由核对。
+if [[ -f "$DEVTOOLBOX_GO" ]]; then
+  toolbox_routes="$(grep -oE 'Handle\("[A-Za-z]+ [^"]+"' "$DEVTOOLBOX_GO" \
+    | sed -E 's/^Handle\("([A-Za-z]+) ([^"]+)".*$/\1 \2/' \
+    | awk '{print tolower($1), $2}' | sed '/^$/d')"
+  expected_openapi_ops="$openapi_ops"
+  scope_label="relay + dev-toolbox"
+else
+  toolbox_routes=""
+  expected_openapi_ops="$(comm -23 \
+    <(printf '%s\n' "$openapi_ops" | sort) \
+    <(printf '%s\n' "$DEVTOOLBOX_OWNED_OPS" | sort))"
+  scope_label="relay（dev-toolbox 源码不在当前 checkout）"
+fi
 
 code_routes="$(printf '%s\n%s\n' "$relay_routes" "$toolbox_routes" | sort -u | sed '/^$/d')"
 
 # --- 3) 对比 ------------------------------------------------------------------
 echo "== openapi 操作数:$(printf '%s\n' "$openapi_ops" | wc -l | tr -d ' ')"
-echo "== 代码路由数(relay + dev-toolbox 去重):$(printf '%s\n' "$code_routes" | wc -l | tr -d ' ')"
+echo "== 代码路由数($scope_label,去重):$(printf '%s\n' "$code_routes" | wc -l | tr -d ' ')"
 
 fail=0
 
 # FAIL:openapi 有,代码没有
-missing_in_code="$(comm -23 <(printf '%s\n' "$openapi_ops" | sort) <(printf '%s\n' "$code_routes" | sort))"
+missing_in_code="$(comm -23 <(printf '%s\n' "$expected_openapi_ops" | sort) <(printf '%s\n' "$code_routes" | sort))"
 if [ -n "$missing_in_code" ]; then
   fail=1
   echo "FAIL: openapi 中存在但代码路由中不存在的操作:"
   printf '%s\n' "$missing_in_code" | sed 's/^/  /'
 else
-  echo "PASS: openapi 中每个操作都能对应到代码路由"
+  echo "PASS: 当前检查范围内的 openapi 操作都能对应到代码路由"
+fi
+
+if [[ ! -f "$DEVTOOLBOX_GO" ]]; then
+  missing_devtoolbox_contract="$(comm -23 \
+    <(printf '%s\n' "$DEVTOOLBOX_OWNED_OPS" | sort) \
+    <(printf '%s\n' "$openapi_ops" | sort))"
+  if [[ -n "$missing_devtoolbox_contract" ]]; then
+    fail=1
+    echo "FAIL: dev-toolbox 外部边界操作在 openapi 中缺失:"
+    printf '%s\n' "$missing_devtoolbox_contract" | sed 's/^/  /'
+  else
+    echo "PASS: dev-toolbox 的 4 个外部边界操作均已登记；实现核对需提供 sibling 仓库"
+  fi
 fi
 
 # WARN:代码有,openapi 缺(internal 内部端点除外)

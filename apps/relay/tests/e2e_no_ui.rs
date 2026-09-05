@@ -769,12 +769,23 @@ async fn e2e_full_chain_no_ui_eleven_scenarios() {
         .await
         .expect("重连成功");
     send_env(&mut browser, &subscribe_session(&device_id, MAIN)).await;
-    let _resub = collect_until(&mut browser, Duration::from_secs(5), |frames| {
-        payloads(frames)
-            .iter()
-            .any(|p| matches!(p, envelope::Payload::Subscribed(_)))
+    let resub_frames = collect_until(&mut browser, Duration::from_secs(5), |frames| {
+        frames.iter().any(|frame| {
+            matches!(
+                frame.payload.as_ref(),
+                Some(envelope::Payload::Subscribed(s)) if s.stream_id == main_stream
+            )
+        }) && frames.iter().any(|frame| {
+            frame.stream_id == main_stream
+                && matches!(
+                    frame.payload.as_ref(),
+                    Some(envelope::Payload::RuntimeSnapshot(_))
+                )
+        })
     })
     .await;
+    assert_subscribe_order(&resub_frames, &main_stream);
+    all_frames.extend(resub_frames);
     // 同一 request_id + 相同内容重试。
     send_env(
         &mut browser,
@@ -832,12 +843,11 @@ async fn e2e_full_chain_no_ui_eleven_scenarios() {
     let mut dropped = false;
     let mut gap_detected = false;
     let mut last_seq: Option<u64> = None;
-    let mut replay_frames: Vec<pb::Envelope> = Vec::new();
     let gap_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < gap_deadline {
         let env = recv_env(&mut browser, Duration::from_secs(6)).await;
         if env.stream_id != main_stream {
-            replay_frames.push(env);
+            all_frames.push(env);
             continue;
         }
         if matches!(env.payload.as_ref(), Some(envelope::Payload::EventBatch(_))) {
@@ -862,6 +872,7 @@ async fn e2e_full_chain_no_ui_eleven_scenarios() {
         "应能制造并检测输出 gap(dropped={dropped}, gap={gap_detected})"
     );
     send_env(&mut browser, &resync_request(&main_stream)).await;
+    let mut replay_frames: Vec<pb::Envelope> = Vec::new();
     loop {
         let env = recv_env(&mut browser, Duration::from_secs(6)).await;
         let is_replayed_snapshot = env.stream_id == main_stream
@@ -900,12 +911,19 @@ async fn e2e_full_chain_no_ui_eleven_scenarios() {
         "重放快照 sequence = base_sequence"
     );
 
-    // 等 MAIN turn 完成(唯一运行 turn;断线重连窗口未阻塞事件流)。
+    // 等 MAIN turn 完成且权威输出校正到达；二者属于同一终态快照产生的事件，
+    // 不能只见 lifecycle 就停止收帧后再断言 OutputReplace。
     let completion = collect_until(&mut browser, Duration::from_secs(30), |frames| {
-        turn_lifecycle_events(frames).iter().any(|t| {
+        let completed = turn_lifecycle_events(frames).iter().any(|t| {
             t.phase == pb::ActiveTurnPhase::TurnPhaseIdle as i32
                 && t.outcome == pb::LastTurnOutcome::TurnOutcomeCompleted as i32
-        })
+        });
+        let corrected = domain_events(frames).iter().any(|event| matches!(
+            event,
+            pb::domain_event::Event::OutputReplace(replace)
+                if replace.content == Some(pb::output_replace::Content::Bytes(FINAL_OUTPUT.as_bytes().to_vec()))
+        ));
+        completed && corrected
     })
     .await;
     all_frames.extend(completion.iter().cloned());

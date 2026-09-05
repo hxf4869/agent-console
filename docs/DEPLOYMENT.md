@@ -170,6 +170,10 @@ push 发送禁用(订阅仍可存储)——两者都允许灰度上线。
 
 ## 7. 明确声明
 
-- 本轮交付止步于可部署的配置与模板:**未部署、未推送、未创建 tag**。
+- 仓库提供 `scripts/install-macos-bridge.sh` 与
+  `scripts/uninstall-macos-bridge.sh`，用于普通用户权限下的本机 Bridge 安装、
+  配对和 LaunchAgent 常驻；这不是签名/公证后的正式 macOS 安装包，也不包含
+  自动更新。
+- 当前交付止步于可部署配置、模板与本机安装入口:**未创建 tag 或正式 Release**。
 - 生产上线前完成一次端到端冒烟(配对 → 登录 → WS → 快照 → 命令回执 →
   文件预览);同域真实网关链的自动化覆盖见 e2e_gateway 测试。

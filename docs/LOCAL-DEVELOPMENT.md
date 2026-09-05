@@ -123,3 +123,46 @@ pnpm --filter @agent-console/protocol build
   不调用真实 Push 服务(§24)。
 - dev-toolbox 侧测试(`apps/api/integration/agent_console_test.go`)归
   dev-toolbox 仓库,见其 `docs/18-AGENT-CONSOLE-AUTH.md`。
+
+## 6. macOS Bridge 常驻安装
+
+从仓库构建 release 二进制、在未绑定时发起配对，并注册当前用户的
+LaunchAgent（全程不需要管理员权限）：
+
+```bash
+./scripts/install-macos-bridge.sh --relay-url http://127.0.0.1:8080
+```
+
+已有预构建二进制时可跳过源码构建：
+
+```bash
+./scripts/install-macos-bridge.sh \
+  --relay-url https://toolbox.example.com \
+  --binary /absolute/path/to/bridge
+```
+
+固定路径：
+
+- 二进制：`~/Library/Application Support/com.hxf.agent-console/bin/bridge`
+- LaunchAgent：`~/Library/LaunchAgents/com.hxf.agent-console.bridge.plist`
+- 日志：`~/Library/Logs/com.hxf.agent-console/bridge.stdout.log` 与
+  `bridge.stderr.log`
+- 数据：默认 `~/Library/Application Support/agent-console`；可用
+  `--data-dir` 指向当前用户主目录内的其他专用目录
+
+状态与卸载：
+
+```bash
+launchctl print "gui/$(id -u)/com.hxf.agent-console.bridge"
+./scripts/uninstall-macos-bridge.sh
+```
+
+普通卸载保留 Keychain 绑定和本地数据，便于重装。只有明确需要完全清除时使用：
+
+```bash
+./scripts/uninstall-macos-bridge.sh --purge-data
+```
+
+安装器属于本地源码/预构建二进制安装入口，不包含签名、公证或自动更新。
+LaunchAgent 通过 `/usr/bin/env -i` 只向 Bridge 传入 HOME、TMPDIR、最小 PATH、
+日志级别和 Agent Console 配置，避免继承当前 GUI 会话中的无关凭据变量。

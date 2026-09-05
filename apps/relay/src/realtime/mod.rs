@@ -822,13 +822,13 @@ impl Hub {
                 binding.snapshot_received = false;
                 c
             };
-            (
-                changed,
-                ds.upstreams
-                    .values()
-                    .map(|b| (b.device, key.1.clone()))
-                    .collect::<Vec<_>>(),
-            )
+            let other_upstreams = ds
+                .upstreams
+                .iter()
+                .filter(|(uid, _)| uid.as_str() != upstream_id)
+                .map(|(_, binding)| (binding.device, key.1.clone()))
+                .collect::<Vec<_>>();
+            (changed, other_upstreams)
         };
         if !epoch_changed {
             return;
@@ -857,6 +857,9 @@ impl Hub {
                 }
             }
         }
+        // 当前 upstream 已用这个 Subscribed 宣告新 epoch，其新 snapshot 正在
+        // 到达；只刷新聚合流中的其他 upstream。若再次订阅当前 upstream，
+        // 每个响应都会再生成一个 epoch，形成自激重订阅循环。
         for (device, tag) in rebinding {
             let uid = upstream_stream_id(device, &tag);
             if let Some(ds) = g.streams.get_mut(&key) {
