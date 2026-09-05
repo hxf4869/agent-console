@@ -26,9 +26,13 @@ fn write_fake_caffeinate(
     } else {
         script.push_str("exit 0\n");
     }
+    // 先完整写入并关闭临时路径，再原子发布为可执行文件。Linux CI 的
+    // overlay 文件系统可能在“直接写最终路径后立刻 exec”时返回 ETXTBSY。
     let path = dir.join("fake-caffeinate");
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pending = dir.join("fake-caffeinate.pending");
+    std::fs::write(&pending, script).unwrap();
+    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&pending, &path).unwrap();
     path
 }
 
