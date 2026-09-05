@@ -171,6 +171,18 @@ impl SessionMapper {
             .map(std::path::PathBuf::from)
     }
 
+    /// Desktop 0.153.1 的 steer owner 会读取 restoreMessage.cwd；从本机
+    /// 权威快照原样回填 cwd 与协作模式，仅用于本机 IPC，不进入 Relay。
+    pub(crate) fn steer_restore_message(&self) -> Option<Value> {
+        let state = self.state.as_ref()?;
+        let cwd = state.get("cwd").and_then(Value::as_str)?;
+        let mut context = serde_json::json!({"workspaceRoots": [cwd]});
+        if let Some(mode) = state.get("latestCollaborationMode") {
+            context["collaborationMode"] = mode.clone();
+        }
+        Some(serde_json::json!({"cwd": cwd, "context": context}))
+    }
+
     pub fn unknown_keys(&self) -> &UnknownKeyCounts {
         &self.unknown_keys
     }
@@ -797,4 +809,39 @@ fn find_item(state: &Value, key: &str) -> Option<Item> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn steer_restore_message_uses_authoritative_local_context() {
+        let mut mapper = SessionMapper::new(SessionKey::codex("dev", "thread-1"));
+        mapper.apply_snapshot(
+            1,
+            &json!({
+                "cwd": "/tmp/ac-e2e",
+                "latestCollaborationMode": {"mode": "default", "settings": {}}
+            }),
+        );
+
+        assert_eq!(
+            mapper.steer_restore_message(),
+            Some(json!({
+                "cwd": "/tmp/ac-e2e",
+                "context": {
+                    "workspaceRoots": ["/tmp/ac-e2e"],
+                    "collaborationMode": {"mode": "default", "settings": {}}
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn steer_restore_message_requires_snapshot_cwd() {
+        let mapper = SessionMapper::new(SessionKey::codex("dev", "thread-1"));
+        assert_eq!(mapper.steer_restore_message(), None);
+    }
 }

@@ -568,6 +568,18 @@ impl CodexAdapter {
             }
             CommandPayload::Steer { input } => {
                 gate(&Operation::SteerTurn)?;
+                let restore_message = self
+                    .inner
+                    .sessions
+                    .lock()
+                    .get(&conversation)
+                    .and_then(|runtime| runtime.mapper.steer_restore_message())
+                    .ok_or_else(|| {
+                        AdapterError::stable(
+                            StableErrorCode::CodexUnavailable,
+                            "steer requires current session context",
+                        )
+                    })?;
                 receipt!(ReceiptState::DispatchedToCodex);
                 ipc.steer_turn(
                     &owner,
@@ -579,7 +591,7 @@ impl CodexAdapter {
                         attachments: None,
                         additional_context: None,
                         tool_output: None,
-                        restore_message: None,
+                        restore_message: Some(restore_message),
                     },
                 )
                 .await

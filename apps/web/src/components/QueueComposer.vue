@@ -116,6 +116,17 @@ function onMobileKeydown(event: KeyboardEvent): void {
       @keydown="onMobileKeydown"
     />
     <button
+      v-if="phase === 'RUNNING' && queue.status === 'EMPTY'"
+      class="queue-composer__mobile-mode"
+      type="button"
+      :disabled="!availability(sessionId, 'STEER').enabled && sendMode !== 'steer'"
+      :aria-label="sendMode === 'steer' ? '改为下一轮' : 'Steer 当前轮'"
+      :aria-pressed="sendMode === 'steer'"
+      @click="sendMode = sendMode === 'queue' ? 'steer' : 'queue'"
+    >
+      {{ sendMode === 'steer' ? '队列' : 'Steer' }}
+    </button>
+    <button
       v-if="queue.status !== 'EMPTY'"
       class="queue-composer__mobile-cancel"
       type="button"
@@ -210,6 +221,7 @@ function onMobileKeydown(event: KeyboardEvent): void {
 }
 
 .queue-composer__mobile-input,
+.queue-composer__mobile-mode,
 .queue-composer__mobile-cancel,
 .queue-composer__mobile-submit {
   display: none;
@@ -252,22 +264,41 @@ function onMobileKeydown(event: KeyboardEvent): void {
     border-color: var(--focus-ring);
   }
 
+  .queue-composer__mobile-mode,
   .queue-composer__mobile-cancel,
   .queue-composer__mobile-submit {
-    width: 44px;
     height: 44px;
     padding: 0;
     place-items: center;
     border-radius: var(--radius-control);
   }
 
+  .queue-composer__mobile-mode {
+    display: grid;
+    min-width: 58px;
+    padding: 0 9px;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .queue-composer__mobile-mode[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
   .queue-composer__mobile-cancel {
+    width: 44px;
     border: 1px solid var(--border-subtle);
     background: transparent;
     color: var(--text-muted);
   }
 
   .queue-composer__mobile-submit {
+    width: 44px;
     display: grid;
     border: 0;
     background: var(--accent);
@@ -278,6 +309,7 @@ function onMobileKeydown(event: KeyboardEvent): void {
     display: grid;
   }
 
+  .queue-composer__mobile-mode:disabled,
   .queue-composer__mobile-cancel:disabled,
   .queue-composer__mobile-submit:disabled {
     opacity: 0.48;

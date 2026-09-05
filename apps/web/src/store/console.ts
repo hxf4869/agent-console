@@ -132,7 +132,11 @@ async function loadDevices(): Promise<void> {
   }
 }
 
-async function ensureRuntime(sessionId: string, force = false): Promise<RuntimeSnapshot> {
+async function ensureRuntime(
+  sessionId: string,
+  force = false,
+  includeHistory = true,
+): Promise<RuntimeSnapshot> {
   const existing = state.runtimes[sessionId]
   if (existing && !force) return existing
   const summary = state.sessions.find((session) => session.id === sessionId)
@@ -142,11 +146,14 @@ async function ensureRuntime(sessionId: string, force = false): Promise<RuntimeS
     delete state.historyCursors[sessionId]
     return runtime
   }
-  const runtime = await transport.getRuntimeSnapshot(sessionId)
+  const runtime = await transport.getRuntimeSnapshot(sessionId, { includeHistory })
+  if (!includeHistory && existing) runtime.timeline = existing.timeline
   state.runtimes[sessionId] = runtime
-  if (runtime.historyNextCursor) state.historyCursors[sessionId] = runtime.historyNextCursor
-  else delete state.historyCursors[sessionId]
-  void hydrateFinalOutputs(runtime)
+  if (includeHistory) {
+    if (runtime.historyNextCursor) state.historyCursors[sessionId] = runtime.historyNextCursor
+    else delete state.historyCursors[sessionId]
+    void hydrateFinalOutputs(runtime)
+  }
   return runtime
 }
 
@@ -254,7 +261,9 @@ async function sendCommand(
   operation: ControlOperation,
   payload: Record<string, unknown> = {},
 ): Promise<CommandReceipt | undefined> {
-  const runtime = await ensureRuntime(sessionId)
+  // 写入必须基于发送时的权威 revision；运行中输出会持续推进修订，不能
+  // 复用打开详情页时缓存的快照，否则 Steer/Interrupt 会稳定变成 STALE_TURN。
+  const runtime = await ensureRuntime(sessionId, true, false)
   const allowed = availability(sessionId, operation)
   if (!allowed.enabled) {
     pushToast(allowed.reason ?? '当前操作不可用。', 'warning')
@@ -430,7 +439,6 @@ function handleEvent(event: ConsoleEvent): void {
   if (event.type === 'runtime-snapshot') {
     const timeline = mergeTimeline(runtime?.timeline ?? [], event.runtime.timeline)
     state.runtimes[event.sessionId] = { ...event.runtime, timeline }
-    void hydrateFinalOutputs(state.runtimes[event.sessionId]!)
     return
   }
   if (!runtime) return
@@ -574,6 +582,11 @@ export function mergeSessions(incoming: SessionSummary[], snapshot: boolean): vo
     }
     else state.sessions.push(session)
     seenIds.add(targetId)
+    const runtime = state.runtimes[targetId]
+    if (runtime) {
+      runtime.phase = session.phase
+      if (session.phase === 'IDLE') delete runtime.activeTurnId
+    }
     if (
       session.attentionCount > 0 &&
       session.deviceConnection === 'ONLINE' &&

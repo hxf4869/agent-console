@@ -565,6 +565,7 @@ impl Hub {
         key: DKey,
         needs_binding: Vec<(uuid::Uuid, TargetTag)>,
     ) {
+        let refresh_session = matches!(key.1, TargetTag::Session { .. });
         let mut g1 = self.inner.lock().unwrap();
         if !g1.browsers.contains_key(&conn_id) {
             return;
@@ -593,6 +594,25 @@ impl Hub {
                         },
                     );
                     upstream_index.insert(uid.clone(), key.clone());
+                    sub_envs.push((device, Self::upstream_subscribe_env(device, &tag)));
+                } else if refresh_session
+                    && ds
+                        .upstreams
+                        .get(&uid)
+                        .is_some_and(|binding| binding.snapshot_received)
+                {
+                    // 单会话快照包含完整当前状态；新详情订阅直接向 Bridge
+                    // 取新快照，避免重放经过合并后的旧事件窗口产生 sequence gap。
+                    if let Some(binding) = ds.upstreams.get_mut(&uid) {
+                        binding.epoch = 0;
+                        binding.last_seq = 0;
+                        binding.snapshot_received = false;
+                    }
+                    ds.snapshots.clear();
+                    ds.buffer.clear();
+                    for subscriber in ds.subscribers.values_mut() {
+                        subscriber.awaiting_snapshot = true;
+                    }
                     sub_envs.push((device, Self::upstream_subscribe_env(device, &tag)));
                 }
             }
@@ -660,13 +680,61 @@ impl Hub {
         }
     }
 
-    /// Browser ResyncRequest(§17.5):窗口内重发 snapshot+缓冲;无 snapshot 则继续等待。
+    /// Browser ResyncRequest(§17.5):列表流窗口内重放；单会话详情向 Bridge
+    /// 重取完整 RuntimeSnapshot，避免合并窗口的序号空洞反复触发 resync。
     pub fn browser_resync(&self, conn_id: uuid::Uuid, stream_id: &str) {
         let mut g = self.inner.lock().unwrap();
+        let Some(key) = g
+            .streams
+            .iter()
+            .find(|(_, ds)| ds.stream_id == stream_id)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+
+        if matches!(key.1, TargetTag::Session { .. }) {
+            let tag = key.1.clone();
+            let refreshes = {
+                let Some(ds) = g.streams.get_mut(&key) else {
+                    return;
+                };
+                if !ds.subscribers.contains_key(&conn_id) {
+                    return;
+                }
+                for subscriber in ds.subscribers.values_mut() {
+                    subscriber.awaiting_snapshot = true;
+                }
+                ds.snapshots.clear();
+                ds.buffer.clear();
+                ds.upstreams
+                    .values_mut()
+                    .filter_map(|binding| {
+                        // false 表示同一详情流已有 fresh snapshot 在途；后续
+                        // resync 只等待它，不能再发 Subscribe 造成 epoch 抖动。
+                        if !binding.snapshot_received {
+                            return None;
+                        }
+                        binding.epoch = 0;
+                        binding.last_seq = 0;
+                        binding.snapshot_received = false;
+                        Some((
+                            binding.device,
+                            Self::upstream_subscribe_env(binding.device, &tag),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (device, env) in refreshes {
+                Self::send_to_bridge_locked(&g, device, env);
+            }
+            return;
+        }
+
         let HubInner {
             streams, browsers, ..
         } = &mut *g;
-        let Some((_, ds)) = streams.iter_mut().find(|(_, ds)| ds.stream_id == stream_id) else {
+        let Some(ds) = streams.get_mut(&key) else {
             return;
         };
         match ds.snapshot_anchor() {
@@ -835,6 +903,13 @@ impl Hub {
         // 已活跃订阅者把 snapshot 当普通帧应用。
         let (anchor, stream_id, epoch) = (seq, ds.stream_id.clone(), ds.epoch);
         let buffered: Vec<Arc<Frame>> = ds.buffer.items.iter().cloned().collect();
+        // 缓冲帧会从 anchor+1 连续重编号；推进全局 next_seq，避免下一条
+        // 实时帧复用回放序号并让客户端立刻再次判定 gap。
+        ds.next_seq = ds.next_seq.max(
+            anchor
+                .saturating_add(1)
+                .saturating_add(buffered.len() as u64),
+        );
         let conn_ids: Vec<uuid::Uuid> = ds.subscribers.keys().cloned().collect();
         for conn_id in conn_ids {
             let awaiting = ds
@@ -1363,6 +1438,11 @@ impl Hub {
     }
 
     async fn on_command_result(&self, app: &AppState, device: uuid::Uuid, result: &CommandResult) {
+        let status = Receipt::try_from(result.status).unwrap_or(Receipt::Unspecified);
+        let terminal = matches!(
+            status,
+            Receipt::ReceiptCompleted | Receipt::ReceiptRejected | Receipt::ReceiptOutcomeUnknown
+        );
         let audit_info: Option<(uuid::Uuid, u64)> = {
             let mut g = self.inner.lock().unwrap();
             let pending = g.commands.get(&result.request_id);
@@ -1376,13 +1456,16 @@ impl Hub {
                     );
                     bc.outbox.push_direct(encode_direct(&env));
                 }
-                g.commands.remove(&result.request_id);
+                // DISPATCHED_TO_CODEX 是中间态；保留跟踪直到终态，才能把
+                // COMPLETED/REJECTED/OUTCOME_UNKNOWN 继续送达同一浏览器。
+                if terminal {
+                    g.commands.remove(&result.request_id);
+                }
                 Some((conn_id, elapsed))
             } else {
                 None
             }
         };
-        let status = Receipt::try_from(result.status).unwrap_or(Receipt::Unspecified);
         let status_name = match status {
             Receipt::ReceiptCompleted => "COMPLETED",
             Receipt::ReceiptRejected => "REJECTED",
@@ -1391,9 +1474,14 @@ impl Hub {
             Receipt::ReceiptAcceptedByBridge => "ACCEPTED_BY_BRIDGE",
             _ => "RECEIVED",
         };
-        let error = stable_code_ref_name(
-            &StableErrorCode::try_from(result.error_code).unwrap_or(StableErrorCode::Unspecified),
-        );
+        let error = if result.error_code == StableErrorCode::Unspecified as i32 {
+            ""
+        } else {
+            stable_code_ref_name(
+                &StableErrorCode::try_from(result.error_code)
+                    .unwrap_or(StableErrorCode::InternalError),
+            )
+        };
         let _ =
             crate::sessions::store::update_receipt(&app.db, &result.request_id, status_name, error)
                 .await;
@@ -1408,7 +1496,11 @@ impl Hub {
                         session_id: None,
                         request_id: Some(result.request_id.clone()),
                         operation: "command_result".into(),
-                        result: format!("{status_name}:{error}"),
+                        result: if error.is_empty() {
+                            status_name.to_string()
+                        } else {
+                            format!("{status_name}:{error}")
+                        },
                         latency_ms: Some(elapsed as i64),
                     },
                 )
@@ -1672,10 +1764,12 @@ impl Hub {
                         ));
                         return;
                     }
-                    let mut result = command_rejected(
-                        &request.request_id,
-                        crate::state::stable_code_from_name(&existing.error_code),
-                    );
+                    let stored_error = if existing.error_code.is_empty() {
+                        StableErrorCode::Unspecified
+                    } else {
+                        crate::state::stable_code_from_name(&existing.error_code)
+                    };
+                    let mut result = command_rejected(&request.request_id, stored_error);
                     result.status = crate::sessions::store::receipt_status_code(&existing.status)
                         .map(|s| s as i32)
                         .unwrap_or(0);

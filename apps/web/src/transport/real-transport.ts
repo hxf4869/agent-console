@@ -88,6 +88,9 @@ const WS_PROTOCOL = 'agent-console.v1'
 const HEARTBEAT_MS = 15_000
 const HEARTBEAT_TIMEOUT_MS = 45_000
 const SUBSCRIBE_TIMEOUT_MS = 15_000
+// Browser WebSocket.close 只允许 1000 或 3000–4999；内部主动关闭使用私有码。
+const WS_CLOSE_HEARTBEAT_TIMEOUT = 4001
+const WS_CLOSE_PROTOCOL_MISMATCH = 4002
 
 type SubscriptionTarget = { kind: 'list' } | { kind: 'session'; sessionId: string }
 
@@ -194,14 +197,20 @@ export class RealConsoleTransport implements ConsoleTransport {
     return body.nextCursor ? { items, nextCursor: body.nextCursor } : { items }
   }
 
-  async getRuntimeSnapshot(sessionId: string): Promise<RuntimeSnapshot> {
+  async getRuntimeSnapshot(
+    sessionId: string,
+    options?: { includeHistory?: boolean },
+  ): Promise<RuntimeSnapshot> {
     this.#wantedSessions.add(sessionId)
     this.#queueSubscription({ kind: 'session', sessionId })
+    const historyRequest = options?.includeHistory === false
+      ? Promise.resolve<Page<TimelineItem>>({ items: [] })
+      : this.getHistory(sessionId).catch((): Page<TimelineItem> => ({ items: [] }))
     const [runtimeBody, history] = await Promise.all([
       this.#json<{ runtimeSnapshot: unknown }>(`${API_ROOT}/sessions/${encodeURIComponent(sessionId)}/runtime`),
       // RuntimeSnapshot 是详情首屏事实；HistoryPage 是可选分页补充。fake owner
       // 或旧 Desktop 暂时不能提供历史时，不得把已成功的 runtime 一并丢弃。
-      this.getHistory(sessionId).catch((): Page<TimelineItem> => ({ items: [] })),
+      historyRequest,
     ])
     const runtime = mapRuntimeSnapshotJson(sessionId, runtimeBody.runtimeSnapshot)
     runtime.timeline = history.items
@@ -465,14 +474,14 @@ export class RealConsoleTransport implements ConsoleTransport {
     try {
       envelope = decodeEnvelope(new Uint8Array(data))
     } catch {
-      this.#socket?.close(1002, 'PROTOCOL_VERSION_MISMATCH')
+      this.#socket?.close(WS_CLOSE_PROTOCOL_MISMATCH, 'PROTOCOL_VERSION_MISMATCH')
       return
     }
     const payload = envelope.payload
     switch (payload.case) {
       case 'serverHello':
         if (payload.value.acceptedProtocolVersion !== PROTOCOL_VERSION) {
-          this.#socket?.close(1002, 'PROTOCOL_VERSION_MISMATCH')
+          this.#socket?.close(WS_CLOSE_PROTOCOL_MISMATCH, 'PROTOCOL_VERSION_MISMATCH')
           return
         }
         onHello()
@@ -849,7 +858,7 @@ export class RealConsoleTransport implements ConsoleTransport {
     if (this.#heartbeatTimer) window.clearInterval(this.#heartbeatTimer)
     this.#heartbeatTimer = window.setInterval(() => {
       if (Date.now() - this.#lastHeartbeatAck > HEARTBEAT_TIMEOUT_MS) {
-        this.#socket?.close(1001, 'HEARTBEAT_TIMEOUT')
+        this.#socket?.close(WS_CLOSE_HEARTBEAT_TIMEOUT, 'HEARTBEAT_TIMEOUT')
         return
       }
       this.#send(baseEnvelope({ case: 'heartbeat', value: create(HeartbeatSchema) }))
@@ -1244,6 +1253,7 @@ export function mapRuntimeSnapshotJson(sessionId: string, value: unknown): Runti
           revision: numberOrZero(cursor.revision),
           byteLength: numberOrZero(cursor.byteLength),
           isFinal: Boolean(cursor.isFinal),
+          finalUnavailable: Boolean(cursor.finalUnavailable),
         }
       })
       .filter((cursor) => cursor.itemId),

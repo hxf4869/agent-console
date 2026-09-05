@@ -89,7 +89,10 @@ export class FixtureConsoleTransport implements ConsoleTransport {
     return { items: structuredClone(sessionsFixture.slice(0, 4)), nextCursor: 'sessions:2' }
   }
 
-  async getRuntimeSnapshot(sessionId: string): Promise<RuntimeSnapshot> {
+  async getRuntimeSnapshot(
+    sessionId: string,
+    _options?: { includeHistory?: boolean },
+  ): Promise<RuntimeSnapshot> {
     await delay(90)
     if (sessionId === 'session-offline') return structuredClone(offlineRuntime)
     if (sessionId === 'session-sync') {

@@ -6,9 +6,9 @@ export function utf8Length(value: string): number {
 
 export function shouldHydrateFinalOutput(
   state: OutputState,
-  cursor: { revision: number; byteLength: number; isFinal: boolean },
+  cursor: { revision: number; byteLength: number; isFinal: boolean; finalUnavailable?: boolean },
 ): boolean {
-  if (!cursor.isFinal) return false
+  if (!cursor.isFinal || cursor.finalUnavailable) return false
   return !(
     state.isFinal &&
     state.authority === 'AUTHORITATIVE_FINAL' &&

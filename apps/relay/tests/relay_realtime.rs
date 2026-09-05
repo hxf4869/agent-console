@@ -362,8 +362,8 @@ async fn detail_stream_snapshot_then_events_order() {
 
     // 顺序:Subscribed → RuntimeSnapshot → 缓冲的 OutputAppend 事件。
     let subd = browser.recv(Duration::from_secs(5)).await;
-    let subd_base = match subd.payload {
-        Some(envelope::Payload::Subscribed(s)) => s.base_sequence,
+    let (subd_base, downstream_stream) = match subd.payload {
+        Some(envelope::Payload::Subscribed(s)) => (s.base_sequence, s.stream_id),
         other => panic!("expected Subscribed, got {other:?}"),
     };
     let snap = browser.recv(Duration::from_secs(5)).await;
@@ -401,6 +401,67 @@ async fn detail_stream_snapshot_then_events_order() {
         snap.sequence + 1,
         "buffered event follows snapshot"
     );
+
+    // 单会话 resync 不重放已经合并过的旧窗口，而是重新向 Bridge 取
+    // 权威快照；新快照后的实时事件必须继续严格相邻。
+    browser
+        .send(&base_env(envelope::Payload::ResyncRequest(
+            agent_console_protocol::v1::ResyncRequest {
+                stream_id: downstream_stream,
+            },
+        )))
+        .await;
+    let refresh = loop {
+        let frame = bridge.recv(Duration::from_secs(5)).await;
+        if matches!(frame.payload, Some(envelope::Payload::Heartbeat(_))) {
+            continue;
+        }
+        break frame;
+    };
+    assert!(matches!(
+        refresh.payload,
+        Some(envelope::Payload::Subscribe(ref subscribe))
+            if matches!(subscribe.target, Some(agent_console_protocol::v1::subscribe::Target::Session(_)))
+    ));
+    bridge.send_subscribed(&refresh.stream_id, 4, 20).await;
+    bridge
+        .send(&FakeBridge::runtime_snapshot_env(
+            &device_id.to_string(),
+            "native-9",
+            &refresh.stream_id,
+            20,
+        ))
+        .await;
+
+    let refreshed = browser.recv(Duration::from_secs(5)).await;
+    let refreshed_base = match refreshed.payload {
+        Some(envelope::Payload::Subscribed(s)) => s.base_sequence,
+        other => panic!("expected fresh Subscribed on detail resync, got {other:?}"),
+    };
+    let refreshed_snapshot = browser.recv(Duration::from_secs(5)).await;
+    assert!(matches!(
+        refreshed_snapshot.payload,
+        Some(envelope::Payload::RuntimeSnapshot(_))
+    ));
+    assert_eq!(refreshed_snapshot.sequence, refreshed_base);
+    assert!(refreshed_snapshot.sequence > ev.sequence);
+
+    bridge
+        .send(&FakeBridge::output_append_env(
+            &device_id.to_string(),
+            &refresh.stream_id,
+            "item-1",
+            5,
+            6,
+            21,
+        ))
+        .await;
+    let after_resync = browser.recv(Duration::from_secs(5)).await;
+    assert!(matches!(
+        after_resync.payload,
+        Some(envelope::Payload::EventBatch(_))
+    ));
+    assert_eq!(after_resync.sequence, refreshed_snapshot.sequence + 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

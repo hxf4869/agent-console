@@ -909,16 +909,17 @@ async fn e2e_full_chain_no_ui_eleven_scenarios() {
     })
     .await;
     all_frames.extend(completion.iter().cloned());
-    // 执行计数断言:全链路 MAIN 只出现一个 running turn(fake owner 只执行一次)。
-    let running_turns: std::collections::HashSet<String> = turn_lifecycle_events(&all_frames)
+    // 执行计数断言:全链路 MAIN 只出现一个 turn id(fake owner 只执行一次)。
+    // Browser 在 running 期间断线；详情流重连会取 fresh snapshot，因此不能依赖
+    // 断线窗口内的 running 事件仍被重放，终态 lifecycle 仍能可靠证明执行次数。
+    let executed_turns: std::collections::HashSet<String> = turn_lifecycle_events(&all_frames)
         .into_iter()
-        .filter(|t| t.phase == pb::ActiveTurnPhase::TurnPhaseRunning as i32)
         .filter_map(|t| t.turn.as_ref().map(|x| x.id.clone()))
         .collect();
     assert_eq!(
-        running_turns.len(),
+        executed_turns.len(),
         1,
-        "重试不得重复执行(§29.4 场景 6);实际 running turns: {running_turns:?}"
+        "重试不得重复执行(§29.4 场景 6);实际 turn ids: {executed_turns:?}"
     );
 
     // =====================================================================

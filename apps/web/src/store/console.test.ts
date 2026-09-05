@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import type { SessionSummary } from '@/transport/types'
+import type { RuntimeSnapshot, SessionSummary } from '@/transport/types'
 
 import { mergeSessions, useConsoleStore } from './console'
 
@@ -53,5 +53,25 @@ describe('session list snapshots', () => {
     mergeSessions([session('session-page', '2026-09-05T02:00:00Z')], false)
 
     expect(state.sessions.map((item) => item.id)).toEqual(['session-page', 'session-prior'])
+  })
+
+  it('keeps an opened runtime phase aligned with authoritative list summaries', () => {
+    const current = session('session-current', '2026-09-05T01:00:00Z')
+    state.sessions.push(current)
+    state.runtimes[current.id] = {
+      sessionId: current.id,
+      phase: 'IDLE',
+      activeTurnId: 'turn-old',
+    } as RuntimeSnapshot
+
+    mergeSessions(
+      [{ ...session('session-current', '2026-09-05T02:00:00Z'), phase: 'RUNNING' }],
+      false,
+    )
+    expect(state.runtimes[current.id]?.phase).toBe('RUNNING')
+
+    mergeSessions([session('session-current', '2026-09-05T03:00:00Z')], false)
+    expect(state.runtimes[current.id]?.phase).toBe('IDLE')
+    expect(state.runtimes[current.id]?.activeTurnId).toBeUndefined()
   })
 })

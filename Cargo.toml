@@ -5,7 +5,7 @@ members = ["apps/bridge", "apps/relay", "crates/protocol"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "private"
+license = "MIT"
 
 [workspace.dependencies]
 # ---------------------------------------------------------------- 异步运行时与 Web 框架
@@ -69,11 +69,14 @@ clap = { version = "4", features = ["derive"] }
 
 # ---------------------------------------------------------------- Mac 本机能力
 directories = "5"
-keyring = "3"
+keyring = { version = "3", features = ["apple-native"] }
 infer = "0.16"
 
 # ---------------------------------------------------------------- Web Push 后端
 web-push = "0.10"
+# web-push 0.10 传递依赖 OpenSSL；vendored 使 distroless Relay 镜像无需
+# 运行时 libssl，也避免构建机依赖系统 pkg-config/libssl-dev。
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 # ---------------------------------------------------------------- 内部 crate
 agent_console_protocol = { path = "crates/protocol" }

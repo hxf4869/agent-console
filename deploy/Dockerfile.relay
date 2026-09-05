@@ -1,14 +1,22 @@
 # syntax=docker/dockerfile:1
 # ============================================================================
 # Relay 服务镜像(多阶段构建)
-# - TLS 全部走 rustls(sqlx/reqwest/tokio-tungstenite),无需 openssl 与 pkg-config
+# - 主链路走 rustls；web-push 的传递 OpenSSL 依赖静态 vendored 构建，
+#   无需系统 libssl 与 pkg-config，distroless 运行镜像保持自包含
 # - proto 编译使用纯 Rust 的 protox(build.rs),无需 protoc
 # - 运行镜像使用 distroless cc(nonroot,UID 65532)
 # ============================================================================
 
 # ---------- 构建阶段 ----------
-FROM rust:1-slim AS builder
+# 与 distroless debian12 运行层保持相同 glibc 基线，避免构建产物要求
+# Debian 13 才有的 GLIBC 符号。
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
+
+# vendored OpenSSL 的 Configure/编译需要完整 Perl（slim 仅含 perl-base）和 make。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends make perl \
+    && rm -rf /var/lib/apt/lists/*
 
 # 复制整个 workspace(上下文由根 .dockerignore 裁剪掉 .git/target 等)。
 # 依赖规模变大后,relay workstream 可改为“仅清单 + 占位 src”两级缓存以加速重建。

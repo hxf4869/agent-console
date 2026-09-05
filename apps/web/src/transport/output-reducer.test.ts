@@ -172,4 +172,15 @@ describe('shouldHydrateFinalOutput', () => {
       shouldHydrateFinalOutput(output(), { revision: 2, byteLength: 1, isFinal: false }),
     ).toBe(false)
   })
+
+  it('does not query a final output the Bridge marked unavailable', () => {
+    expect(
+      shouldHydrateFinalOutput(output(), {
+        revision: 2,
+        byteLength: 0,
+        isFinal: true,
+        finalUnavailable: true,
+      }),
+    ).toBe(false)
+  })
 })

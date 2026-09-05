@@ -40,6 +40,8 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 url = { workspace = true }
 uuid = { workspace = true }
 web-push = { workspace = true }
+# 仅用于统一开启 web-push 传递依赖的 vendored OpenSSL feature。
+openssl-sys = { workspace = true }
 
 [dev-dependencies]
 # 无 UI e2e(§29.4):进程内构造 BridgeRuntime + fake-codex-owner(lib 暴露)。

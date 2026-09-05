@@ -115,7 +115,31 @@ async fn command_receipt_flow_and_retry_dedup() {
         other => panic!("expected CommandAccepted, got {other:?}"),
     }
 
-    // 4. Bridge 回 CommandResult(COMPLETED)→ 浏览器收到,回执落库。
+    // 4. Bridge 先回中间态 DISPATCHED_TO_CODEX，再回终态 COMPLETED；
+    // Relay 必须把两条都送到浏览器，且只能在终态移除命令跟踪。
+    let dispatched = base_env(envelope::Payload::CommandResult(
+        agent_console_protocol::v1::CommandResult {
+            request_id: request_id.clone(),
+            status: agent_console_protocol::v1::CommandReceiptStatus::ReceiptDispatchedToCodex
+                as i32,
+            error_code: 0,
+            details: Default::default(),
+            duration_ms: Some(6),
+        },
+    ));
+    bridge.send(&dispatched).await;
+    let got = recv_skip_presence(&mut browser.ws, Duration::from_secs(5)).await;
+    match got.payload {
+        Some(envelope::Payload::CommandResult(r)) => {
+            assert_eq!(
+                r.status,
+                agent_console_protocol::v1::CommandReceiptStatus::ReceiptDispatchedToCodex as i32
+            );
+            assert_eq!(r.error_code, 0);
+        }
+        other => panic!("expected dispatched CommandResult, got {other:?}"),
+    }
+
     let result = base_env(envelope::Payload::CommandResult(
         agent_console_protocol::v1::CommandResult {
             request_id: request_id.clone(),
@@ -146,6 +170,7 @@ async fn command_receipt_flow_and_retry_dedup() {
     .await;
     assert_eq!(resp.status(), 200);
     let mut status = String::new();
+    let mut error_code = String::new();
     for _ in 0..30 {
         let body: serde_json::Value = http_get(
             &env.relay,
@@ -157,12 +182,14 @@ async fn command_receipt_flow_and_retry_dedup() {
         .await
         .unwrap();
         status = body["status"].as_str().unwrap_or("").to_string();
+        error_code = body["errorCode"].as_str().unwrap_or("").to_string();
         if status == "COMPLETED" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(status, "COMPLETED", "receipt must reach COMPLETED");
+    assert_eq!(error_code, "", "successful receipt must not carry an error");
 
     // 5. 相同 request_id 重试:返回已有回执,不再转发 Bridge(§15.2)。
     browser
@@ -175,6 +202,7 @@ async fn command_receipt_flow_and_retry_dedup() {
                 r.status,
                 agent_console_protocol::v1::CommandReceiptStatus::ReceiptCompleted as i32
             );
+            assert_eq!(r.error_code, 0);
         }
         other => panic!("expected stored receipt, got {other:?}"),
     }

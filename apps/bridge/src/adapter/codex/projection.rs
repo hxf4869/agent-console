@@ -497,13 +497,30 @@ pub fn project_display_from_cwd(cwd: &str) -> Option<String> {
 
 /// 当前(或最近)turn 数组:`turns[]`。
 pub fn extract_turns(state: &Value) -> Vec<&Value> {
-    state
-        .get("turns")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .collect()
+    if let Some(turns) = state.get("turns").and_then(Value::as_array) {
+        if !turns.is_empty() {
+            return turns.iter().collect();
+        }
+    }
+
+    // Desktop 0.153.1 的 paginated history 将 turn 存在 entitiesByKey，
+    // `turns[]` 恒空；按原生开始时间恢复与旧数组相同的时间顺序。
+    let mut turns: Vec<&Value> = state
+        .pointer("/turnHistory/history/entitiesByKey")
+        .and_then(Value::as_object)
+        .map(|entities| {
+            entities
+                .values()
+                .filter(|entity| entity.get("turnId").is_some())
+                .collect()
+        })
+        .unwrap_or_default();
+    turns.sort_by_key(|turn| {
+        turn.get("turnStartedAtMs")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    });
+    turns
 }
 
 /// turn 的原生 turnId(§9.2:缺失时由 mapper 生成 synthetic)。
@@ -871,6 +888,24 @@ mod tests {
             Some("demo-app".to_string())
         );
         assert_eq!(project_display_from_cwd("/"), None);
+    }
+
+    #[test]
+    fn extract_turns_supports_paginated_history_in_start_order() {
+        let state = json!({
+            "turns": [],
+            "turnHistory": {"history": {"entitiesByKey": {
+                "newer": {"turnId": "turn-2", "turnStartedAtMs": 20, "status": "inProgress"},
+                "older": {"turnId": "turn-1", "turnStartedAtMs": 10, "status": "completed"},
+                "not-a-turn": {"id": "item-1", "type": "reasoning"}
+            }}}
+        });
+
+        let ids: Vec<_> = extract_turns(&state)
+            .into_iter()
+            .filter_map(|turn| turn.get("turnId").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, vec!["turn-1", "turn-2"]);
     }
 
     #[test]

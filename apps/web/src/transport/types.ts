@@ -197,6 +197,7 @@ export interface RuntimeSnapshot {
     revision: number
     byteLength: number
     isFinal: boolean
+    finalUnavailable?: boolean
   }>
 }
 
@@ -305,7 +306,10 @@ export type ConsoleEvent =
 export interface ConsoleTransport {
   connect(onEvent: (event: ConsoleEvent) => void): Promise<() => void>
   listSessions(cursor?: string): Promise<Page<SessionSummary>>
-  getRuntimeSnapshot(sessionId: string): Promise<RuntimeSnapshot>
+  getRuntimeSnapshot(
+    sessionId: string,
+    options?: { includeHistory?: boolean },
+  ): Promise<RuntimeSnapshot>
   getHistory(sessionId: string, cursor?: string): Promise<Page<TimelineItem>>
   getDevices(): Promise<DeviceSummary[]>
   lookupPairing(shortCode: string): Promise<PairingChallenge>

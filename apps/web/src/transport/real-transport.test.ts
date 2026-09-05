@@ -77,6 +77,13 @@ describe('real transport contract mapping', () => {
       pendingApprovals: [],
       backgroundCommands: [],
       backgroundCommandCount: 0,
+      recentOutputCursors: [{
+        itemId: { id: 'command-1' },
+        revision: 8,
+        byteLength: 0,
+        isFinal: true,
+        finalUnavailable: true,
+      }],
       queue: { state: 'QUEUE_STATE_EMPTY' },
       capabilities: {
         controlMode: 'CONTROL_MODE_LIMITED_CONTROL',
@@ -106,6 +113,7 @@ describe('real transport contract mapping', () => {
       STOP_BACKGROUND_COMMAND: false,
       STOP_ALL_BACKGROUND_COMMANDS: false,
     })
+    expect(runtime.outputCursors[0]?.finalUnavailable).toBe(true)
   })
 
   it('keeps the refreshed file handle from metadata', () => {

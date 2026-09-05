@@ -440,6 +440,54 @@ fn settings_are_projected_dynamically() {
 }
 
 #[test]
+fn paginated_history_projects_active_turn_and_running_command() {
+    let mut mapper = SessionMapper::new(SessionKey::codex("dev", CONV));
+    let state = json!({
+        "id": CONV,
+        "cwd": "/tmp/fixture-mapper",
+        "historyMode": "paginated",
+        "threadRuntimeStatus": {"type": "active", "activeFlags": []},
+        "turns": [],
+        "turnHistory": {"history": {"entitiesByKey": {
+            "turn-old": {
+                "turnId": "turn-old",
+                "turnStartedAtMs": 10,
+                "status": "completed",
+                "items": []
+            },
+            "turn-live": {
+                "turnId": "turn-live",
+                "turnStartedAtMs": 20,
+                "status": "inProgress",
+                "items": [{
+                    "id": "command-live",
+                    "type": "commandExecution",
+                    "status": "inProgress",
+                    "command": "fixture-read-only"
+                }]
+            }
+        }}},
+        "pendingQuestions": [],
+        "pendingApprovals": []
+    });
+
+    let events = mapper.apply_snapshot(7, &state);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        DomainEvent::TurnLifecycle {
+            phase: ActiveTurnPhase::Running,
+            ..
+        }
+    )));
+    let snapshot = mapper.runtime_snapshot().expect("runtime snapshot");
+    let current = snapshot.current_turn.expect("current paginated turn");
+    assert_eq!(current.turn.id, "turn-live");
+    assert_eq!(current.phase, ActiveTurnPhase::Running);
+    assert_eq!(snapshot.running_commands.len(), 1);
+    assert_eq!(snapshot.running_commands[0].command_id, "command-live");
+}
+
+#[test]
 fn immer_patch_application_and_opaque_items() {
     let mut state = json!({"a": {"b": [1, 2]}, "keep": true});
     apply_immer_patches(
