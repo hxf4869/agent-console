@@ -82,7 +82,7 @@
 ## 6. 版本门
 
 - 版本判定与写能力注入分三层,互不共用同一判断:
-  1. **只读协议兼容版本**:`VERIFIED_VERSIONS = ["0.153.0-alpha.5", "0.153.1"]`(asar 复核 + 真机只读复验;0.153.1 Ev 版本表 22 项零 diff,见 §8)。命中即 `CompatibilityState::Verified`,语义仅为协议/只读兼容,不等于任何写能力开放。
+  1. **只读协议兼容版本**:`VERIFIED_VERSIONS = ["0.153.0-alpha.5", "0.153.1", "0.153.4"]`(asar 复核 + 真机只读复验;0.153.1 Ev 版本表 22 项零 diff,见 §8;0.153.4 只读探针 + Ev 差异面核对,见 §10)。命中即 `CompatibilityState::Verified`,语义仅为协议/只读兼容,不等于任何写能力开放。
   2. **每版本实际验证过的写操作**:生产写白名单独立按版本注入(逐版本矩阵见 §9.2)——0.153.1 注入 start/steer/interrupt = Passed(§9.1 真机验证);0.153.0-alpha.5(写验证仍 FIXTURE_ONLY,§3)与一切未知版本的全部写操作保持 NotProbed;未知版本另加 DEGRADED + READ_ONLY 只读降级。
   3. **方法已验证但产品未开放的设置能力**:update-thread-settings 方法级已真机验证(§9.1,effort max→high),但因 Desktop 0.153.1 不提供动态可选值列表(availableValues 恒空),产品 UpdateSettings capability 保持关闭、生产白名单 update_settings = NotProbed;解锁条件与命令层防御见 §9.2。
 - 版本表(asar `Ev`)随 Desktop 演进;`version` 字段不匹配时对端拒绝(`request-version-mismatch`),Bridge 的 capability probe 必须覆盖该表。
@@ -162,3 +162,41 @@
 - 设置写入约束(UpdateSettings 保持关闭期间的命令层防御;将来开放也按此收紧):仅接受 `ReasoningEffort`,值必须存在于 owner 动态下发的 availableValues,空列表一律以 `SETTING_COMBINATION_UNSUPPORTED` 拒绝;model/serviceTier/permissionMode/collaborationMode 不可写。已实测字段仅 `effort`(max→high 往返);`minimal` 在 0.153.1 实测会引发 turn 无终态并使会话停留 systemError,同样只在真实出现于动态选项时才允许。
 - UpdateSettings 解锁条件:Desktop 后续版本提供可靠动态 availableValues 后,按上一条约束开放;开放前不得凭方法级 VERIFIED(§9.1)宣称设置写入可用。
 - CREATE_TASK / RENAME / ARCHIVE / UNARCHIVE / FORK / 后台命令停止:IPC 无对应方法(§3/§4/§7),保持 UNSUPPORTED,不在白名单。
+
+## 10. 版本矩阵:codex-cli 0.153.4(bundle 26.901.41600)复核与只读验证
+
+- 复核日期:2026-09-05(ChatGPT Desktop 自动更新至 bundle `26.901.41600`,`CFBundleVersion=7982`;`codex --version` = `codex-cli 0.153.4`,进程以 `-c features.code_mode_host=true` 拉起 app-server,与 §7 记录的私有 stdio 模式一致)。
+- 复核方式:新版 asar 静态逆向(`.vite/build/src-VqXTPopo.js` 路由/客户端库 + `webview/assets/app-initial-86767c3d23e5.js` 渲染进程)+ 真实 socket 只读探针(`cargo test -p bridge --test ipc_live -- --ignored --nocapture`;initialize / thread-owner-discovery / thread-stream-following-changed / thread-follower-load-complete-history,**未发送任何写方法**)。
+- **判定:只读协议 COMPATIBLE(`VERIFIED_VERSIONS` 已增补 `0.153.4`,§6);写能力全部 NotProbed(写矩阵未注入,真实写验证受 B.11 阶段门约束,待专用测试会话窗口)。**
+
+### 10.1 协议差异面(0.153.4 vs 0.153.1,静态 + 真机)
+
+| 项 | 0.153.1 | 0.153.4 | 对 Bridge 影响 |
+|---|---|---|---|
+| follower 方法清单(13 个)+ thread-owner-discovery | 不变 | 不变(逐一比对) | 无 |
+| Ev 版本表(Bridge 发送侧使用的全部方法) | — | **全部不变**(start 2/steer 1/interrupt 4/settings 1/submit-user-input 1 等) | 发送侧 request version 无需改动 |
+| Ev 表新增 `ipc-connection-reset:1` | 无 | 有 | Bridge 未注册该广播,落 unknown broadcast 计数,无影响 |
+| Ev 表 `thread-queued-followups-changed` | 2 | **1** | Bridge 不发送该方法,无影响 |
+| initialize 握手 / 帧格式 / socket 权限 | VERIFIED | VERIFIED(真机探针:success + clientId;dir 0700 / socket 0600) | 无 |
+| thread-owner-discovery / following → 快照 / load-complete-history | VERIFIED | VERIFIED(真机探针:owner present、snapshot revision 单调、补偿后重发) | 无 |
+| conversationState 顶层键 | 39 键 | **41 键(真机实测)**,新增 `paginatedHistory`/`parentThreadId`/`threadGoal`/`threadGoalResumeConfirmation`/`unreadMessageCount` 等(部分与 39 键清单重合,净增见 `projection.rs::KNOWN_STATE_KEYS` 2026-09-05 增补) | 未知键容忍已覆盖;KNOWN_STATE_KEYS 已增补消除 doctor 计数噪音 |
+| **`pendingQuestions` / `pendingApprovals` 顶层键** | 投影约定(FIXTURE_ONLY,真机未出现) | **不存在(真机 41 键实证)** | 见 §10.2 |
+
+### 10.2 原生问题/审批的真实落点(0.153.4,asar + 真机键存在性证据)
+
+- 0.153.4 渲染进程中,原生"问题"是 app-server 的 server request:`item/tool/requestUserInput`(另有 `item/tool/requestOptionPicker`),审批为 `item/commandExecution/requestApproval` / `item/fileChange/requestApproval`。这些请求统一记录在 conversationState 顶层 **`requests[]`**(元素形态 `{id, method, params, completed}`,idle 会话实测空数组;idle 时无 pending 属预期)。
+- `item/tool/requestUserInput` 的 params(asar):`{threadId, turnId, questions: [{id, header, question, isOther, options: [{label, description}]}]}`;渲染进程回答经 `replyWithUserInputResponse(conversationId, requestId, response)` 且归一化 `{answers: {<questionId>: {answers: [...]}}}`;follower 回答走 `thread-follower-submit-user-input`(params `{conversationId, requestId, response}` 原样转发)——**Bridge 旧 payload `{optionIds, text}` 形状不匹配,已修**(`adapter/codex/mod.rs` AnswerQuestion:外层 request.id 与题目自身 `questions[].id` 是两个身份,params.`requestId` 用外层 `id` 路由,`answers` 内层键用每题自身 `id` 且全部题目进 payload,见 `projection.rs::extract_requests_questions_detail`;answers 元素与 option_id 的精确原生类型待 N01 真机采样校正)。
+- **识别层修复**(有真机键存在性 + asar schema 证据):`projection.rs` 的 `extract_questions`/`extract_approvals` 在 `pendingQuestions`/`pendingApprovals` 缺失时回退投影 `requests[]`(method 白名单 + `completed` 过滤);question 的 follower requestId = request 外层 `id`;options 原生无 id 字段,以 `label` 兼作 option_id(待采样校正);审批仅投影稳定维度(ID/turn/valid),**decisions 留空**(原生决定选项值未采样,answer 前不得宣称可点)。
+- 阶段:识别/回答 payload 修改为**静态 + 键存在性证据驱动**(N01 真机采样未做);单测以 asar schema 为 fixture(`projection.rs::requests_array_yields_questions_and_approvals_for_0_153_4`)。真机采样完成后校正。
+
+### 10.3 0.153.4 能力状态(逐操作)
+
+| 能力 | 状态 | 证据 |
+|---|---|---|
+| 只读观察能力(§1/§2 全部) | VERIFIED(0.153.4) | 真机只读探针(ipc_live,2026-09-05);Ev 表核对发送侧版本零 diff |
+| start/steer/interrupt | NOT_RUN(0.153.4) | 写矩阵未注入(§9.2 逐版本独立);0.153.1 证据不自动外推,待专用测试会话真机重验 |
+| 回答原生问题 | FIXTURE_ONLY(识别层已适配 `requests[]`,回答 payload 形状已按 asar 修正) | §10.2;N01 真机采样 BLOCKED_AUTH |
+| 命令/文件审批 | FIXTURE_ONLY(识别层已适配;decisions 空) | §10.2;N01 真机采样 BLOCKED_AUTH |
+| 权限审批 / MCP elicitation / queued follow-ups / edit / compact | FIXTURE_ONLY | 无新证据,维持 §3 状态 |
+| `default_mode_request_user_input` feature | NOT_RUN | 键在 0.153.4 二进制存在(8 处字符串命中);config 于 app-server 启动时加载,改键生效需重启 Desktop → 与冷启动测试同窗口,本机 Desktop 运行中未安排重启,配置未改动 |
+| 新建 thread | UNSUPPORTED(IPC,复确认) | 0.153.4 asar 仍仅 thread-owner-discovery + 13 个 thread-follower-*;§4/§7 结论不变 |

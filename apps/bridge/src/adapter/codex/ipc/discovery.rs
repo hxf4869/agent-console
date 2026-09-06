@@ -21,8 +21,10 @@ pub const VERSION_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// 协议/只读兼容版本表(CODEX-COMPATIBILITY.md 记录):命中即
 /// `CompatibilityState::Verified`(只读协议兼容)。写能力矩阵独立于此表,
 /// 见 `crate::capabilities::verified_write_probes`;0.153.1 的写能力已逐操作
-/// 真机验证(§9),0.153.0-alpha.5 仅有 fixture 证据(只读兼容)。
-pub const VERIFIED_VERSIONS: &[&str] = &["0.153.0-alpha.5", "0.153.1"];
+/// 真机验证(§9),0.153.0-alpha.5 仅有 fixture 证据(只读兼容);
+/// 0.153.4 于 2026-09-05 真机只读探针验证(ipc_live:握手/owner/快照/history
+/// 全通过;Ev 表核对 Bridge 发送侧版本无变化),写能力仍 NotProbed(未知写矩阵)。
+pub const VERIFIED_VERSIONS: &[&str] = &["0.153.0-alpha.5", "0.153.1", "0.153.4"];
 
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
@@ -130,11 +132,17 @@ pub fn socket_owned_by_current_user(path: &Path) -> bool {
     }
 }
 
+/// 默认 Desktop 内置版本探测二进制(固定路径;与 `probe_version` 缺省一致)。
+pub const DEFAULT_VERSION_BINARY: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
+
+pub fn default_version_binary() -> PathBuf {
+    PathBuf::from(DEFAULT_VERSION_BINARY)
+}
+
 /// 通过固定 argv 探测 codex CLI 版本(不经 shell)。
 /// `binary` 缺省时使用 Desktop 内置二进制路径。
 pub async fn probe_version(binary: Option<PathBuf>) -> Result<String, DiscoveryError> {
-    let bin = binary
-        .unwrap_or_else(|| PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"));
+    let bin = binary.unwrap_or_else(default_version_binary);
     let out = timeout(
         VERSION_COMMAND_TIMEOUT,
         tokio::process::Command::new(&bin).arg("--version").output(),
@@ -243,6 +251,8 @@ mod tests {
         assert!(version_is_verified("codex-cli 0.153.0-alpha.5"));
         assert!(version_is_verified("0.153.1"));
         assert!(version_is_verified("codex-cli 0.153.1"));
+        // 0.153.4:2026-09-05 真机只读探针验证后的只读兼容条目(§10)。
+        assert!(version_is_verified("codex-cli 0.153.4"));
         assert!(!version_is_verified("codex-cli 0.999.0"));
         assert!(!version_is_verified("0.999.0"));
         assert!(!version_is_verified(""));

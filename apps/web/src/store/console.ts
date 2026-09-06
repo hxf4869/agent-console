@@ -1,5 +1,11 @@
 import { computed, reactive } from 'vue'
 
+import {
+  consoleProtocolVersion,
+  consoleWebCommit,
+  loadRelayVersion,
+  loadToolboxVersion,
+} from '@/lib/build-info'
 import { getOperationAvailability } from '@/transport/capabilities'
 import { FixtureConsoleTransport } from '@/transport/fixture-transport'
 import { AuthRequiredError, loginUrl, RealConsoleTransport } from '@/transport/real-transport'
@@ -11,6 +17,7 @@ import {
 } from '@/transport/receipt-policy'
 import type {
   AttentionItem,
+  AttentionKind,
   CapabilitySnapshot,
   CommandReceipt,
   ConsoleEvent,
@@ -23,17 +30,24 @@ import type {
   GitFileDiff,
   GitSummary,
   PairingChallenge,
+  ReceiptStatus,
+  RelayLinkState,
   RuntimeSettings,
   RuntimeSnapshot,
   SessionSummary,
   TimelineItem,
   UploadResult,
 } from '@/transport/types'
+import type { AnswerState } from '@/transport/types'
+
+export type { AnswerState } from '@/transport/types'
 
 interface ToastMessage {
   id: string
   message: string
   tone: 'info' | 'success' | 'warning' | 'danger'
+  /** 站内路由标识:点击提醒经正常认证进入会话,不直接携带可批准卡片(UX-06)。 */
+  linkTo?: string
 }
 
 interface PendingCommandContext {
@@ -42,9 +56,16 @@ interface PendingCommandContext {
   baselineRevision: number
 }
 
+export interface ExpiredAttentionNotice {
+  id: string
+  sessionId: string
+  at: string
+}
+
 interface ConsoleState {
   initialized: boolean
   connection: DeviceConnection
+  link: RelayLinkState
   sessions: SessionSummary[]
   sessionsCursor?: string
   sessionsLoading: boolean
@@ -56,6 +77,14 @@ interface ConsoleState {
   receipts: CommandReceipt[]
   toasts: ToastMessage[]
   resolvedAttentionIds: string[]
+  answerStates: Record<string, AnswerState>
+  expiredNotices: ExpiredAttentionNotice[]
+  drafts: Record<string, string>
+  notifySuccessEnabled: boolean
+  /** Relay 版本端点结果(IN-01):空串表示尚未取到,展示为"未知"。 */
+  relayVersions: { relay: string; protocol: string }
+  /** Toolbox 版本端点结果(IN-01):空串表示尚未取到或占位值,展示为"未知"。 */
+  toolboxVersions: { app: string; commit: string }
   fixtureMode: boolean
   startupError?: string
 }
@@ -70,9 +99,30 @@ const transport: ConsoleTransport = fixtureMode
   ? new FixtureConsoleTransport()
   : new RealConsoleTransport()
 
+/** 成功完成提醒的用户开关(UX-06);只存布尔偏好,不存任何内容。 */
+const NOTIFY_SUCCESS_KEY = 'agent-console.notify-success'
+
+function readNotifySuccessSetting(): boolean {
+  try {
+    return window.localStorage.getItem(NOTIFY_SUCCESS_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function writeNotifySuccessSetting(enabled: boolean): void {
+  try {
+    if (enabled) window.localStorage.setItem(NOTIFY_SUCCESS_KEY, '1')
+    else window.localStorage.removeItem(NOTIFY_SUCCESS_KEY)
+  } catch {
+    // 存储不可用时开关只在当前会话内生效。
+  }
+}
+
 const state = reactive<ConsoleState>({
   initialized: false,
   connection: 'CONNECTING',
+  link: { state: 'CONNECTING', stage: 'TICKET', updatedAt: '' },
   sessions: [],
   sessionsLoading: false,
   devices: [],
@@ -83,11 +133,23 @@ const state = reactive<ConsoleState>({
   receipts: [],
   toasts: [],
   resolvedAttentionIds: [],
+  answerStates: {},
+  expiredNotices: [],
+  drafts: {},
+  notifySuccessEnabled: readNotifySuccessSetting(),
+  relayVersions: { relay: '', protocol: '' },
+  toolboxVersions: { app: '', commit: '' },
   fixtureMode,
 })
 
 let disconnectTransport: (() => void) | undefined
 const pendingCommandContexts = new Map<string, PendingCommandContext>()
+/** 已提交回复的审批 → 所属会话:所属轮次失败时标记"已允许，执行失败"(UX-05)。 */
+const answeredApprovalSessions = new Map<string, string>()
+/** 详情视图对会话订阅的引用计数:归零才释放 transport 订阅。 */
+const detailRefs = new Map<string, number>()
+/** 在途输出补全的取消句柄(key: `${sessionId}:${itemId}`),离开详情时取消。 */
+const outputLoads = new Map<string, AbortController>()
 const reconcileTimers = new Map<number, () => void>()
 const START_RECONCILE_DELAYS_MS = [0, 150, 300, 600, 1_200] as const
 const INTERRUPT_RECONCILE_DELAYS_MS = [0, 250, 500, 1_000, 2_000, 4_000, 8_000, 12_000] as const
@@ -96,6 +158,9 @@ async function initialize(): Promise<void> {
   if (state.initialized) return
   state.initialized = true
   delete state.startupError
+  // Relay/Toolbox 版本端点与会话/WS 无关:各自独立拉取一次,失败静默保持"未知"(IN-01)。
+  void refreshRelayVersion()
+  void refreshToolboxVersion()
   try {
     disconnectTransport = await transport.connect(handleEvent)
     await Promise.all([loadMoreSessions(), loadDevices()])
@@ -175,6 +240,29 @@ async function ensureRuntime(
     prepareDeferredOutputs(runtime)
   }
   return runtime
+}
+
+/** 详情视图进入:计数持有该会话订阅。 */
+function acquireRuntime(sessionId: string): void {
+  detailRefs.set(sessionId, (detailRefs.get(sessionId) ?? 0) + 1)
+}
+
+/** 详情视图离开:引用归零后释放订阅;有待处理注意项的会话由后台任务继续持有。 */
+function releaseRuntime(sessionId: string): void {
+  const refs = (detailRefs.get(sessionId) ?? 0) - 1
+  if (refs > 0) {
+    detailRefs.set(sessionId, refs)
+    return
+  }
+  detailRefs.delete(sessionId)
+  const summary = state.sessions.find((item) => item.id === sessionId)
+  if (summary && summary.attentionCount > 0 && summary.deviceConnection === 'ONLINE') return
+  for (const [key, controller] of outputLoads) {
+    if (!key.startsWith(`${sessionId}:`)) continue
+    controller.abort()
+    outputLoads.delete(key)
+  }
+  transport.releaseRuntime(sessionId)
 }
 
 async function loadOlderHistory(sessionId: string): Promise<void> {
@@ -343,11 +431,29 @@ function toggleConnection(): void {
   )
 }
 
-async function answerAttention(attentionId: string, optionId: string): Promise<void> {
+async function answerAttention(
+  attentionId: string,
+  optionId: string,
+  freeText?: string,
+): Promise<void> {
   const attention = pendingAttention.value.find((item) => item.id === attentionId)
   if (!attention || !attention.valid) return
   const operation = attention.kind === 'RISK_APPROVAL' ? 'ANSWER_APPROVAL' : 'ANSWER_QUESTION'
-  const receipt = await sendCommand(attention.sessionId, operation, { attentionId, optionId })
+  const payload: Record<string, unknown> = { attentionId, optionId }
+  // 自由文本只按原生 allowFreeText 传递;secret 型答案只驻内存,不落任何持久化。
+  if (freeText?.trim()) payload.freeText = freeText.trim()
+  const receipt = await sendCommand(attention.sessionId, operation, payload)
+  if (receipt) {
+    state.answerStates[attentionId] = {
+      requestId: receipt.requestId,
+      submittedStatus: receipt.status,
+      ...(receipt.errorCode ? { errorCode: receipt.errorCode } : {}),
+      at: new Date().toISOString(),
+    }
+    if (attention.kind === 'RISK_APPROVAL') {
+      answeredApprovalSessions.set(attentionId, attention.sessionId)
+    }
+  }
   if (
     receipt &&
     shouldApplyReceipt(receipt.status) &&
@@ -427,6 +533,15 @@ function handleEvent(event: ConsoleEvent): void {
     state.connection = event.state
     return
   }
+  if (event.type === 'link') {
+    state.link = event.link
+    if (event.link.state === 'ONLINE') {
+      delete state.startupError
+      // 首连失败后经重试恢复:HTTP 设备列表在此补一次,任务列表由 WS 列表快照提供。
+      if (!state.devices.length) void loadDevices().catch(() => undefined)
+    }
+    return
+  }
   if (event.type === 'auth-expired') {
     redirectToLogin()
     return
@@ -480,6 +595,12 @@ function handleEvent(event: ConsoleEvent): void {
       session.phase = event.phase
       if (event.outcome) session.lastOutcome = event.outcome
     }
+    if (event.outcome === 'FAILED') {
+      applyExecutionFailureToApprovals(state.answerStates, answeredApprovalSessions, event.sessionId)
+      notifyOutcome(event.sessionId, 'FAILED')
+    } else if (event.outcome === 'COMPLETED') {
+      notifyOutcome(event.sessionId, 'COMPLETED')
+    }
     return
   }
   if (event.type === 'attention-added') {
@@ -495,6 +616,7 @@ function handleEvent(event: ConsoleEvent): void {
         attention: event.attention,
       },
     ])
+    notifyAttentionAdded(event.sessionId)
     return
   }
   if (event.type === 'attention-removed') {
@@ -502,6 +624,7 @@ function handleEvent(event: ConsoleEvent): void {
     runtime.timeline = runtime.timeline.filter(
       (item) => item.type !== 'attention' || item.attention.id !== event.attentionId,
     )
+    recordAttentionClosure(event.sessionId, event.attentionId)
     return
   }
   if (event.type === 'queue-changed') {
@@ -554,9 +677,12 @@ function handleEvent(event: ConsoleEvent): void {
     if (!output?.hasGap) return
     if (event.event.type === 'final') {
       const finalEvent = event.event
+      const controller = new AbortController()
+      const loadKey = `${event.sessionId}:${finalEvent.itemId}`
+      outputLoads.set(loadKey, controller)
       output.loadState = 'LOADING'
       void transport
-        .getOutputText(event.sessionId, finalEvent.itemId)
+        .getOutputText(event.sessionId, finalEvent.itemId, { signal: controller.signal })
         .then((text) => {
           handleEvent({
             type: 'output',
@@ -571,7 +697,11 @@ function handleEvent(event: ConsoleEvent): void {
           handleEvent(event)
         })
         .catch(() => {
-          output.loadState = 'FAILED'
+          // 取消(已离开详情)不是失败:保持 DEFERRED 等待再次进入;真失败保留已有内容。
+          output.loadState = controller.signal.aborted ? 'DEFERRED' : 'FAILED'
+        })
+        .finally(() => {
+          if (outputLoads.get(loadKey) === controller) outputLoads.delete(loadKey)
         })
     } else {
       transport.requestResync(event.sessionId)
@@ -582,10 +712,14 @@ function handleEvent(event: ConsoleEvent): void {
 export function mergeSessions(incoming: SessionSummary[], snapshot: boolean): void {
   const seenIds = new Set<string>()
   for (const session of incoming) {
+    // 归属去重必须含 agentKind:同机同 nativeSessionId 的双 Agent 会话
+    // (Codex/ZCode)是两个不同对象,不得互相覆盖(ZC-02)。
     const existing = state.sessions.find(
       (item) =>
         item.id === session.id ||
-        (item.deviceId === session.deviceId && item.nativeSessionId === session.nativeSessionId),
+        (item.deviceId === session.deviceId &&
+          item.agentKind === session.agentKind &&
+          item.nativeSessionId === session.nativeSessionId),
     )
     let targetId = session.id
     if (existing) {
@@ -760,8 +894,11 @@ async function loadOutput(sessionId: string, itemId: string): Promise<void> {
   )
   if (!runtime || !cursor || !item || item.output.loadState === 'LOADING') return
   item.output.loadState = 'LOADING'
+  const controller = new AbortController()
+  const loadKey = `${sessionId}:${itemId}`
+  outputLoads.set(loadKey, controller)
   try {
-    const text = await transport.getOutputText(sessionId, itemId)
+    const text = await transport.getOutputText(sessionId, itemId, { signal: controller.signal })
     let output = reduceOutput(item.output, {
       type: 'replace',
       itemId,
@@ -777,8 +914,14 @@ async function loadOutput(sessionId: string, itemId: string): Promise<void> {
     delete output.loadState
     item.output = output
   } catch (error) {
-    item.output.loadState = 'FAILED'
-    pushToast(error instanceof Error ? error.message : '最终输出读取失败，可重试。', 'warning')
+    if (controller.signal.aborted) {
+      item.output.loadState = 'DEFERRED'
+    } else {
+      item.output.loadState = 'FAILED'
+      pushToast(error instanceof Error ? error.message : '最终输出读取失败，可重试。', 'warning')
+    }
+  } finally {
+    if (outputLoads.get(loadKey) === controller) outputLoads.delete(loadKey)
   }
 }
 
@@ -882,15 +1025,171 @@ function receiptMessage(receipt: CommandReceipt): string {
   return '请求已接收，等待 Bridge 确认。'
 }
 
-function pushToast(message: string, tone: ToastMessage['tone'] = 'info'): void {
+function pushToast(message: string, tone: ToastMessage['tone'] = 'info', linkTo?: string): void {
   const id = crypto.randomUUID()
-  state.toasts.push({ id, message, tone })
-  window.setTimeout(() => dismissToast(id), 4200)
+  state.toasts.push({ id, message, tone, ...(linkTo ? { linkTo } : {}) })
+  // 可点击的站内提醒停留更久;普通提示保持原节奏。
+  window.setTimeout(() => dismissToast(id), linkTo ? 8000 : 4200)
 }
 
 function dismissToast(id: string): void {
   const index = state.toasts.findIndex((toast) => toast.id === id)
   if (index >= 0) state.toasts.splice(index, 1)
+}
+
+/**
+ * 站内待办提醒(UX-06 最小集;Console 无 Web Push 模块,不接新通知供应商):
+ * payload 只带不敏感摘要与站内路由标识,不含标题正文/命令/路径。
+ */
+export interface ReminderMessage {
+  message: string
+  linkTo: string
+}
+
+export function attentionAddedReminder(sessionId: string, muted: boolean): ReminderMessage | undefined {
+  if (muted) return undefined
+  return { message: '有新的待处理请求，请查看待处理中心。', linkTo: `/s/${sessionId}` }
+}
+
+export function outcomeReminder(
+  sessionId: string,
+  outcome: 'FAILED' | 'COMPLETED',
+  muted: boolean,
+  notifySuccessEnabled: boolean,
+): ReminderMessage | undefined {
+  if (muted) return undefined
+  if (outcome === 'COMPLETED' && !notifySuccessEnabled) return undefined
+  return {
+    message:
+      outcome === 'FAILED' ? '一个任务的本轮执行失败，请查看详情。' : '一个任务已完成。',
+    linkTo: `/s/${sessionId}`,
+  }
+}
+
+/**
+ * 待处理请求关闭(到期/本机已处理)后的短提示:只解释事实,
+ * 不再提供可批准卡片;本机已处理与过期使用同一句用户可读解释。
+ */
+export function attentionClosureReminder(sessionId: string): ReminderMessage {
+  return {
+    message: '一项待处理请求已关闭：可能已过期或已在本机处理。',
+    linkTo: `/s/${sessionId}`,
+  }
+}
+
+function notifyAttentionAdded(sessionId: string): void {
+  const session = state.sessions.find((item) => item.id === sessionId)
+  const reminder = attentionAddedReminder(sessionId, session?.muted ?? false)
+  if (reminder) pushToast(reminder.message, 'warning', reminder.linkTo)
+}
+
+function notifyOutcome(sessionId: string, outcome: 'FAILED' | 'COMPLETED'): void {
+  const session = state.sessions.find((item) => item.id === sessionId)
+  const reminder = outcomeReminder(sessionId, outcome, session?.muted ?? false, state.notifySuccessEnabled)
+  if (!reminder) return
+  pushToast(reminder.message, outcome === 'FAILED' ? 'warning' : 'success', reminder.linkTo)
+}
+
+function recordAttentionClosure(sessionId: string, attentionId: string): void {
+  if (state.resolvedAttentionIds.includes(attentionId)) return
+  state.expiredNotices.unshift({ id: attentionId, sessionId, at: new Date().toISOString() })
+  if (state.expiredNotices.length > 5) state.expiredNotices.length = 5
+  const reminder = attentionClosureReminder(sessionId)
+  pushToast(reminder.message, 'info', reminder.linkTo)
+}
+
+/** 审批所属轮次失败时,把该会话已允许的审批标记为"已允许，执行失败"(UX-05)。 */
+export function applyExecutionFailureToApprovals(
+  answerStates: Record<string, AnswerState>,
+  approvalSessionByAttention: ReadonlyMap<string, string>,
+  sessionId: string,
+): void {
+  for (const [attentionId, ownerSessionId] of approvalSessionByAttention) {
+    if (ownerSessionId !== sessionId) continue
+    const answerState = answerStates[attentionId]
+    if (answerState && answerState.submittedStatus !== 'REJECTED') answerState.execution = 'FAILED'
+  }
+}
+
+function retryConnection(): void {
+  delete state.startupError
+  transport.retryLink()
+}
+
+/** 供视图推送本地提示(如保存结果);不承载命令语义。 */
+function notify(message: string, tone: ToastMessage['tone'] = 'info'): void {
+  pushToast(message, tone)
+}
+
+async function verifyRequest(requestId: string): Promise<CommandReceipt | undefined> {
+  try {
+    const receipt = await transport.getReceipt(requestId)
+    if (receipt) recordReceipt(receipt)
+    return receipt
+  } catch (error) {
+    if (error instanceof AuthRequiredError) redirectToLogin()
+    return undefined
+  }
+}
+
+function toggleNotifySuccess(): void {
+  state.notifySuccessEnabled = !state.notifySuccessEnabled
+  writeNotifySuccessSetting(state.notifySuccessEnabled)
+}
+
+/**
+ * 页面内草稿键(UX-03):按 (device, agentKind, nativeSession) 绑定,切会话不串内容。
+ * 默认内存保存;审批凭据等 secret 型答案从不进入任何持久化存储。
+ */
+export function draftKeyFor(deviceId: string, agentKind: string, nativeSessionId: string): string {
+  return `${deviceId}:${agentKind}:${nativeSessionId}`
+}
+
+function draftKey(sessionId: string): string {
+  const summary = state.sessions.find((item) => item.id === sessionId)
+  return draftKeyFor(
+    summary?.deviceId ?? '',
+    summary?.agentKind ?? 'AGENT_KIND_UNSPECIFIED',
+    summary?.nativeSessionId || sessionId,
+  )
+}
+
+function getDraft(sessionId: string): string {
+  return state.drafts[draftKey(sessionId)] ?? ''
+}
+
+function setDraft(sessionId: string, text: string): void {
+  state.drafts[draftKey(sessionId)] = text
+}
+
+/** 版本组合可观察(IN-01):后端未提供的字段如实显示"未知",不强造数据。 */
+function componentVersions() {
+  const device = state.devices[0]
+  const codexVersion = Object.values(state.runtimes)
+    .map((runtime) => runtime.capabilities.codexVersion)
+    .find((value) => Boolean(value))
+  return {
+    protocol: consoleProtocolVersion,
+    web: consoleWebCommit,
+    // Relay 版本来自 GET /agent-console/api/version;Toolbox 来自 GET /api/v1/version。
+    relay: state.relayVersions.relay,
+    relayProtocol: state.relayVersions.protocol,
+    toolbox: state.toolboxVersions.app,
+    toolboxCommit: state.toolboxVersions.commit,
+    bridge: device?.bridgeVersion ?? '',
+    codex: codexVersion ?? '',
+  }
+}
+
+/** Relay 版本端点失败/缺失/占位值时保持空串,由展示层回退为"未知"。 */
+async function refreshRelayVersion(): Promise<void> {
+  const info = await loadRelayVersion()
+  if (info) state.relayVersions = { relay: info.relayVersion, protocol: info.protocolVersion }
+}
+
+async function refreshToolboxVersion(): Promise<void> {
+  const info = await loadToolboxVersion()
+  if (info) state.toolboxVersions = { app: info.appVersion, commit: info.commit }
 }
 
 function redirectToLogin(): void {
@@ -908,6 +1207,81 @@ const pendingAttention = computed<AttentionItem[]>(() => {
     })
 })
 
+export interface AttentionInboxEntry {
+  attention: AttentionItem
+  kind: AttentionKind
+  session?: SessionSummary | undefined
+  deviceName: string
+  projectDisplay: string
+  waitingMs: number
+  /** 会话摘要显示有待处理但设备离线:只有最后已知信息,无法提交回复(UX-01)。 */
+  offlineDegraded: boolean
+}
+
+/**
+ * 待处理中心投影(UX-01):从 SessionSummary、PendingAttention 与连接状态推导。
+ * 同一请求按稳定原生 ID 去重;审批优先于提问,同类按等待时间最久优先。
+ * 不建任务调度系统,只重组既有事实。
+ */
+export function projectAttentionInbox(input: {
+  sessions: SessionSummary[]
+  runtimes: Record<string, RuntimeSnapshot>
+  resolvedAttentionIds: string[]
+  nowMs: number
+}): { active: AttentionInboxEntry[]; offlineDegraded: AttentionInboxEntry[] } {
+  const seen = new Set<string>()
+  const active: AttentionInboxEntry[] = []
+  for (const runtime of Object.values(input.runtimes)) {
+    for (const attention of runtime.attention) {
+      if (!attention.valid || seen.has(attention.id)) continue
+      if (input.resolvedAttentionIds.includes(attention.id)) continue
+      seen.add(attention.id)
+      const session = input.sessions.find((item) => item.id === attention.sessionId)
+      active.push({
+        attention,
+        kind: attention.kind,
+        session,
+        deviceName: session ? `设备 ${session.deviceId}` : '未知设备',
+        projectDisplay: session?.projectDisplay ?? '未知项目',
+        waitingMs: Math.max(0, input.nowMs - Date.parse(attention.createdAt)),
+        offlineDegraded: (session?.deviceConnection ?? 'OFFLINE') === 'OFFLINE',
+      })
+    }
+  }
+  active.sort((left, right) => {
+    if (left.kind !== right.kind) return left.kind === 'RISK_APPROVAL' ? -1 : 1
+    return Date.parse(left.attention.createdAt) - Date.parse(right.attention.createdAt)
+  })
+
+  // 会话摘要声明有待处理但运行时为空(通常设备离线):显示最后已知信息并解释不可提交。
+  const offlineDegraded: AttentionInboxEntry[] = []
+  for (const session of input.sessions) {
+    if (session.attentionCount <= 0) continue
+    if (session.deviceConnection !== 'OFFLINE') continue
+    if (active.some((entry) => entry.attention.sessionId === session.id)) continue
+    offlineDegraded.push({
+      attention: {
+        id: `offline-${session.id}`,
+        kind: 'USER_QUESTION',
+        sessionId: session.id,
+        turnId: '',
+        title: `${session.attentionCount} 项待处理（最后已知）`,
+        description: '设备离线，无法读取请求正文；恢复连接后自动同步。',
+        createdAt: session.deviceLastSeenAt ?? session.updatedAt,
+        valid: false,
+        options: [],
+      },
+      kind: 'USER_QUESTION',
+      session,
+      deviceName: `设备 ${session.deviceId}`,
+      projectDisplay: session.projectDisplay,
+      waitingMs: Math.max(0, input.nowMs - Date.parse(session.deviceLastSeenAt ?? session.updatedAt)),
+      offlineDegraded: true,
+    })
+  }
+  return { active, offlineDegraded }
+}
+
 export function useConsoleStore() {
   return {
     state,
@@ -917,6 +1291,8 @@ export function useConsoleStore() {
     loadMoreSessions,
     loadDevices,
     ensureRuntime,
+    acquireRuntime,
+    releaseRuntime,
     loadOlderHistory,
     loadOutput,
     presenceFor,
@@ -935,5 +1311,12 @@ export function useConsoleStore() {
     downloadFile,
     uploadFile,
     dismissToast,
+    retryConnection,
+    verifyRequest,
+    getDraft,
+    setDraft,
+    toggleNotifySuccess,
+    componentVersions,
+    notify,
   }
 }

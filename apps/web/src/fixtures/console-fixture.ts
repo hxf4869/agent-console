@@ -135,6 +135,7 @@ export const sessionsFixture: SessionSummary[] = [
   {
     id: 'session-ui',
     nativeSessionId: '01a-ui-fixture',
+    agentKind: 'CODEX_DESKTOP',
     title: 'Agent Console 前端实现',
     projectDisplay: 'agent-console',
     branch: 'feat/agent-console-ui',
@@ -155,6 +156,7 @@ export const sessionsFixture: SessionSummary[] = [
   {
     id: 'session-sync',
     nativeSessionId: '01a-sync-fixture',
+    agentKind: 'CODEX_DESKTOP',
     title: '修复同步后的重复事件',
     projectDisplay: 'sync-engine',
     branch: 'fix/duplicate-events',
@@ -175,6 +177,7 @@ export const sessionsFixture: SessionSummary[] = [
   {
     id: 'session-api',
     nativeSessionId: '01a-api-fixture',
+    agentKind: 'CODEX_DESKTOP',
     title: 'Relay 认证接口联调',
     projectDisplay: 'agent-console',
     branch: 'feat/relay-auth',
@@ -195,6 +198,7 @@ export const sessionsFixture: SessionSummary[] = [
   {
     id: 'session-offline',
     nativeSessionId: '01a-offline-fixture',
+    agentKind: 'CODEX_DESKTOP',
     title: '离线与结果不确定状态',
     projectDisplay: '脱敏 fixture',
     branch: 'state/offline',
@@ -216,6 +220,7 @@ export const sessionsFixture: SessionSummary[] = [
   {
     id: 'session-failed',
     nativeSessionId: '01a-failed-fixture',
+    agentKind: 'CODEX_DESKTOP',
     title: '失败结果状态',
     projectDisplay: '脱敏 fixture',
     branch: 'state/failed',
@@ -236,6 +241,7 @@ export const sessionsFixture: SessionSummary[] = [
   {
     id: 'session-docs',
     nativeSessionId: '01a-docs-fixture',
+    agentKind: 'CODEX_DESKTOP',
     title: '前端联调说明整理',
     projectDisplay: 'agent-console',
     branch: 'docs/integration',
@@ -256,6 +262,7 @@ export const sessionsFixture: SessionSummary[] = [
   {
     id: 'session-archived',
     nativeSessionId: '01a-archive-fixture',
+    agentKind: 'CODEX_DESKTOP',
     title: '验证任务历史分页',
     projectDisplay: 'agent-console',
     branch: 'test/history',

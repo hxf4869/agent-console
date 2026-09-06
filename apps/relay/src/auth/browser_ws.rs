@@ -3,6 +3,12 @@
 //! ticket 经 `Sec-WebSocket-Protocol` 携带(固定协议名 + `agent-console.ticket-<b64url>`);
 //! Relay 只回显固定协议名,不记录完整 header。升级前原子消费 ticket;
 //! 握手 ClientHello/ServerHello 协商 protocol_version,不匹配发 ProtocolError 并关闭。
+//!
+//! 连接收尾(§17.6/§26.4):
+//! - WS 消息/帧上限对齐 codec 单帧限制,分片聚合超限直接终止。
+//! - 每次 sink 写入有可取消时间预算;超时丢弃整个连接(计数 +1)。
+//! - 读写循环共享最小取消机制:任一端结束都收尾另一端并摘除 Hub 注册。
+//! - 认证撤销/停机的 Close 经 Outbox.close 丢弃可恢复帧后优先送达。
 
 use std::{sync::Arc, time::Duration};
 
@@ -15,17 +21,22 @@ use futures::{SinkExt, StreamExt};
 use tokio::time::timeout;
 
 use agent_console_protocol::{
-    codec::{decode_envelope, encode_envelope, new_message_id, PROTOCOL_VERSION},
+    codec::{decode_envelope, encode_envelope, new_message_id, MAX_FRAME_BYTES, PROTOCOL_VERSION},
     v1::{envelope, ClientHello, ClientKind, ProtocolError, ServerHello, StableErrorCode},
 };
 
 use crate::{
     auth::{parse_ws_subprotocols, ticket_reject_response},
-    realtime::buffer::{OutItem, Outbox},
+    realtime::buffer::{
+        OutItem, Outbox, BROWSER_QUEUE_MAX_BYTES, WS_WRITE_TIMEOUT, WS_WRITE_TIMEOUTS,
+    },
     state::{limits, AppState},
 };
 
 type WsMessage = axum::extract::ws::Message;
+
+/// writer 收尾预算:读循环结束后丢弃待发数据并限时发送 Close。
+const WRITER_CLOSE_BUDGET: Duration = Duration::from_millis(500);
 
 pub async fn browser_ws_handler(
     State(app): State<AppState>,
@@ -62,8 +73,11 @@ pub async fn browser_ws_handler(
             );
         }
     };
-    // 3. 只回显固定协议名(§20.2)。
+    // 3. 只回显固定协议名(§20.2);WS 消息/帧上限对齐 codec 单帧限制:
+    // 分片聚合超限由 transport 层终止,不无限聚合(T15)。
     ws.protocols([limits::WS_SUBPROTOCOL])
+        .max_message_size(MAX_FRAME_BYTES)
+        .max_frame_size(MAX_FRAME_BYTES)
         .on_upgrade(move |socket| async move { browser_connection(app, socket, ident).await })
 }
 
@@ -178,78 +192,142 @@ async fn browser_connection(
     }
 
     // 5. 注册连接,启动写循环(§17.4 步骤 2:有界发送队列 + 控制帧通道)。
-    let outbox = Arc::new(Outbox::new(limits::BROWSER_QUEUE_MAX_FRAMES));
+    let outbox = Arc::new(Outbox::new(
+        limits::BROWSER_QUEUE_MAX_FRAMES,
+        BROWSER_QUEUE_MAX_BYTES,
+    ));
     let conn_id = app.hub.register_browser(ident, outbox.clone());
     tracing::info!(target: "relay::auth", "browser connected");
 
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<WsMessage>(16);
+    // 读写循环共享的最小取消机制:任一端结束都收尾另一端。
+    let (writer_cancel, mut writer_cancel_rx) = tokio::sync::watch::channel(false);
     let writer_outbox = outbox.clone();
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         loop {
             tokio::select! {
                 item = writer_outbox.recv() => {
                     match item {
                         Some(OutItem::Frame(frame)) => {
-                            tracing::debug!(target: "relay::auth", seq = frame.env.sequence, "browser writer sending frame");
-                            if sink.send(WsMessage::Binary(frame.encoded())).await.is_err() {
+                            let Some(bytes) = frame.encoded() else {
+                                // 编码失败绝不发送空帧:终止对应流,走重连恢复。
+                                tracing::warn!(target: "relay::auth", "browser frame encode failed; closing");
+                                return;
+                            };
+                            if write_bounded(&mut sink, WsMessage::Binary(bytes)).await.is_err() {
                                 tracing::debug!(target: "relay::auth", "browser writer send error");
                                 return;
                             }
                         }
                         Some(OutItem::Direct(bytes)) => {
-                            if sink.send(WsMessage::Binary(bytes)).await.is_err() {
+                            if write_bounded(&mut sink, WsMessage::Binary(bytes))
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }
                         Some(OutItem::Close(reason)) => {
                             // 稳定 close reason(§20.5);auth 类关闭用 1008。
-                            send_close(&mut sink, 1008, reason).await;
+                            let _ = write_bounded(
+                                &mut sink,
+                                WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                                    code: 1008,
+                                    reason: reason.into(),
+                                })),
+                            )
+                            .await;
                             return;
                         }
                         None => return,
                     }
                 }
                 ctrl = control_rx.recv() => {
-                    match ctrl {
-                        Some(msg) => {
-                            if sink.send(msg).await.is_err() {
-                                return;
-                            }
-                        }
-                        None => {
-                            // 读循环尚未退出前不会发生;等待 outbox 分支。
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                        }
+                    // Ping/Pong 等控制帧;写预算与数据帧一致。
+                    let Some(msg) = ctrl else { continue };
+                    if write_bounded(&mut sink, msg).await.is_err() {
+                        return;
                     }
+                }
+                _ = writer_cancel_rx.changed() => {
+                    // 读循环已结束:丢弃剩余待发数据,限时发送 Close 后释放。
+                    let _ = timeout(
+                        WRITER_CLOSE_BUDGET,
+                        sink.send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 1001,
+                            reason: "SERVER_CLOSED".into(),
+                        }))),
+                    )
+                    .await;
+                    return;
                 }
             }
         }
     });
 
-    // 6. 读循环。
-    while let Some(Ok(msg)) = stream.next().await {
-        match msg {
-            WsMessage::Binary(bytes) => match decode_envelope(&bytes) {
-                Ok(env) => {
-                    app.hub.handle_browser_envelope(&app, conn_id, env).await;
-                }
-                Err(_) => {
-                    if let Some(outbox) = app.hub.browser_outbox(conn_id) {
-                        outbox.push_direct(
-                            protocol_error_bytes(StableErrorCode::InternalError, "无法解码消息")
-                                .into(),
-                        );
+    // 6. 读循环:writer 提前结束(对端断开/写超时/编码失败)时同步收尾。
+    let mut writer_done = false;
+    loop {
+        tokio::select! {
+            msg = stream.next() => {
+                match msg {
+                    Some(Ok(WsMessage::Binary(bytes))) => match decode_envelope(&bytes) {
+                        Ok(env) => {
+                            app.hub.handle_browser_envelope(&app, conn_id, env).await;
+                        }
+                        Err(_) => {
+                            if let Some(outbox) = app.hub.browser_outbox(conn_id) {
+                                outbox.push_direct(
+                                    protocol_error_bytes(
+                                        StableErrorCode::InternalError,
+                                        "无法解码消息",
+                                    )
+                                    .into(),
+                                );
+                            }
+                        }
+                    },
+                    Some(Ok(WsMessage::Ping(payload))) => {
+                        // Ping 回复不等待失去写入能力的小通道:满即丢弃。
+                        let _ = control_tx.try_send(WsMessage::Pong(payload));
                     }
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {}
                 }
-            },
-            WsMessage::Ping(payload) => {
-                let _ = control_tx.send(WsMessage::Pong(payload)).await;
             }
-            WsMessage::Close(_) => break,
-            _ => {}
+            result = &mut writer => {
+                if let Err(e) = result {
+                    tracing::debug!(target: "relay::auth", error = %e, "browser writer joined");
+                }
+                writer_done = true;
+                break;
+            }
         }
     }
-    writer.abort();
+    // 收尾:通知 writer 限时退出,再摘除 Hub 注册(幂等)。
+    // writer 先结束时其 JoinHandle 已在上面的 select 中完成过一次 poll;
+    // JoinHandle 完成后再次 poll 会 panic 并跳过 remove_browser(连接滞留
+    // Hub 泄漏),因此只有读循环先结束(writer 仍在运行)才限时等待收尾。
+    let _ = writer_cancel.send(true);
+    if !writer_done {
+        let _ = timeout(WRITER_CLOSE_BUDGET * 3, &mut writer).await;
+    }
     app.hub.remove_browser(conn_id);
     tracing::info!(target: "relay::auth", "browser disconnected");
+}
+
+/// 带可取消时间预算的 sink 写入;超时/失败都返回 Err,调用方丢弃整个连接,
+/// 绝不在原 sink 上继续写半帧。
+async fn write_bounded(
+    sink: &mut futures::stream::SplitSink<axum::extract::ws::WebSocket, WsMessage>,
+    msg: WsMessage,
+) -> Result<(), ()> {
+    match timeout(WS_WRITE_TIMEOUT, sink.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(()),
+        Err(_) => {
+            WS_WRITE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(())
+        }
+    }
 }

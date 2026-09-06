@@ -81,6 +81,12 @@ pub const KNOWN_STATE_KEYS: &[&str] = &[
     "pendingQuestions",
     "pendingApprovals",
     "queuedFollowUps",
+    // 0.153.4 真机快照新增顶层键(2026-09-05 探针,41 键;消除 doctor 计数噪音)。
+    "paginatedHistory",
+    "parentThreadId",
+    "threadGoal",
+    "threadGoalResumeConfirmation",
+    "unreadMessageCount",
 ];
 
 /// 未识别键计数:unknown 顶层键 → 出现次数(供 doctor/兼容文档)。
@@ -549,92 +555,358 @@ pub fn turn_items_of(turn: &Value) -> Vec<&Value> {
 /// 问题提取(§16.3):`pendingQuestions[]`。
 /// 每项形态(投影约定,fake owner 按此回放;真实验证待记录):
 /// `{ id, title, description, options: [{id, label}], allowMultiple, allowFreeText, turnId? }`。
+///
+/// 0.153.4 回退路径:真机快照(41 顶层键)无 `pendingQuestions` 键;原生问题
+/// 落在 `requests[]`(server request 记录,asar 2026-09-05 复核:
+/// `item/tool/requestUserInput`,params `{threadId,turnId,questions:[
+/// {id,header,question,isOther,options:[{label,description}]}]}`,completed
+/// 标记已答)。见 [`extract_requests_questions`]。
 pub fn extract_questions(state: &Value) -> Vec<PendingQuestion> {
-    let Some(list) = state.get("pendingQuestions").and_then(Value::as_array) else {
+    if let Some(list) = state.get("pendingQuestions").and_then(Value::as_array) {
+        let parsed: Vec<PendingQuestion> = list
+            .iter()
+            .map(|q| PendingQuestion {
+                question_id: q
+                    .get("id")
+                    .or_else(|| q.get("questionId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                title: text_from(q.get("title")),
+                description: text_from(q.get("description")),
+                options: q
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|opts| {
+                        opts.iter()
+                            .filter_map(|o| {
+                                Some(QuestionOption {
+                                    option_id: o.get("id").and_then(Value::as_str)?.to_string(),
+                                    label: text_from(o.get("label")),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                allow_multiple: q
+                    .get("allowMultiple")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                allow_free_text: q
+                    .get("allowFreeText")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                turn: q.get("turnId").and_then(Value::as_str).map(TurnId::native),
+                created_at: q
+                    .get("createdAtMs")
+                    .and_then(Value::as_i64)
+                    .and_then(ms_to_datetime),
+                valid: q.get("valid").and_then(Value::as_bool).unwrap_or(true),
+            })
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    extract_requests_questions(state)
+}
+
+/// 0.153.4 `requests[]` 中的原生问题投影(识别层;回答 payload 形状见
+/// adapter `execute_command` AnswerQuestion 与 [`RequestsQuestion`])。
+///
+/// 证据:asar `replyWithUserInputResponse`/`forwardFollowerUserInput` 链,
+/// follower 回答的 `requestId` 对应 request 外层 `id`;options 原生仅有
+/// `{label,description}` 无 id 字段,投影以 label 兼作 option_id(回答
+/// 数组元素即 label;真机采样待校正,N01 待办)。
+///
+/// 本函数是展示/检索形态(领域 `PendingQuestion`,question_id = 外层
+/// request.id);每题自身身份与选项的完整结构见
+/// [`extract_requests_questions_detail`]。
+pub fn extract_requests_questions(state: &Value) -> Vec<PendingQuestion> {
+    extract_requests_questions_detail(state)
+        .iter()
+        .map(|request| {
+            let first = request.questions.first();
+            PendingQuestion {
+                // follower 回答路由所需 requestId = request 外层 id(asar V9t
+                // 链);题目自身身份保存在 detail 投影,不与路由身份混用。
+                question_id: request.request_id.clone(),
+                title: OutputText::new(
+                    first.map(|q| q.header.as_str()).unwrap_or_default(),
+                ),
+                // 多题在单卡内拼接描述展示;完整每题结构由 detail 投影保留。
+                description: OutputText::new(
+                    request
+                        .questions
+                        .iter()
+                        .map(|q| q.question.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" / "),
+                ),
+                // 展示选项取第一题(原生 options 无 id,label 兼作 option_id);
+                // 后续题目的选项结构在 detail 投影,不丢。
+                options: first
+                    .map(|q| {
+                        q.option_labels
+                            .iter()
+                            .map(|label| QuestionOption {
+                                option_id: label.clone(),
+                                label: OutputText::new(label.clone()),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                allow_multiple: false,
+                allow_free_text: first.map(|q| q.allow_free_text).unwrap_or(false),
+                turn: request.turn.clone(),
+                created_at: None,
+                valid: true,
+            }
+        })
+        .collect()
+}
+
+/// `item/tool/requestUserInput` 的单题投影(asar 2026-09-05:
+/// `params.questions[]` 元素 `{id, header, question, isOther,
+/// options:[{label, description}]}`)。
+///
+/// 题目自身 `id` 与外层 request.id 是两个身份:前者是
+/// `replyWithUserInputResponse` 归一化 `answers` 的内层键,后者是 follower
+/// 回答的路由 requestId。options 原生仅 `{label,description}` 无 id,
+/// 回答数组元素即 label(N01 真机采样待校正)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestQuestion {
+    /// 题目自身 ID(`params.questions[].id`;≠ 外层 request.id)。
+    pub question_id: String,
+    pub header: String,
+    pub question: String,
+    /// 原生 `isOther`。
+    pub allow_free_text: bool,
+    /// 选项 label 列表(原生顺序;label 兼作回答元素)。
+    pub option_labels: Vec<String>,
+}
+
+/// 一次 requestUserInput 请求的完整投影:回复路由身份与每题身份分离保留。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestsQuestion {
+    /// 外层 request.id(`thread-follower-submit-user-input`
+    /// params.requestId;与各题自身 id 是两个身份)。
+    pub request_id: String,
+    pub turn: Option<TurnId>,
+    /// 全部题目按原生顺序;每题身份与选项独立保留(不拼接、不丢题)。
+    pub questions: Vec<RequestQuestion>,
+}
+
+/// 0.153.4 `requests[]` 中未完成 `item/tool/requestUserInput` 请求的结构化
+/// 投影(回答 payload 组装的数据源;展示形态见 [`extract_requests_questions`])。
+pub fn extract_requests_questions_detail(state: &Value) -> Vec<RequestsQuestion> {
+    let Some(requests) = state.get("requests").and_then(Value::as_array) else {
         return Vec::new();
     };
-    list.iter()
-        .map(|q| PendingQuestion {
-            question_id: q
+    let mut out = Vec::new();
+    for request in requests {
+        if request.get("method").and_then(Value::as_str) != Some("item/tool/requestUserInput") {
+            continue;
+        }
+        if request.get("completed").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(params) = request.get("params") else {
+            continue;
+        };
+        let questions: Vec<RequestQuestion> = params
+            .get("questions")
+            .and_then(Value::as_array)
+            .map(|qs| {
+                qs.iter()
+                    .map(|q| RequestQuestion {
+                        question_id: q
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        header: q
+                            .get("header")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        question: q
+                            .get("question")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        allow_free_text: q
+                            .get("isOther")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        option_labels: q
+                            .get("options")
+                            .and_then(Value::as_array)
+                            .map(|opts| {
+                                opts.iter()
+                                    .filter_map(|o| {
+                                        o.get("label").and_then(Value::as_str).map(String::from)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 无题目的请求不产生问题卡(与展示投影一致,避免不可回答的死卡)。
+        if questions.is_empty() {
+            continue;
+        }
+        out.push(RequestsQuestion {
+            request_id: request
                 .get("id")
-                .or_else(|| q.get("questionId"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            title: text_from(q.get("title")),
-            description: text_from(q.get("description")),
-            options: q
-                .get("options")
-                .and_then(Value::as_array)
-                .map(|opts| {
-                    opts.iter()
-                        .filter_map(|o| {
-                            Some(QuestionOption {
-                                option_id: o.get("id").and_then(Value::as_str)?.to_string(),
-                                label: text_from(o.get("label")),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            allow_multiple: q
-                .get("allowMultiple")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            allow_free_text: q
-                .get("allowFreeText")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            turn: q.get("turnId").and_then(Value::as_str).map(TurnId::native),
-            created_at: q
-                .get("createdAtMs")
-                .and_then(Value::as_i64)
-                .and_then(ms_to_datetime),
-            valid: q.get("valid").and_then(Value::as_bool).unwrap_or(true),
-        })
+            turn: params
+                .get("turnId")
+                .and_then(Value::as_str)
+                .map(TurnId::native),
+            questions,
+        });
+    }
+    out
+}
+
+/// 回答条目序列化:选项 label 与自由文本均为字符串元素(原生 options 无
+/// id,回答数组元素即 label;精确原生类型待 N01 真机采样校正)。
+pub(crate) fn answer_entries(
+    answered_labels: &[String],
+    free_text: Option<&str>,
+) -> Vec<serde_json::Value> {
+    answered_labels
+        .iter()
+        .map(|label| serde_json::Value::String(label.clone()))
+        .chain(free_text.map(|text| serde_json::Value::String(text.to_string())))
         .collect()
+}
+
+/// 组装 `thread-follower-submit-user-input` 的 response(asar 归一化形状
+/// `{answers: {<题目自身id>: {answers: [<label>...]}}}`):
+/// - 内层键 = 每题自身 id(不是外层 request.id,P2-10 身份分离);
+/// - 全部题目进 payload(多题不丢);
+/// - 命令是单卡回答:所选 label 与自由文本归属第一题(与展示卡一致),
+///   其余题目显式空 answers(空 answers 的原生接受度待 N01 采样)。
+pub fn build_request_answer_response(
+    request: &RequestsQuestion,
+    answered_labels: &[String],
+    free_text: Option<&str>,
+) -> serde_json::Value {
+    let entries = answer_entries(answered_labels, free_text);
+    let mut answers = serde_json::Map::new();
+    for (index, question) in request.questions.iter().enumerate() {
+        let question_answers = if index == 0 {
+            entries.clone()
+        } else {
+            Vec::new()
+        };
+        answers.insert(
+            question.question_id.clone(),
+            serde_json::json!({ "answers": question_answers }),
+        );
+    }
+    serde_json::json!({ "answers": serde_json::Value::Object(answers) })
 }
 
 /// 审批提取(§16.4):`pendingApprovals[]`。
 /// 每项形态(投影约定,fake owner 按此回放;真实验证待记录):
 /// `{ id, riskDescription, requestedAction, decisions: [{id, label}], scope, turnId? }`。
+///
+/// 0.153.4 回退路径:真机快照无 `pendingApprovals` 键;审批落在 `requests[]`
+/// (asar 2026-09-05 复核:`item/commandExecution/requestApproval` /
+/// `item/fileChange/requestApproval`,decision 由
+/// `thread-follower-command/file-approval-decision` 透传)。params 内部形状
+/// 未真机采样,仅投影稳定维度(ID/turn/valid);decisions 留空,待 N01 采样。
 pub fn extract_approvals(state: &Value) -> Vec<PendingApproval> {
-    let Some(list) = state.get("pendingApprovals").and_then(Value::as_array) else {
+    if let Some(list) = state.get("pendingApprovals").and_then(Value::as_array) {
+        let parsed: Vec<PendingApproval> = list
+            .iter()
+            .map(|a| PendingApproval {
+                approval_id: a
+                    .get("id")
+                    .or_else(|| a.get("approvalId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                risk_description: text_from(a.get("riskDescription")),
+                requested_action: text_from(a.get("requestedAction").or_else(|| a.get("action"))),
+                decisions: a
+                    .get("decisions")
+                    .and_then(Value::as_array)
+                    .map(|ds| {
+                        ds.iter()
+                            .filter_map(|d| {
+                                Some(ApprovalDecision {
+                                    decision_id: d.get("id").and_then(Value::as_str)?.to_string(),
+                                    label: text_from(d.get("label")),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                scope: a.get("scope").and_then(Value::as_str).map(OutputText::new),
+                turn: a.get("turnId").and_then(Value::as_str).map(TurnId::native),
+                created_at: a
+                    .get("createdAtMs")
+                    .and_then(Value::as_i64)
+                    .and_then(ms_to_datetime),
+                valid: a.get("valid").and_then(Value::as_bool).unwrap_or(true),
+            })
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    extract_requests_approvals(state)
+}
+
+/// 0.153.4 `requests[]` 中的审批投影(识别层;decisions 原生列表未采样,
+/// 留空——attention 计数与卡片"待审批"状态可用,具体决定选项待 N01)。
+pub fn extract_requests_approvals(state: &Value) -> Vec<PendingApproval> {
+    const APPROVAL_METHODS: [&str; 2] = [
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+    ];
+    let Some(requests) = state.get("requests").and_then(Value::as_array) else {
         return Vec::new();
     };
-    list.iter()
-        .map(|a| PendingApproval {
-            approval_id: a
+    let mut out = Vec::new();
+    for request in requests {
+        let Some(method) = request.get("method").and_then(Value::as_str) else {
+            continue;
+        };
+        if !APPROVAL_METHODS.contains(&method) {
+            continue;
+        }
+        if request.get("completed").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let params = request.get("params").cloned().unwrap_or_default();
+        out.push(PendingApproval {
+            approval_id: request
                 .get("id")
-                .or_else(|| a.get("approvalId"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            risk_description: text_from(a.get("riskDescription")),
-            requested_action: text_from(a.get("requestedAction").or_else(|| a.get("action"))),
-            decisions: a
-                .get("decisions")
-                .and_then(Value::as_array)
-                .map(|ds| {
-                    ds.iter()
-                        .filter_map(|d| {
-                            Some(ApprovalDecision {
-                                decision_id: d.get("id").and_then(Value::as_str)?.to_string(),
-                                label: text_from(d.get("label")),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            scope: a.get("scope").and_then(Value::as_str).map(OutputText::new),
-            turn: a.get("turnId").and_then(Value::as_str).map(TurnId::native),
-            created_at: a
-                .get("createdAtMs")
-                .and_then(Value::as_i64)
-                .and_then(ms_to_datetime),
-            valid: a.get("valid").and_then(Value::as_bool).unwrap_or(true),
-        })
-        .collect()
+            risk_description: OutputText::new(""),
+            requested_action: text_from(params.get("command").or_else(|| params.get("action"))),
+            decisions: Vec::new(),
+            scope: None,
+            turn: params
+                .get("turnId")
+                .and_then(Value::as_str)
+                .map(TurnId::native),
+            created_at: None,
+            valid: true,
+        });
+    }
+    out
 }
 
 /// 设置动态提取(§16.1):模型/思考深度/服务等级/权限/协作模式。
@@ -888,6 +1160,161 @@ mod tests {
             Some("demo-app".to_string())
         );
         assert_eq!(project_display_from_cwd("/"), None);
+    }
+
+    #[test]
+    fn requests_array_yields_questions_and_approvals_for_0_153_4() {
+        // 0.153.4 真机快照无 pendingQuestions/pendingApprovals 键;
+        // 原生问题/审批落在 requests[](schema 来自 asar 2026-09-05 复核)。
+        let state = json!({
+            "requests": [
+                {
+                    "id": "req-q-1",
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "threadId": "01A",
+                        "turnId": "turn-1",
+                        "questions": [{
+                            "id": "q1",
+                            "header": "Plan",
+                            "question": "Which option?",
+                            "isOther": true,
+                            "options": [
+                                {"label": "Option A", "description": null},
+                                {"label": "Option B", "description": null}
+                            ]
+                        }]
+                    },
+                    "completed": false
+                },
+                {
+                    "id": "req-a-1",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"threadId": "01A", "turnId": "turn-1", "command": "make test"},
+                    "completed": false
+                },
+                {
+                    "id": "req-done",
+                    "method": "item/tool/requestUserInput",
+                    "params": {"turnId": "turn-0", "questions": []},
+                    "completed": true
+                }
+            ]
+        });
+
+        let questions = extract_questions(&state);
+        assert_eq!(questions.len(), 1, "completed request must be skipped");
+        let q = &questions[0];
+        assert_eq!(q.question_id, "req-q-1", "follower answers by request id");
+        assert_eq!(q.options.len(), 2);
+        assert_eq!(q.options[0].option_id, "Option A", "label doubles as option id");
+        assert!(q.allow_free_text);
+        assert_eq!(q.turn.as_ref().map(|t| t.id.as_str()), Some("turn-1"));
+
+        let approvals = extract_approvals(&state);
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].approval_id, "req-a-1");
+        assert!(approvals[0].valid);
+
+        // legacy 投影约定仍优先(fake owner / 旧版本路径不受影响)。
+        let legacy = json!({
+            "pendingQuestions": [{
+                "id": "legacy-q", "options": [{"id": "yes", "label": "Yes"}]
+            }],
+            "requests": []
+        });
+        let legacy_questions = extract_questions(&legacy);
+        assert_eq!(legacy_questions.len(), 1);
+        assert_eq!(legacy_questions[0].question_id, "legacy-q");
+    }
+
+    // P2-10 回归:外层 request.id 与题目自身 id 是两个身份(fixture
+    // req-q-1 vs q1)。结构化投影必须分别保留:路由身份进 request_id,
+    // 每题自身 id/选项独立保留(回答 payload 内层键断言见 mod.rs)。
+    #[test]
+    fn requests_detail_separates_request_and_question_identity() {
+        let state = json!({
+            "requests": [{
+                "id": "req-q-1",
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "threadId": "01A",
+                    "turnId": "turn-1",
+                    "questions": [{
+                        "id": "q1",
+                        "header": "Plan",
+                        "question": "Which option?",
+                        "isOther": true,
+                        "options": [
+                            {"label": "Option A", "description": null},
+                            {"label": "Option B", "description": null}
+                        ]
+                    }]
+                },
+                "completed": false
+            }]
+        });
+
+        let detail = extract_requests_questions_detail(&state);
+        assert_eq!(detail.len(), 1);
+        assert_eq!(detail[0].request_id, "req-q-1", "路由身份");
+        assert_eq!(detail[0].questions.len(), 1);
+        assert_eq!(detail[0].questions[0].question_id, "q1", "题目身份");
+        assert_eq!(
+            detail[0].questions[0].option_labels,
+            vec!["Option A".to_string(), "Option B".to_string()]
+        );
+
+        // 展示/检索形态(领域 PendingQuestion)保留路由身份不变。
+        let display = extract_questions(&state);
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].question_id, "req-q-1");
+        assert_eq!(display[0].options.len(), 2);
+    }
+
+    // P2-10 回归:多题场景每题身份与选项独立保留,不拼接、不丢题。
+    #[test]
+    fn requests_detail_keeps_all_questions_and_options_independent() {
+        let state = json!({
+            "requests": [{
+                "id": "req-q-2",
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "turnId": "turn-2",
+                    "questions": [
+                        {
+                            "id": "qA",
+                            "header": "Approach",
+                            "question": "Which approach?",
+                            "isOther": false,
+                            "options": [{"label": "Fast"}, {"label": "Safe"}]
+                        },
+                        {
+                            "id": "qB",
+                            "header": "Scope",
+                            "question": "Which scope?",
+                            "isOther": true,
+                            "options": [{"label": "Minimal"}]
+                        }
+                    ]
+                },
+                "completed": false
+            }]
+        });
+
+        let detail = extract_requests_questions_detail(&state);
+        assert_eq!(detail.len(), 1);
+        let questions = &detail[0].questions;
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].question_id, "qA");
+        assert_eq!(
+            questions[0].option_labels,
+            vec!["Fast".to_string(), "Safe".to_string()]
+        );
+        assert!(!questions[0].allow_free_text);
+        assert_eq!(questions[1].question_id, "qB");
+        assert_eq!(questions[1].option_labels, vec!["Minimal".to_string()]);
+        assert!(questions[1].allow_free_text);
     }
 
     #[test]

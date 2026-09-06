@@ -7,6 +7,7 @@ import {
   Clock3,
   LoaderCircle,
   MessageSquareText,
+  Save,
   SquareTerminal,
 } from 'lucide-vue-next'
 import { computed } from 'vue'
@@ -20,15 +21,31 @@ import { useConsoleStore } from '@/store/console'
 import type { TimelineItem } from '@/transport/types'
 
 const props = defineProps<{ item: TimelineItem; sessionId: string }>()
+const emit = defineEmits<{ save: [payload: { source: string; text: string }] }>()
 const { availability, answerAttention, loadOutput, sendCommand } = useConsoleStore()
 const stopAvailability = computed(() => availability(props.sessionId, 'STOP_BACKGROUND_COMMAND'))
+
+function savePayload(source: string, text: string) {
+  emit('save', { source, text })
+}
 </script>
 
 <template>
   <article v-if="item.type === 'commentary'" class="timeline-card timeline-card--commentary">
     <header>
       <span><MessageSquareText :size="15" aria-hidden="true" />{{ item.author ?? 'Codex' }}</span>
-      <time :datetime="item.createdAt">{{ formatClock(item.createdAt) }}</time>
+      <div class="timeline-card__tools">
+        <time :datetime="item.createdAt">{{ formatClock(item.createdAt) }}</time>
+        <button
+          v-if="item.body"
+          type="button"
+          class="timeline-card__save"
+          aria-label="保存该条消息到工具箱"
+          @click="savePayload(item.author ?? 'Codex', item.body)"
+        >
+          <Save :size="13" aria-hidden="true" />
+        </button>
+      </div>
     </header>
     <p>{{ item.body }}</p>
   </article>
@@ -63,7 +80,12 @@ const stopAvailability = computed(() => availability(props.sessionId, 'STOP_BACK
       <code>{{ item.command }}</code>
       <span class="mono">{{ item.cwdDisplay }} · {{ item.elapsed }}</span>
     </div>
-    <OutputBlock :output="item.output" @load="loadOutput(sessionId, item.output.itemId)" />
+    <OutputBlock
+      :output="item.output"
+      default-collapsed
+      @load="loadOutput(sessionId, item.output.itemId)"
+      @save="(payload: string) => savePayload('命令输出', payload)"
+    />
   </article>
 
   <article v-else-if="item.type === 'background-command'" class="timeline-card timeline-card--background">
@@ -103,7 +125,12 @@ const stopAvailability = computed(() => availability(props.sessionId, 'STOP_BACK
     </header>
     <p>{{ item.description }}</p>
     <div class="request-id mono">request {{ item.requestId }}</div>
-    <OutputBlock :output="item.output" @load="loadOutput(sessionId, item.output.itemId)" />
+    <OutputBlock
+      :output="item.output"
+      default-collapsed
+      @load="loadOutput(sessionId, item.output.itemId)"
+      @save="(payload) => savePayload('未确认指令输出', payload)"
+    />
   </article>
 </template>
 
@@ -146,6 +173,29 @@ const stopAvailability = computed(() => availability(props.sessionId, 'STOP_BACK
   color: var(--text-muted);
   font-size: 10px;
   font-weight: 500;
+}
+
+.timeline-card__tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.timeline-card__save {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.timeline-card__save:hover {
+  background: var(--bg-elevated);
+  color: var(--accent);
 }
 
 .timeline-card p {

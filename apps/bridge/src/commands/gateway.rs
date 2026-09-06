@@ -248,6 +248,21 @@ impl CommandGateway {
         let key = req.session_key.clone();
         let request_id = req.request_id;
 
+        // ---- ⓪ agentKind 分发(ZC-02):ZCode 会话只放行 Hook 审批/问答
+        // (通常由 runtime 直接决定,不会到这里);其余写能力明确
+        // CAPABILITY_UNSUPPORTED,绝不借道 Codex Desktop。
+        if key.agent_kind == crate::domain::AgentKind::ZcodeDesktop
+            && !matches!(
+                req.payload,
+                CommandPayload::AnswerQuestion { .. } | CommandPayload::SubmitApproval { .. }
+            )
+        {
+            return Err(BridgeError::new(
+                StableErrorCode::CapabilityUnsupported,
+                "operation not supported for zcode hook sessions",
+            ));
+        }
+
         // ---- ① capability gate(队列操作为 Bridge 本地,豁免) ----
         // Operation::QueueNextTurn 的文档即涵盖设置/替换/取消(§15.3);
         // CancelQueue/PauseQueue 只是 payload 形态,操作层面同属队列命令。
@@ -275,7 +290,7 @@ impl CommandGateway {
             request_id: request_id.to_string(),
             session: SessionKeyRef {
                 device_id: key.device_id.clone(),
-                agent_kind: agent_kind_value(&key),
+                agent_kind: key.agent_kind.proto_value() as i64,
                 native_session_id: key.native_session_id.clone(),
             },
             operation: operation_name(req.operation),
@@ -564,13 +579,6 @@ fn accepted(receipts: mpsc::Receiver<CommandReceipt>) -> Submission {
     Submission::Accepted {
         accepted_at: Utc::now(),
         receipts,
-    }
-}
-
-/// SessionKey.agent_kind 的 proto 数值(首版恒 CODEX_DESKTOP = 1)。
-fn agent_kind_value(key: &SessionKey) -> i64 {
-    match key.agent_kind {
-        crate::domain::AgentKind::CodexDesktop => 1,
     }
 }
 

@@ -184,3 +184,39 @@ describe('shouldHydrateFinalOutput', () => {
     ).toBe(false)
   })
 })
+
+describe('utf-8 append safety (UX-04)', () => {
+  const base: OutputState = {
+    itemId: 'item-zh',
+    revision: 0,
+    text: '',
+    byteLength: 0,
+    isFinal: false,
+    authority: 'LIVE_PREVIEW',
+    hasGap: false,
+  }
+
+  it('appends Chinese and emoji chunks without duplicating characters', () => {
+    let output = reduceOutput(base, { type: 'append', itemId: 'item-zh', expectedOffset: 0, text: '中文' })
+    const chineseBytes = new TextEncoder().encode('中文').byteLength
+    expect(output.byteLength).toBe(chineseBytes)
+
+    output = reduceOutput(output, {
+      type: 'append',
+      itemId: 'item-zh',
+      expectedOffset: chineseBytes,
+      text: '🎉ok',
+    })
+    expect(output.text).toBe('中文🎉ok')
+    expect(output.text).not.toMatch(/([\u{1F300}-\u{1FAFF}])\1/u)
+    expect(output.byteLength).toBe(new TextEncoder().encode('中文🎉ok').byteLength)
+  })
+
+  it('marks a gap when a chunk boundary lands mid-character', () => {
+    let output = reduceOutput(base, { type: 'append', itemId: 'item-zh', expectedOffset: 0, text: '中' })
+    // 错误的字节偏移(按 UTF-16 code unit 计)必须置 gap,不重复拼接。
+    output = reduceOutput(output, { type: 'append', itemId: 'item-zh', expectedOffset: 1, text: '文' })
+    expect(output.hasGap).toBe(true)
+    expect(output.text).toBe('中')
+  })
+})

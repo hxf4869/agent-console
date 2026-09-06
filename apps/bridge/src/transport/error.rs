@@ -13,6 +13,12 @@ pub enum TransportError {
     /// 客户端已停止或句柄全部丢弃。
     #[error("client stopped")]
     Stopped,
+    /// 出站帧写出失败(底层 WS/TCP 错误的安全摘要)。
+    #[error("sink write failed: {0}")]
+    Send(String),
+    /// 出站帧在写预算内未完成:判链路失活,断开走退避重连(§26.2/§26.4)。
+    #[error("sink write stalled beyond budget")]
+    SendStalled,
     /// Envelope 编解码失败(含单帧超 1 MiB,§17.6)。
     #[error("codec: {0}")]
     Codec(#[from] CodecError),

@@ -10,7 +10,15 @@
 //!   [`TransportError::QueueFull`],不阻塞调用方。
 //! - 心跳:每 [`RelayClientOptions::heartbeat_interval`](默认 15s)发送
 //!   Heartbeat;约 45s(`heartbeat_dead_after`)无任何入站帧判离线断开。
-//! - 重连:指数退避 1s–30s + jitter;`ws://`(开发)与 `wss://`(生产)都支持。
+//! - 有限预算:连接(含握手)受 `connect_budget`(默认 10s)、每帧写出受
+//!   `send_budget`(默认 10s)约束;网络黑洞下限时失败进入退避,不依赖
+//!   OS 级分钟超时,shutdown 也不被连接/写出阻塞(§26.2/§26.4)。
+//! - 重连:指数退避 1s–30s + jitter;仅在收到首个有效协议帧(应用协议
+//!   成立)后退避计数归零,仅 TCP/WS 升级成功不重置。`ws://`(开发)与
+//!   `wss://`(生产)都支持。
+//! - 连接代次:断线重连沿用同一出站队列,队列中残留的旧代次帧携带旧
+//!   `stream_epoch`,按 §17.5(sequence/epoch 语义 + 重连后上层重建流并先发
+//!   快照)不会被误认成新代次快照之后的事件,无需清理队列。
 //! - 每次连接成功后调用 `on_connected` 回调,由上层触发 capability/summary/
 //!   snapshot 重同步(§26.2)。
 //! - 入站队列有界;满时视为慢 consumer,断开重连触发重同步(§26.4)。
@@ -18,7 +26,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{SinkExt, StreamExt};
+use futures::stream::{SplitSink, StreamExt};
+use futures::SinkExt;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
@@ -172,8 +181,11 @@ struct RunContext {
 enum SessionEnd {
     /// 收到停止信号或发送端全部关闭:退出整个循环。
     Shutdown,
-    /// 连接丢失:按退避重连。
-    Lost,
+    /// 连接丢失。`protocol_established` 表示本次连接收到过至少一个有效协议
+    /// 帧(ClientHello 之后的对端帧,实践中为 ServerHello/HeartbeatAck):
+    /// 只有成立时才允许重连退避归零,避免对"仅升级成功"的服务以最短间隔
+    /// 反复重试失败的应用协议。
+    Lost { protocol_established: bool },
 }
 
 async fn run_loop(mut ctx: RunContext) {
@@ -184,9 +196,11 @@ async fn run_loop(mut ctx: RunContext) {
         }
         let _ = ctx.state_tx.send(ConnectionState::Connecting);
 
-        match connect_once(&ctx.options, ctx.credential.as_ref()).await {
+        match connect_once(&ctx.options, ctx.credential.as_ref(), &mut ctx.stop_rx).await {
             Ok(ws) => {
-                attempt = 0;
+                // 注意:退避计数不在这里归零 —— 仅 TCP/WS 升级成功不足以证明
+                // 应用协议可用(例如 Relay 侧认证失败/握手后立即断开)。归零点
+                // 在 run_session 收到首个有效协议帧之后(见 SessionEnd)。
                 let _ = ctx.state_tx.send(ConnectionState::Connected);
                 // 重同步点:上层在此重建订阅/重拉 capability 与 snapshot。
                 if let Some(cb) = &ctx.on_connected {
@@ -194,10 +208,17 @@ async fn run_loop(mut ctx: RunContext) {
                 }
                 match run_session(&mut ctx, ws).await {
                     SessionEnd::Shutdown => break,
-                    SessionEnd::Lost => {}
+                    SessionEnd::Lost {
+                        protocol_established,
+                    } => {
+                        if protocol_established {
+                            attempt = 0;
+                        }
+                    }
                 }
                 let _ = ctx.state_tx.send(ConnectionState::Disconnected);
             }
+            Err(TransportError::Stopped) => break,
             Err(err) => {
                 // 只记录稳定错误文本,不带 URL 细节/凭据(§25.3)。
                 tracing::warn!(attempt, error = %err, "relay connect failed");
@@ -247,9 +268,25 @@ fn backoff_delay(attempt: u32, options: &RelayClientOptions) -> Duration {
     base + Duration::from_millis(extra)
 }
 
+/// 连接建立统一写入口:单帧写出预算(§26.2/§26.4)。阻塞的 sink(网络黑洞、
+/// 对端停止读取)在预算内未完成即判链路失活,断开走既有退避与重同步;
+/// 不重放结果未知的帧(上层按 epoch/快照语义重同步)。
+async fn send_with_deadline(
+    sink: &mut SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+    frame: Vec<u8>,
+    budget: Duration,
+) -> Result<(), TransportError> {
+    match tokio::time::timeout(budget, sink.send(Message::Binary(frame))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(TransportError::Send(e.to_string())),
+        Err(_) => Err(TransportError::SendStalled),
+    }
+}
+
 async fn connect_once(
     options: &RelayClientOptions,
     credential: &dyn DeviceCredential,
+    stop_rx: &mut watch::Receiver<bool>,
 ) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, TransportError> {
     // ws_url 由 RelayUrls 校验派生,此处只做握手;解析失败按连接错误处理。
     let url: url::Url = options
@@ -268,10 +305,19 @@ async fn connect_once(
         http::HeaderValue::from_str(&format!("Bearer {}", credential.bearer_token()))
             .map_err(|e| TransportError::Connect(format!("invalid auth header: {e}")))?,
     );
-    let (ws, _response) = connect_async(request)
-        .await
-        .map_err(|e| TransportError::Connect(e.to_string()))?;
-    Ok(ws)
+    // 连接预算 + 停止竞争(§26.2):网络黑洞(TCP 可达但握手无响应)在预算内
+    // 失败进入退避;连接进行中 shutdown 立即放弃尝试,不留悬挂任务。
+    let connect = connect_async(request);
+    tokio::pin!(connect);
+    tokio::select! {
+        res = &mut connect => res
+            .map(|(ws, _response)| ws)
+            .map_err(|e| TransportError::Connect(e.to_string())),
+        _ = wait_stop(stop_rx) => Err(TransportError::Stopped),
+        _ = tokio::time::sleep(options.connect_budget) => Err(TransportError::Connect(
+            format!("connect budget exceeded ({}s)", options.connect_budget.as_secs()),
+        )),
+    }
 }
 
 async fn run_session(
@@ -279,19 +325,29 @@ async fn run_session(
     ws: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
 ) -> SessionEnd {
     let (mut sink, mut stream) = ws.split();
+    // 应用协议是否已成立:收到首个有效对端帧后置位(退避归零的依据)。
+    let mut protocol_established = false;
 
     // 握手(§17.2):升级后立即发送 ClientHello(BRIDGE);Relay 校验协议版本
     // 与 device_id 一致后回 ServerHello(由入站队列交给上层,无动作)。
+    // hello 写同样受写预算约束,不无限阻塞。
     let hello = client_hello_envelope(&ctx.options.device_id);
     match encode_envelope(&hello) {
         Ok(frame) => {
-            if sink.send(Message::Binary(frame)).await.is_err() {
-                return SessionEnd::Lost;
+            if send_with_deadline(&mut sink, frame, ctx.options.send_budget)
+                .await
+                .is_err()
+            {
+                return SessionEnd::Lost {
+                    protocol_established,
+                };
             }
         }
         Err(err) => {
             tracing::error!(error = %err, "client hello encode failed");
-            return SessionEnd::Lost;
+            return SessionEnd::Lost {
+                protocol_established,
+            };
         }
     }
 
@@ -311,8 +367,12 @@ async fn run_session(
 
             outbound = ctx.outbound_rx.recv() => match outbound {
                 Some(frame) => {
-                    if sink.send(Message::Binary(frame)).await.is_err() {
-                        return SessionEnd::Lost;
+                    // 写预算内未完成(对端不读/黑洞):判链路失活,断开重连。
+                    if send_with_deadline(&mut sink, frame, ctx.options.send_budget)
+                        .await
+                        .is_err()
+                    {
+                        return SessionEnd::Lost { protocol_established };
                     }
                 }
                 // 句柄全部丢弃:视为停止。
@@ -323,8 +383,11 @@ async fn run_session(
                 let envelope = heartbeat_envelope(&ctx.options.device_id);
                 match encode_envelope(&envelope) {
                     Ok(frame) => {
-                        if sink.send(Message::Binary(frame)).await.is_err() {
-                            return SessionEnd::Lost;
+                        if send_with_deadline(&mut sink, frame, ctx.options.send_budget)
+                            .await
+                            .is_err()
+                        {
+                            return SessionEnd::Lost { protocol_established };
                         }
                     }
                     Err(err) => {
@@ -337,7 +400,7 @@ async fn run_session(
             _ = &mut dead_deadline => {
                 // 约 45s 无入站帧:判离线,主动断开走重连(§26.2)。
                 tracing::warn!("relay heartbeat timeout, reconnecting");
-                return SessionEnd::Lost;
+                return SessionEnd::Lost { protocol_established };
             }
 
             incoming = stream.next() => match incoming {
@@ -348,26 +411,30 @@ async fn run_session(
                         .reset(last_inbound + ctx.options.heartbeat_dead_after);
                     match decode_envelope(&bytes) {
                         Ok(envelope) => {
+                            // 首个有效协议帧:应用协议成立,重连退避自此允许归零。
+                            protocol_established = true;
                             // 入站有界:满即慢 consumer,断开由重连触发重同步(§26.4)。
                             if ctx.inbound_tx.try_send(envelope).is_err() {
                                 tracing::warn!("inbound queue full, dropping connection for resync");
-                                return SessionEnd::Lost;
+                                return SessionEnd::Lost { protocol_established };
                             }
                         }
                         Err(err) => {
                             // 超限或解码失败属于协议违约:断开,不给截断数据放行。
                             tracing::warn!(error = %err, "invalid inbound frame, dropping connection");
-                            return SessionEnd::Lost;
+                            return SessionEnd::Lost { protocol_established };
                         }
                     }
                 }
-                Some(Ok(Message::Close(_))) => return SessionEnd::Lost,
+                Some(Ok(Message::Close(_))) => {
+                    return SessionEnd::Lost { protocol_established }
+                }
                 Some(Ok(_)) => {} // Text/Ping/Pong:tungstenite 已自动处理 ping/pong。
                 Some(Err(err)) => {
                     tracing::warn!(error = %err, "relay read failed");
-                    return SessionEnd::Lost;
+                    return SessionEnd::Lost { protocol_established };
                 }
-                None => return SessionEnd::Lost,
+                None => return SessionEnd::Lost { protocol_established },
             },
         }
     }

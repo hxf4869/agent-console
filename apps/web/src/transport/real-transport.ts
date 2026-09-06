@@ -35,10 +35,12 @@ import {
   StopBackgroundCommandPayloadSchema,
   SubscribeSchema,
   TurnIdSchema,
+  UnsubscribeSchema,
   UpdateSettingsPayloadSchema,
   SettingUpdateSchema,
   type CapabilitySnapshot as PbCapabilitySnapshot,
   type CommandRequest as PbCommandRequest,
+  type DevicePresence as PbDevicePresence,
   type DomainEvent,
   type Envelope,
   type Item as PbItem,
@@ -72,6 +74,8 @@ import type {
   QueueState,
   QueueStatus,
   ReceiptStatus,
+  RelayLinkState,
+  RelayLinkStage,
   RuntimeSettings,
   RuntimeSnapshot,
   SelectOption,
@@ -88,9 +92,19 @@ const WS_PROTOCOL = 'agent-console.v1'
 const HEARTBEAT_MS = 15_000
 const HEARTBEAT_TIMEOUT_MS = 45_000
 const SUBSCRIBE_TIMEOUT_MS = 15_000
+// WS 握手(open→ServerHello)独立超时:握不死时断开重连,不永久卡在 CONNECTING。
+const HANDSHAKE_TIMEOUT_MS = 10_000
+// HTTP 取票(WS ticket)超时,使用 AbortSignal 让浏览器取消旧请求。
+const TICKET_TIMEOUT_MS = 10_000
+// 回执等待超时后的一次性 receipt 查询超时。
+const RECEIPT_QUERY_TIMEOUT_MS = 5_000
+// 受控恢复(ResyncRequest)看门狗:在途恢复超时未完成才断开重连(§17.5)。
+const RESYNC_TIMEOUT_MS = 10_000
 // Browser WebSocket.close 只允许 1000 或 3000–4999；内部主动关闭使用私有码。
 const WS_CLOSE_HEARTBEAT_TIMEOUT = 4001
 const WS_CLOSE_PROTOCOL_MISMATCH = 4002
+const WS_CLOSE_RESYNC_TIMEOUT = 4003
+const WS_CLOSE_HANDSHAKE_TIMEOUT = 4004
 
 type SubscriptionTarget = { kind: 'list' } | { kind: 'session'; sessionId: string }
 
@@ -165,25 +179,88 @@ export class RealConsoleTransport implements ConsoleTransport {
   #reconnectTimer: number | undefined
   #heartbeatTimer: number | undefined
   #lastHeartbeatAck = 0
-  #sessionKeys = new Map<string, { deviceId: string; nativeSessionId: string }>()
+  #sessionKeys = new Map<string, { deviceId: string; agentKind: number; nativeSessionId: string }>()
   #wantedSessions = new Set<string>()
   #streamStates = new Map<string, StreamState>()
   #pendingSubscription: SubscriptionTarget | undefined
   #pendingSubscriptionStream = ''
   #pendingSubscriptionDone: (() => void) | undefined
   #subscriptionChain: Promise<void> = Promise.resolve()
+  /** 已排队尚未开始执行的订阅目标:防止同一目标重复排队。 */
+  #queuedSubscriptionKeys = new Set<string>()
   #pendingCommands = new Map<string, PendingCommand>()
   #commandWaiters = new Map<string, CommandWaiter>()
   #canonicalSessionRefresh: Promise<void> | undefined
+  /** 在途受控恢复(streamId → 看门狗 timer):同一流不重复发送 ResyncRequest。 */
+  #resyncInFlight = new Map<string, number>()
+  /** 取票(经 Toolbox 网关)是否成功过:区分"Relay 不可达但 Toolbox 可用"(IN-01)。 */
+  #toolboxReachable: boolean | undefined
+  /** openSocket 流程(取票+握手)在途标志:任何时刻至多一个连接建立流程。 */
+  #handshakeInFlight = false
 
   async connect(onEvent: (event: ConsoleEvent) => void): Promise<() => void> {
     this.#listener = onEvent
     this.#closed = false
     onEvent({ type: 'connection', state: 'CONNECTING' })
+    this.#emitLink({ state: 'CONNECTING', stage: 'TICKET' })
     const auth = await this.#json<{ csrfToken: string }>(AUTH_SESSION_PATH)
     this.#csrf = auth.csrfToken
     await this.#openSocket()
     return () => this.#disconnect()
+  }
+
+  /** 用户手动重试:清退避并立即重连;协议终态升级后由此恢复。 */
+  retryLink(): void {
+    if (this.#closed) return
+    // 取票/握手在途时不并发第二个 openSocket:旧流程超时会自行走重连自愈,
+    // 此时再点重试只会产生多余的第三次连接尝试。
+    if (this.#handshakeInFlight) return
+    if (this.#socket?.readyState === WebSocket.OPEN) return
+    if (this.#reconnectTimer !== undefined) {
+      window.clearTimeout(this.#reconnectTimer)
+      this.#reconnectTimer = undefined
+    }
+    this.#reconnectAttempt = 0
+    void this.#openSocket()
+      .then(() => this.#resendPendingCommands())
+      .catch((error: unknown) => {
+        if (error instanceof AuthRequiredError) this.#listener?.({ type: 'auth-expired' })
+        else this.#scheduleReconnect()
+      })
+  }
+
+  /** 按 requestId 只读查询持久化回执(UX-03"核对结果");无记录返回 undefined。 */
+  async getReceipt(requestId: string): Promise<CommandReceipt | undefined> {
+    try {
+      const receipt = await this.#json<Record<string, unknown>>(
+        `${API_ROOT}/requests/${encodeURIComponent(requestId)}`,
+      )
+      const status = receiptStatusFromProto(receiptStatusToProto(stringOrEmpty(receipt.status)))
+      return {
+        requestId,
+        status,
+        ...(stringOrEmpty(receipt.errorCode) ? { errorCode: stringOrEmpty(receipt.errorCode) } : {}),
+      }
+    } catch (error) {
+      if (error instanceof AuthRequiredError) throw error
+      return undefined
+    }
+  }
+
+  #emitLink(
+    overrides: Partial<Omit<RelayLinkState, 'updatedAt'>> & {
+      stage: RelayLinkState['stage']
+      state: RelayLinkState['state']
+    },
+  ): void {
+    this.#listener?.({
+      type: 'link',
+      link: {
+        ...overrides,
+        ...(this.#toolboxReachable === undefined ? {} : { toolboxReachable: this.#toolboxReachable }),
+        updatedAt: new Date().toISOString(),
+      },
+    })
   }
 
   async listSessions(cursor?: string): Promise<Page<SessionSummary>> {
@@ -217,6 +294,28 @@ export class RealConsoleTransport implements ConsoleTransport {
     if (history.nextCursor) runtime.historyNextCursor = history.nextCursor
     applyContextUsage(runtime)
     return runtime
+  }
+
+  /** 视图等明确消费者声明需要某会话详情流:声明需要(重连恢复),无活跃流则订阅。 */
+  retainRuntime(sessionId: string): void {
+    this.#wantedSessions.add(sessionId)
+    this.#queueSubscription({ kind: 'session', sessionId })
+  }
+
+  /** 释放详情订阅:不再随重连恢复,并向服务端发送 Unsubscribe。 */
+  releaseRuntime(sessionId: string): void {
+    this.#wantedSessions.delete(sessionId)
+    for (const [streamId, stream] of this.#streamStates) {
+      if (stream.target.kind !== 'session' || stream.target.sessionId !== sessionId) continue
+      this.#streamStates.delete(streamId)
+      this.#clearResyncInFlight(streamId)
+      this.#send(
+        baseEnvelope({
+          case: 'unsubscribe',
+          value: create(UnsubscribeSchema, { streamId }),
+        }),
+      )
+    }
   }
 
   async getHistory(sessionId: string, cursor?: string): Promise<Page<TimelineItem>> {
@@ -342,14 +441,19 @@ export class RealConsoleTransport implements ConsoleTransport {
     )
   }
 
-  async getOutputText(sessionId: string, itemId: string, cursor?: string): Promise<string> {
-    let next = cursor ?? ''
+  async getOutputText(
+    sessionId: string,
+    itemId: string,
+    options?: { cursor?: string; signal?: AbortSignal },
+  ): Promise<string> {
+    let next = options?.cursor ?? ''
     let output = ''
     for (let page = 0; page < 100; page += 1) {
       const query = new URLSearchParams({ itemId, pageSize: String(256 * 1024) })
       if (next) query.set('cursor', next)
       const body = await this.#json<{ commandOutputPage: Record<string, unknown> }>(
         `${API_ROOT}/sessions/${encodeURIComponent(sessionId)}/output?${query}`,
+        options?.signal ? { signal: options.signal } : {},
       )
       output += decodeBase64Utf8(stringOrEmpty(body.commandOutputPage.bytesBase64))
       next = stringOrEmpty(body.commandOutputPage.nextCursor)
@@ -361,12 +465,7 @@ export class RealConsoleTransport implements ConsoleTransport {
   requestResync(sessionId: string): void {
     for (const [streamId, state] of this.#streamStates) {
       if (state.target.kind === 'session' && state.target.sessionId === sessionId) {
-        this.#send(
-          baseEnvelope({
-            case: 'resyncRequest',
-            value: create(ResyncRequestSchema, { streamId }),
-          }),
-        )
+        this.#requestStreamResync(streamId)
         return
       }
     }
@@ -380,7 +479,9 @@ export class RealConsoleTransport implements ConsoleTransport {
     const receipt = new Promise<CommandReceipt>((resolve, reject) => {
       const timer = window.setTimeout(() => {
         this.#commandWaiters.delete(request.requestId)
-        reject(new Error('等待 Bridge 回执超时。'))
+        // 回执等待超时:不推定执行失败。先查询已有 request receipt,
+        // 仍未知则保持可解释的 OUTCOME_UNKNOWN(断开不推定原生操作未执行)。
+        void this.#settleReceiptAfterTimeout(request.requestId, resolve)
       }, 15_000)
       this.#commandWaiters.set(request.requestId, { resolve, reject, timer })
     })
@@ -399,7 +500,7 @@ export class RealConsoleTransport implements ConsoleTransport {
       operation: operationToProto(request.operation),
       sessionKey: create(SessionKeySchema, {
         deviceId: key.deviceId,
-        agentKind: AgentKind.CODEX_DESKTOP,
+        agentKind: key.agentKind,
         nativeSessionId: key.nativeSessionId,
         relaySessionUuid: request.sessionId,
       }),
@@ -414,24 +515,61 @@ export class RealConsoleTransport implements ConsoleTransport {
   }
 
   async #openSocket(): Promise<void> {
-    const ticket = await this.#json<{ ticket: string }>(
-      TICKET_PATH,
-      { method: 'POST', body: '{}' },
-      true,
-    )
+    this.#handshakeInFlight = true
+    try {
+      await this.#openSocketInner()
+    } finally {
+      this.#handshakeInFlight = false
+    }
+  }
+
+  async #openSocketInner(): Promise<void> {
+    // HTTP 取票带超时;取消后旧 Promise 不再创建新连接。
+    this.#emitLink({ state: 'CONNECTING', stage: 'TICKET' })
+    let ticket: string
+    try {
+      const body = await withTimeoutSignal(TICKET_TIMEOUT_MS, (signal) =>
+        this.#json<{ ticket: string }>(
+          TICKET_PATH,
+          { method: 'POST', body: '{}', signal },
+          true,
+        ),
+      )
+      ticket = body.ticket
+      // 取票成功说明 Toolbox 网关与会话都可用;失败是 Relay 侧链路问题(IN-01)。
+      this.#toolboxReachable = true
+    } catch (error) {
+      if (error instanceof AuthRequiredError) throw error
+      const reachable = error instanceof ConsoleApiError
+      this.#toolboxReachable = reachable
+      this.#emitLink({
+        state: 'OFFLINE',
+        stage: 'TICKET',
+        ...(error instanceof ConsoleApiError ? { errorCode: error.code } : { errorCode: 'NETWORK_ERROR' }),
+      })
+      this.#scheduleReconnect()
+      throw error
+    }
+    if (this.#closed) return
     const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const socket = new WebSocket(
       `${scheme}//${window.location.host}/agent-console/ws`,
-      [WS_PROTOCOL, ticketSubprotocol(ticket.ticket)],
+      [WS_PROTOCOL, ticketSubprotocol(ticket)],
     )
     socket.binaryType = 'arraybuffer'
     this.#socket = socket
+    this.#emitLink({ state: 'CONNECTING', stage: 'HANDSHAKE' })
 
     await new Promise<void>((resolve, reject) => {
       let greeted = false
       const fail = () => {
+        window.clearTimeout(handshakeTimer)
         if (!greeted) reject(new Error('WebSocket 在握手完成前关闭。'))
       }
+      const handshakeTimer = window.setTimeout(() => {
+        socket.close(WS_CLOSE_HANDSHAKE_TIMEOUT, 'HANDSHAKE_TIMEOUT')
+        fail()
+      }, HANDSHAKE_TIMEOUT_MS)
       socket.addEventListener('open', () => {
         this.#send(
           baseEnvelope({
@@ -445,9 +583,10 @@ export class RealConsoleTransport implements ConsoleTransport {
         )
       })
       socket.addEventListener('message', (event) => {
-        void this.#handleMessage(event, () => {
+        void this.#handleMessage(event, socket, () => {
           if (greeted) return
           greeted = true
+          window.clearTimeout(handshakeTimer)
           resolve()
         })
       })
@@ -458,8 +597,14 @@ export class RealConsoleTransport implements ConsoleTransport {
       })
     })
 
+    // 连接代次检查:握手期间已断开或 socket 已被替换时,旧握手回调不得发布 ONLINE。
+    if (this.#closed || this.#socket !== socket) {
+      if (socket.readyState === WebSocket.OPEN) socket.close(1000, 'CLIENT_CLOSE')
+      return
+    }
     this.#reconnectAttempt = 0
     this.#listener?.({ type: 'connection', state: 'ONLINE' })
+    this.#emitLink({ state: 'ONLINE', stage: 'CONNECTED' })
     this.#lastHeartbeatAck = Date.now()
     this.#startHeartbeat()
     this.#queueSubscription({ kind: 'list' })
@@ -467,7 +612,9 @@ export class RealConsoleTransport implements ConsoleTransport {
     await this.#reconcilePendingReceipts()
   }
 
-  async #handleMessage(event: MessageEvent, onHello: () => void): Promise<void> {
+  async #handleMessage(event: MessageEvent, socket: WebSocket, onHello: () => void): Promise<void> {
+    // 迟到消息守卫:非当前连接代次的消息不处理,不向新连接回放旧流状态。
+    if (this.#socket !== socket) return
     const data = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data
     if (!(data instanceof ArrayBuffer)) return
     let envelope: Envelope
@@ -500,11 +647,18 @@ export class RealConsoleTransport implements ConsoleTransport {
       case 'sessionSummaryBatch': {
         const stream = payload.value.snapshot
           ? this.#acceptSnapshot(envelope)
-          : this.#acceptSequenced(envelope)
+          : this.#sequencedStream(envelope)
         if (!stream) return
         const sessions = payload.value.summaries.map(mapSessionSummaryProto)
-        this.#rememberSessions(sessions)
-        this.#listener?.({ type: 'sessions', sessions, snapshot: payload.value.snapshot })
+        try {
+          this.#rememberSessions(sessions)
+          this.#listener?.({ type: 'sessions', sessions, snapshot: payload.value.snapshot })
+        } catch {
+          // 应用失败不得把未应用数据记为成功:走受控恢复。
+          this.#requestStreamResync(envelope.streamId)
+          return
+        }
+        if (!payload.value.snapshot) stream.lastSequence = envelope.sequence
         if (sessions.some((session) => !isUuid(session.id))) this.#refreshCanonicalSessions()
         this.#ack(envelope)
         this.#completeSubscription(envelope.streamId)
@@ -520,24 +674,42 @@ export class RealConsoleTransport implements ConsoleTransport {
         return
       }
       case 'eventBatch': {
-        const stream = this.#acceptSequenced(envelope)
-        if (!stream || stream.target.kind !== 'session') return
-        for (const domainEvent of payload.value.events) {
-          this.#emitDomainEvent(stream.target.sessionId, domainEvent)
+        const stream = this.#sequencedStream(envelope)
+        if (!stream) return
+        try {
+          if (stream.target.kind === 'list') {
+            // 列表流:只应用确有合同的事件(摘要/设备状态),按事件自身的
+            // session_key/device_id 定位对象,不套用当前打开的详情会话 ID。
+            for (const domainEvent of payload.value.events) {
+              this.#applyListEvent(domainEvent)
+            }
+          } else {
+            for (const domainEvent of payload.value.events) {
+              this.#emitDomainEvent(stream.target.sessionId, domainEvent)
+            }
+          }
+        } catch {
+          // 应用失败不得把未应用数据记为成功:不推进水位,走受控恢复。
+          this.#requestStreamResync(envelope.streamId)
+          return
         }
+        // 合法批次应用完成后才推进已应用水位并 ACK(§17.4 步骤 6)。
+        stream.lastSequence = envelope.sequence
         this.#ack(envelope)
         return
       }
       case 'resyncRequired': {
         const stream = this.#streamStates.get(payload.value.streamId)
-        if (stream?.target.kind === 'session') {
+        if (!stream) return
+        if (stream.target.kind === 'session') {
           this.#listener?.({
             type: 'resync-required',
             sessionId: stream.target.sessionId,
             reason: 'RESYNC_REQUIRED',
           })
-          this.requestResync(stream.target.sessionId)
         }
+        // 列表与详情都发起恢复;同一流已有恢复在途时不重复发送。
+        this.#requestStreamResync(payload.value.streamId)
         return
       }
       case 'commandAccepted':
@@ -613,19 +785,27 @@ export class RealConsoleTransport implements ConsoleTransport {
             },
           })
         } else if (event.value.content.case === 'pageCursor') {
-          void this.getOutputText(sessionId, event.value.itemId.id, event.value.content.value).then(
-            (text) =>
+          const itemId = event.value.itemId.id
+          const revision = safeNumber(event.value.revision)
+          void this.getOutputText(sessionId, itemId, { cursor: event.value.content.value })
+            .then((text) => {
+              // 补全到达前会话已退订:迟到数据不再回放到界面。
+              if (!this.#sessionStreamActive(sessionId)) return
               this.#listener?.({
                 type: 'output',
                 sessionId,
-                event: {
-                  type: 'replace',
-                  itemId: event.value.itemId!.id,
-                  revision: safeNumber(event.value.revision),
-                  text,
-                },
-              }),
-          )
+                event: { type: 'replace', itemId, revision, text },
+              })
+            })
+            .catch(() => {
+              // 捕获失败:保持已有部分内容,标记完整输出暂不可用,不清空会话。
+              if (!this.#sessionStreamActive(sessionId)) return
+              this.#listener?.({
+                type: 'output',
+                sessionId,
+                event: { type: 'unavailable', itemId, revision },
+              })
+            })
         }
         return
       case 'outputFinal':
@@ -689,19 +869,7 @@ export class RealConsoleTransport implements ConsoleTransport {
         return
       }
       case 'devicePresenceChanged':
-        if (event.value.presence) {
-          this.#listener?.({
-            type: 'device-presence',
-            deviceId: event.value.presence.deviceId,
-            connection: connectionFromProto(event.value.presence.connection),
-            ...(event.value.presence.lastSeenAt
-              ? { lastSeenAt: timestampToIso(event.value.presence.lastSeenAt) }
-              : {}),
-            ...(event.value.presence.degradedReason
-              ? { degradedReason: event.value.presence.degradedReason }
-              : {}),
-          })
-        }
+        this.#emitPresenceChanged(event.value.presence)
         return
       case 'capabilityChanged':
         if (event.value.capabilities) {
@@ -715,6 +883,24 @@ export class RealConsoleTransport implements ConsoleTransport {
       default:
         return
     }
+  }
+
+  #emitPresenceChanged(presence: PbDevicePresence | undefined): void {
+    if (!presence) return
+    this.#listener?.({
+      type: 'device-presence',
+      deviceId: presence.deviceId,
+      connection: connectionFromProto(presence.connection),
+      ...(presence.lastSeenAt ? { lastSeenAt: timestampToIso(presence.lastSeenAt) } : {}),
+      ...(presence.degradedReason ? { degradedReason: presence.degradedReason } : {}),
+    })
+  }
+
+  #sessionStreamActive(sessionId: string): boolean {
+    for (const stream of this.#streamStates.values()) {
+      if (stream.target.kind === 'session' && stream.target.sessionId === sessionId) return true
+    }
+    return false
   }
 
   #handleReceipt(requestId: string, statusCode: CommandReceiptStatus, errorCode: number): void {
@@ -739,10 +925,17 @@ export class RealConsoleTransport implements ConsoleTransport {
     const stream = this.#streamStates.get(envelope.streamId)
     if (!stream || stream.epoch !== envelope.streamEpoch) return undefined
     stream.lastSequence = envelope.sequence
+    // 成功快照重建坐标:解除该流的恢复在途标记。
+    this.#clearResyncInFlight(envelope.streamId)
     return stream
   }
 
-  #acceptSequenced(envelope: Envelope): StreamState | undefined {
+  /**
+   * 序号校验(不提交水位):同 stream+epoch 内只接受 lastSequence+1;
+   * 重复幂等忽略;缺口对列表与详情都发起一次受控恢复(§17.5),
+   * 同一流已有恢复在途时不重复发送。调用方在应用完成后自行提交水位并 ACK。
+   */
+  #sequencedStream(envelope: Envelope): StreamState | undefined {
     const stream = this.#streamStates.get(envelope.streamId)
     if (!stream || stream.epoch !== envelope.streamEpoch) return undefined
     if (envelope.sequence <= stream.lastSequence) return undefined
@@ -753,12 +946,59 @@ export class RealConsoleTransport implements ConsoleTransport {
           sessionId: stream.target.sessionId,
           reason: 'sequence gap',
         })
-        this.requestResync(stream.target.sessionId)
       }
+      this.#requestStreamResync(envelope.streamId)
       return undefined
     }
-    stream.lastSequence = envelope.sequence
     return stream
+  }
+
+  /** 发送受控恢复请求;在途去重 + 看门狗超时才断开重连。 */
+  #requestStreamResync(streamId: string): void {
+    if (this.#resyncInFlight.has(streamId)) return
+    if (this.#socket?.readyState !== WebSocket.OPEN) return
+    const timer = window.setTimeout(() => {
+      this.#resyncInFlight.delete(streamId)
+      // 恢复超时:断开重连,用新快照重建坐标,不形成无限 Resync 循环。
+      this.#socket?.close(WS_CLOSE_RESYNC_TIMEOUT, 'RESYNC_TIMEOUT')
+    }, RESYNC_TIMEOUT_MS)
+    this.#resyncInFlight.set(streamId, timer)
+    this.#send(
+      baseEnvelope({
+        case: 'resyncRequest',
+        value: create(ResyncRequestSchema, { streamId }),
+      }),
+    )
+  }
+
+  #clearResyncInFlight(streamId: string): void {
+    const timer = this.#resyncInFlight.get(streamId)
+    if (timer !== undefined) {
+      window.clearTimeout(timer)
+      this.#resyncInFlight.delete(streamId)
+    }
+  }
+
+  /**
+   * 列表流事件应用:只接受会话摘要与设备状态等确有合同的事件;按事件自身的
+   * session_key/device_id 定位对象。其余类型不属于列表合同,不臆造字段、
+   * 不套用当前详情会话 ID。
+   */
+  #applyListEvent(domain: DomainEvent): void {
+    const event = domain.event
+    switch (event.case) {
+      case 'sessionSummaryChanged': {
+        const summary = mapSessionSummaryProto(event.value)
+        this.#rememberSessions([summary])
+        this.#listener?.({ type: 'sessions', sessions: [summary], snapshot: false })
+        return
+      }
+      case 'devicePresenceChanged':
+        this.#emitPresenceChanged(event.value.presence)
+        return
+      default:
+        return
+    }
   }
 
   #ack(envelope: Envelope): void {
@@ -771,16 +1011,25 @@ export class RealConsoleTransport implements ConsoleTransport {
   }
 
   #queueSubscription(target: SubscriptionTarget): void {
+    const key = targetKey(target)
+    if (this.#pendingSubscription && targetEqual(this.#pendingSubscription, target)) return
+    if (this.#queuedSubscriptionKeys.has(key)) return
     const already = [...this.#streamStates.values()].some((stream) => targetEqual(stream.target, target))
     if (already) return
+    this.#queuedSubscriptionKeys.add(key)
     this.#subscriptionChain = this.#subscriptionChain
       .catch(() => undefined)
-      .then(() => this.#subscribe(target))
+      .then(() => {
+        this.#queuedSubscriptionKeys.delete(key)
+        return this.#subscribe(target)
+      })
   }
 
   async #subscribe(target: SubscriptionTarget): Promise<void> {
     const socket = this.#socket
     if (!socket || socket.readyState !== WebSocket.OPEN) return
+    // 排队期间目标已被释放:不再发出订阅,避免已离开的详情流被重新建立。
+    if (target.kind === 'session' && !this.#wantedSessions.has(target.sessionId)) return
     const subscribe =
       target.kind === 'list'
         ? create(SubscribeSchema, {
@@ -815,7 +1064,7 @@ export class RealConsoleTransport implements ConsoleTransport {
         case: 'session',
         value: create(SessionKeySchema, {
           deviceId: key.deviceId,
-          agentKind: AgentKind.CODEX_DESKTOP,
+          agentKind: key.agentKind,
           nativeSessionId: key.nativeSessionId,
           relaySessionUuid: sessionId,
         }),
@@ -831,6 +1080,7 @@ export class RealConsoleTransport implements ConsoleTransport {
     for (const session of sessions) {
       this.#sessionKeys.set(session.id, {
         deviceId: session.deviceId,
+        agentKind: agentKindValueFromName(session.agentKind),
         nativeSessionId: session.nativeSessionId,
       })
     }
@@ -869,6 +1119,8 @@ export class RealConsoleTransport implements ConsoleTransport {
     if (socket && this.#socket !== socket) return
     if (this.#heartbeatTimer) window.clearInterval(this.#heartbeatTimer)
     this.#heartbeatTimer = undefined
+    for (const timer of this.#resyncInFlight.values()) window.clearTimeout(timer)
+    this.#resyncInFlight.clear()
     this.#socket = undefined
     this.#streamStates.clear()
     this.#pendingSubscriptionDone?.()
@@ -878,6 +1130,18 @@ export class RealConsoleTransport implements ConsoleTransport {
       this.#listener?.({ type: 'auth-expired' })
       return
     }
+    // 协议不匹配是需要人工升级的终态:停止自动重连,由用户在升级后手动重试(IN-01)。
+    if (event.code === WS_CLOSE_PROTOCOL_MISMATCH) {
+      this.#emitLink({
+        state: 'OFFLINE',
+        stage: 'HELLO',
+        errorCode: 'PROTOCOL_VERSION_MISMATCH',
+        terminal: true,
+      })
+      return
+    }
+    const failure = closeFailure(event)
+    if (failure) this.#emitLink({ state: 'OFFLINE', stage: failure.stage, errorCode: failure.errorCode })
     this.#scheduleReconnect()
   }
 
@@ -886,19 +1150,27 @@ export class RealConsoleTransport implements ConsoleTransport {
     const delay = Math.min(10_000, 500 * 2 ** this.#reconnectAttempt)
     this.#reconnectAttempt += 1
     this.#listener?.({ type: 'connection', state: 'CONNECTING' })
+    this.#emitLink({
+      state: 'CONNECTING',
+      stage: 'RECONNECT',
+      reconnectAttempt: this.#reconnectAttempt,
+    })
     this.#reconnectTimer = window.setTimeout(() => {
       this.#reconnectTimer = undefined
       void this.#openSocket()
-        .then(() => {
-          for (const pending of this.#pendingCommands.values()) {
-            if (!pending.accepted) this.#send(pending.envelope)
-          }
-        })
+        .then(() => this.#resendPendingCommands())
         .catch((error) => {
           if (error instanceof AuthRequiredError) this.#listener?.({ type: 'auth-expired' })
           else this.#scheduleReconnect()
         })
     }, delay)
+  }
+
+  /** 连接就绪后重发尚未被 Bridge 接受的命令(幂等 requestId 由服务端去重)。 */
+  #resendPendingCommands(): void {
+    for (const pending of this.#pendingCommands.values()) {
+      if (!pending.accepted) this.#send(pending.envelope)
+    }
   }
 
   async #reconcilePendingReceipts(): Promise<void> {
@@ -919,6 +1191,33 @@ export class RealConsoleTransport implements ConsoleTransport {
     }
   }
 
+  /** 回执等待超时后的一次性查询:已有终态回执则返回;仍未知则保持 OUTCOME_UNKNOWN。 */
+  async #settleReceiptAfterTimeout(
+    requestId: string,
+    resolve: (receipt: CommandReceipt) => void,
+  ): Promise<void> {
+    try {
+      const receipt = await withTimeoutSignal(RECEIPT_QUERY_TIMEOUT_MS, (signal) =>
+        this.#json<Record<string, unknown>>(
+          `${API_ROOT}/requests/${encodeURIComponent(requestId)}`,
+          { signal },
+        ),
+      )
+      const status = receiptStatusFromProto(receiptStatusToProto(stringOrEmpty(receipt.status)))
+      if (status !== 'RECEIVED') {
+        resolve({
+          requestId,
+          status,
+          ...(stringOrEmpty(receipt.errorCode) ? { errorCode: stringOrEmpty(receipt.errorCode) } : {}),
+        })
+        return
+      }
+    } catch {
+      // 查询失败:保持未知,不推定失败。
+    }
+    resolve({ requestId, status: 'OUTCOME_UNKNOWN' })
+  }
+
   #disconnect(): void {
     this.#closed = true
     if (this.#reconnectTimer !== undefined) window.clearTimeout(this.#reconnectTimer)
@@ -930,6 +1229,8 @@ export class RealConsoleTransport implements ConsoleTransport {
       waiter.reject(new Error('实时连接已关闭。'))
     }
     this.#commandWaiters.clear()
+    // 终局断开:清空未决命令,重新登录后的新连接不重发、不回填旧请求回执。
+    this.#pendingCommands.clear()
   }
 
   async #json<T = unknown>(path: string, init: RequestInit = {}, mutation = false): Promise<T> {
@@ -971,6 +1272,8 @@ export class RealConsoleTransport implements ConsoleTransport {
 }
 
 function baseEnvelope(payload: Envelope['payload']): Envelope {
+  // Envelope.agent_kind 是设备级元数据(路由不依赖它;会话级身份在
+  // SessionKey.agent_kind,ZC-02),沿用主 Agent 值。
   return create(EnvelopeSchema, {
     protocolVersion: PROTOCOL_VERSION,
     messageId: newMessageId(),
@@ -1147,11 +1450,34 @@ function operationFromName(value: string): ControlOperation | undefined {
   return names[normalized]
 }
 
+/**
+ * AgentKind proto 数值 ↔ 枚举名映射(ZC-02)。
+ * 未知数值原样保留为 `AGENT_KIND_{n}`;未知名称解析出数值或回退 UNSPECIFIED,
+ * 绝不默认当作 CODEX_DESKTOP(由 Bridge/Relay 显式拒绝)。
+ */
+const AGENT_KIND_NAMES: Record<number, string> = {
+  0: 'AGENT_KIND_UNSPECIFIED',
+  1: 'CODEX_DESKTOP',
+  2: 'ZCODE_DESKTOP',
+}
+
+export function agentKindName(value: number): string {
+  return AGENT_KIND_NAMES[value] ?? `AGENT_KIND_${value}`
+}
+
+export function agentKindValueFromName(name: string): number {
+  const known = Object.entries(AGENT_KIND_NAMES).find(([, value]) => value === name)
+  if (known) return Number(known[0])
+  const match = /^AGENT_KIND_(\d+)$/.exec(name)
+  return match ? Number(match[1]) : 0
+}
+
 export function mapSessionSummaryJson(value: unknown): SessionSummary {
   const raw = record(value)
   return {
     id: stringOrEmpty(raw.id),
     nativeSessionId: stringOrEmpty(raw.nativeSessionId),
+    agentKind: stringOrEmpty(raw.agentKind) || 'AGENT_KIND_UNSPECIFIED',
     title: stringOrEmpty(raw.title) || '未命名任务',
     projectDisplay: stringOrEmpty(raw.projectDisplayName),
     branch: stringOrEmpty(raw.currentBranch),
@@ -1174,9 +1500,18 @@ export function mapSessionSummaryJson(value: unknown): SessionSummary {
 
 export function mapSessionSummaryProto(summary: PbSessionSummary): SessionSummary {
   const key = summary.sessionKey
+  const agentKind = agentKindName(summary.agentKind)
+  // 临时 ID 归属必须含 agentKind:relaySessionUuid 缺失时,同机同
+  // nativeSessionId 的双 Agent(Codex/ZCode)是两个会话,临时 ID 与
+  // store 归一化(deviceId+agentKind+nativeSessionId 元组)保持一致,
+  // 不得折叠成一条(ZC-02)。
+  const id =
+    key?.relaySessionUuid ||
+    `${key?.deviceId ?? ''}:${agentKind}:${key?.nativeSessionId ?? ''}`
   return {
-    id: key?.relaySessionUuid || `${key?.deviceId ?? ''}:${key?.nativeSessionId ?? ''}`,
+    id,
     nativeSessionId: key?.nativeSessionId ?? '',
+    agentKind,
     title: summary.title || '未命名任务',
     projectDisplay: summary.projectDisplayName,
     branch: summary.currentBranch,
@@ -1973,8 +2308,35 @@ function isTerminalReceipt(value: ReceiptStatus): boolean {
   return value === 'COMPLETED' || value === 'REJECTED' || value === 'OUTCOME_UNKNOWN'
 }
 
+/** 把主动关闭码映射为可解释的失败阶段与稳定错误码(IN-01/UX-02)。 */
+function closeFailure(event: CloseEvent): { stage: RelayLinkStage; errorCode: string } | undefined {
+  switch (event.code) {
+    case WS_CLOSE_HEARTBEAT_TIMEOUT:
+      return { stage: 'HEARTBEAT', errorCode: 'HEARTBEAT_TIMEOUT' }
+    case WS_CLOSE_RESYNC_TIMEOUT:
+      return { stage: 'STREAM', errorCode: 'RESYNC_TIMEOUT' }
+    case WS_CLOSE_HANDSHAKE_TIMEOUT:
+      return { stage: 'HANDSHAKE', errorCode: 'HANDSHAKE_TIMEOUT' }
+    default:
+      return event.code === 1006 || event.code === 1001
+        ? { stage: 'RECONNECT', errorCode: 'CONNECTION_LOST' }
+        : undefined
+  }
+}
+
 function targetEqual(left: SubscriptionTarget, right: SubscriptionTarget): boolean {
   return left.kind === right.kind && (left.kind === 'list' || left.sessionId === (right as { sessionId: string }).sessionId)
+}
+
+function targetKey(target: SubscriptionTarget): string {
+  return target.kind === 'list' ? 'list' : `session:${target.sessionId}`
+}
+
+/** 带超时的 AbortSignal:请求结束(含失败)即清理定时器,不在事件循环里留悬挂 timer。 */
+function withTimeoutSignal<T>(milliseconds: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), milliseconds)
+  return run(controller.signal).finally(() => window.clearTimeout(timer))
 }
 
 function isUuid(value: string): boolean {

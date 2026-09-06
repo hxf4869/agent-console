@@ -1,9 +1,16 @@
 <script setup lang="ts">
 import { CheckCircle2, CircleAlert, Info, X } from 'lucide-vue-next'
+import { useRouter } from 'vue-router'
 
 import { useConsoleStore } from '@/store/console'
 
+const router = useRouter()
 const { state, dismissToast } = useConsoleStore()
+
+/** 站内提醒点击:经正常认证进入会话,不在推送/提醒里内嵌任何批准动作(UX-06)。 */
+function openReminder(linkTo: string): void {
+  void router.push(linkTo)
+}
 </script>
 
 <template>
@@ -12,7 +19,16 @@ const { state, dismissToast } = useConsoleStore()
       <CheckCircle2 v-if="toast.tone === 'success'" :size="17" aria-hidden="true" />
       <CircleAlert v-else-if="toast.tone === 'warning' || toast.tone === 'danger'" :size="17" aria-hidden="true" />
       <Info v-else :size="17" aria-hidden="true" />
-      <span>{{ toast.message }}</span>
+      <button
+        v-if="toast.linkTo"
+        type="button"
+        class="toast__link"
+        @click="openReminder(toast.linkTo)"
+      >
+        <span>{{ toast.message }}</span>
+        <span class="toast__open">查看</span>
+      </button>
+      <span v-else>{{ toast.message }}</span>
       <button type="button" aria-label="关闭通知" @click="dismissToast(toast.id)">
         <X :size="15" aria-hidden="true" />
       </button>
@@ -57,6 +73,33 @@ const { state, dismissToast } = useConsoleStore()
 
 .toast--danger > svg {
   color: var(--danger);
+}
+
+.toast__link {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.toast__link > span:first-child {
+  min-width: 0;
+}
+
+.toast__open {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .toast button {

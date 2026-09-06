@@ -1,22 +1,26 @@
 <script setup lang="ts">
-import { CornerDownLeft, ListPlus, Trash2 } from 'lucide-vue-next'
-import { computed, ref, watch } from 'vue'
+import { CornerDownLeft, ListPlus, RefreshCw, Trash2 } from 'lucide-vue-next'
+import { computed, ref } from 'vue'
 
 import StatusBadge from '@/components/StatusBadge.vue'
 import UiButton from '@/components/UiButton.vue'
-import { queueLabel } from '@/lib/presentation'
+import { queueLabel, requestStatusLabel } from '@/lib/presentation'
 import { useConsoleStore } from '@/store/console'
 import type { ActiveTurnPhase, QueueState } from '@/transport/types'
 
 const props = defineProps<{ sessionId: string; queue: QueueState; phase: ActiveTurnPhase }>()
-const { availability, sendCommand } = useConsoleStore()
-const draft = ref(props.queue.text ?? '')
-const sendMode = ref<'queue' | 'steer'>('queue')
+const { availability, sendCommand, getDraft, setDraft, verifyRequest, state } = useConsoleStore()
 
-watch(
-  () => props.queue.text,
-  (value) => (draft.value = value ?? ''),
-)
+/** 草稿按 (device, agentKind, nativeSession) 存于 store(UX-03):切会话不串、状态更新不清空。 */
+const draft = computed<string>({
+  get: () => getDraft(props.sessionId) || props.queue.text || '',
+  set: (value) => setDraft(props.sessionId, value),
+})
+const sendMode = ref<'queue' | 'steer'>('queue')
+/** 发送中防重复:一条命令在途回执前按钮与输入全部禁用。 */
+const submitting = ref(false)
+/** 本次输入框最近一次发送的请求 ID;用于关联回执阶段展示。 */
+const lastRequestId = ref('')
 
 const operation = computed(() => {
   if (props.phase === 'RUNNING' && sendMode.value === 'steer') return 'STEER'
@@ -26,16 +30,43 @@ const operation = computed(() => {
 const submitAvailability = computed(() => availability(props.sessionId, operation.value))
 const cancelAvailability = computed(() => availability(props.sessionId, 'CANCEL_QUEUE'))
 
+const lastReceipt = computed(() =>
+  lastRequestId.value
+    ? state.receipts.find((receipt) => receipt.requestId === lastRequestId.value)
+    : undefined,
+)
+const lastReceiptLabel = computed(() =>
+  lastReceipt.value ? requestStatusLabel(lastReceipt.value.status, lastReceipt.value.errorCode) : undefined,
+)
+
 async function submit(): Promise<void> {
   const text = draft.value.trim()
-  if (!text) return
-  const receipt = await sendCommand(props.sessionId, operation.value, { text })
-  if (receipt?.status === 'ACCEPTED_BY_BRIDGE' || receipt?.status === 'COMPLETED') draft.value = ''
+  if (!text || submitting.value) return
+  submitting.value = true
+  try {
+    const receipt = await sendCommand(props.sessionId, operation.value, { text })
+    if (receipt) lastRequestId.value = receipt.requestId
+    // 只有确认被接受才清空输入;超时/未知/拒绝都保留用户输入,不自动新 ID 重发(UX-03)。
+    if (receipt?.status === 'ACCEPTED_BY_BRIDGE' || receipt?.status === 'COMPLETED') draft.value = ''
+  } finally {
+    submitting.value = false
+  }
+}
+
+async function verifyLastRequest(): Promise<void> {
+  if (!lastRequestId.value) return
+  await verifyRequest(lastRequestId.value)
 }
 
 async function cancel(): Promise<void> {
-  await sendCommand(props.sessionId, 'CANCEL_QUEUE')
-  draft.value = ''
+  if (submitting.value) return
+  submitting.value = true
+  try {
+    await sendCommand(props.sessionId, 'CANCEL_QUEUE')
+    draft.value = ''
+  } finally {
+    submitting.value = false
+  }
 }
 
 function onKeydown(event: KeyboardEvent): void {
@@ -65,10 +96,13 @@ function onMobileKeydown(event: KeyboardEvent): void {
       </div>
       <span>{{ phase === 'RUNNING' ? '默认排入下一轮' : '由 Desktop 开始新轮次' }}</span>
     </header>
+    <p v-if="queue.status === 'PAUSED'" class="queue-composer__paused" role="note">
+      队列已暂停：不会自动发送；需重新确认或取消后才会执行。
+    </p>
     <textarea
       v-model="draft"
       rows="2"
-      :disabled="!submitAvailability.enabled"
+      :disabled="!submitAvailability.enabled || submitting"
       :placeholder="phase === 'IDLE' && queue.status === 'EMPTY' ? '给 Codex Desktop 发送下一轮指令…' : sendMode === 'steer' ? '补充当前轮次的方向…' : queue.status === 'EMPTY' ? '当前轮次完成后要继续做什么？' : '替换已排队的下一轮内容…'"
       :aria-describedby="!submitAvailability.enabled ? 'queue-disabled-reason' : 'queue-shortcut'"
       @keydown="onKeydown"
@@ -78,11 +112,22 @@ function onMobileKeydown(event: KeyboardEvent): void {
         v-if="phase === 'RUNNING' && queue.status === 'EMPTY'"
         variant="quiet"
         size="small"
-        :disabled="!availability(sessionId, 'STEER').enabled && sendMode !== 'steer'"
+        :disabled="submitting || (!availability(sessionId, 'STEER').enabled && sendMode !== 'steer')"
         @click="sendMode = sendMode === 'queue' ? 'steer' : 'queue'"
       >
         {{ sendMode === 'steer' ? '改为下一轮' : 'Steer 当前轮' }}
       </UiButton>
+      <span v-if="lastReceiptLabel" class="queue-composer__receipt" role="status">
+        {{ lastReceiptLabel.text }}
+        <button
+          v-if="lastReceiptLabel.verify"
+          type="button"
+          class="queue-composer__verify"
+          @click="verifyLastRequest"
+        >
+          <RefreshCw :size="12" aria-hidden="true" />核对结果
+        </button>
+      </span>
       <span v-if="!submitAvailability.enabled" id="queue-disabled-reason" class="queue-composer__reason">
         {{ submitAvailability.reason }}
       </span>
@@ -91,7 +136,7 @@ function onMobileKeydown(event: KeyboardEvent): void {
         v-if="queue.status !== 'EMPTY'"
         variant="quiet"
         size="small"
-        :disabled="!cancelAvailability.enabled"
+        :disabled="submitting || !cancelAvailability.enabled"
         @click="cancel"
       >
         <template #icon><Trash2 aria-hidden="true" /></template>
@@ -99,18 +144,18 @@ function onMobileKeydown(event: KeyboardEvent): void {
       </UiButton>
       <UiButton
         variant="primary"
-        :disabled="!submitAvailability.enabled || !draft.trim()"
+        :disabled="submitting || !submitAvailability.enabled || !draft.trim()"
         @click="submit"
       >
         <template #icon><CornerDownLeft aria-hidden="true" /></template>
-        {{ operation === 'START_TURN' ? '开始新轮次' : operation === 'STEER' ? 'Steer 当前轮' : queue.status === 'EMPTY' ? '排入下一轮' : '替换队列' }}
+        {{ submitting ? '提交中…' : operation === 'START_TURN' ? '开始新轮次' : operation === 'STEER' ? 'Steer 当前轮' : queue.status === 'EMPTY' ? '排入下一轮' : '替换队列' }}
       </UiButton>
     </div>
     <input
       v-model="draft"
       class="queue-composer__mobile-input"
       type="text"
-      :disabled="!submitAvailability.enabled"
+      :disabled="!submitAvailability.enabled || submitting"
       :placeholder="operation === 'START_TURN' ? '发送下一轮…' : operation === 'STEER' ? 'Steer 当前轮…' : queue.status === 'EMPTY' ? '追加下一轮…' : '替换下一轮…'"
       aria-label="下一轮指令"
       @keydown="onMobileKeydown"
@@ -119,7 +164,7 @@ function onMobileKeydown(event: KeyboardEvent): void {
       v-if="phase === 'RUNNING' && queue.status === 'EMPTY'"
       class="queue-composer__mobile-mode"
       type="button"
-      :disabled="!availability(sessionId, 'STEER').enabled && sendMode !== 'steer'"
+      :disabled="submitting || (!availability(sessionId, 'STEER').enabled && sendMode !== 'steer')"
       :aria-label="sendMode === 'steer' ? '改为下一轮' : 'Steer 当前轮'"
       :aria-pressed="sendMode === 'steer'"
       @click="sendMode = sendMode === 'queue' ? 'steer' : 'queue'"
@@ -130,7 +175,7 @@ function onMobileKeydown(event: KeyboardEvent): void {
       v-if="queue.status !== 'EMPTY'"
       class="queue-composer__mobile-cancel"
       type="button"
-      :disabled="!cancelAvailability.enabled"
+      :disabled="submitting || !cancelAvailability.enabled"
       aria-label="取消下一轮队列"
       @click="cancel"
     >
@@ -139,8 +184,8 @@ function onMobileKeydown(event: KeyboardEvent): void {
     <button
       class="queue-composer__mobile-submit"
       type="button"
-      :disabled="!submitAvailability.enabled || !draft.trim()"
-      :aria-label="operation === 'START_TURN' ? '开始新轮次' : operation === 'STEER' ? 'Steer 当前轮' : queue.status === 'EMPTY' ? '排入下一轮' : '替换下一轮队列'"
+      :disabled="submitting || !submitAvailability.enabled || !draft.trim()"
+      :aria-label="submitting ? '提交中' : operation === 'START_TURN' ? '开始新轮次' : operation === 'STEER' ? 'Steer 当前轮' : queue.status === 'EMPTY' ? '排入下一轮' : '替换下一轮队列'"
       @click="submit"
     >
       <CornerDownLeft :size="18" aria-hidden="true" />
@@ -179,6 +224,16 @@ function onMobileKeydown(event: KeyboardEvent): void {
 .queue-composer header > span {
   color: var(--text-muted);
   font-size: 10px;
+}
+
+.queue-composer__paused {
+  margin: 0;
+  padding: 6px 9px;
+  border: 1px solid color-mix(in srgb, var(--warning), transparent 60%);
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--warning), transparent 92%);
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 
 .queue-composer textarea {
@@ -220,6 +275,29 @@ function onMobileKeydown(event: KeyboardEvent): void {
   color: var(--warning);
 }
 
+.queue-composer__receipt {
+  display: inline-flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.queue-composer__verify {
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+  background: var(--bg-surface);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+}
+
 .queue-composer__mobile-input,
 .queue-composer__mobile-mode,
 .queue-composer__mobile-cancel,
@@ -243,6 +321,7 @@ function onMobileKeydown(event: KeyboardEvent): void {
 
   .queue-composer > header,
   .queue-composer > textarea,
+  .queue-composer > .queue-composer__paused,
   .queue-composer__footer {
     display: none;
   }

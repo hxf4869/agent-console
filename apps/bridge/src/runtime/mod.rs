@@ -97,6 +97,8 @@ pub struct RuntimeParts {
 /// 单会话流(§17.4/§17.5)。
 struct StreamState {
     stream_id: String,
+    /// 所属会话槽位(列表流为 None;resync 重建用,ZC-02)。
+    slot: Option<SessionSlot>,
     epoch: u64,
     next_sequence: u64,
     /// snapshot 未发出前事件先缓冲(§17.4 步骤 4)。
@@ -108,7 +110,29 @@ struct StreamState {
 struct RuntimeState {
     epoch_counter: u64,
     list_stream: Option<StreamState>,
-    session_streams: HashMap<String, StreamState>,
+    /// 会话详情流:按 (agentKind, nativeSessionId) 槽位隔离(ZC-02)。
+    session_streams: HashMap<SessionSlot, StreamState>,
+}
+
+/// 运行时内存 map 的会话槽位(ZC-02):所有缓存、输出、watcher、详情流
+/// 均以 (agentKind, nativeSessionId) 区分,同机同 native id 的双 Agent
+/// 会话互不串线。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SessionSlot(dm::AgentKind, String);
+
+impl SessionSlot {
+    fn of(key: &dm::SessionKey) -> Self {
+        Self(key.agent_kind, key.native_session_id.clone())
+    }
+
+    fn key(&self, device_id: &str) -> dm::SessionKey {
+        dm::SessionKey {
+            device_id: device_id.to_owned(),
+            agent_kind: self.0,
+            native_session_id: self.1.clone(),
+            relay_session_uuid: None,
+        }
+    }
 }
 
 /// 单会话缓存:只记稳定维度(ID/revision/phase/计数,§14/§25.3)。
@@ -145,14 +169,14 @@ struct RuntimeInner {
     transfer_config: TransferConfig,
 
     state: Mutex<RuntimeState>,
-    /// native_session_id → 会话缓存(观察与电源输入)。
-    sessions: Mutex<HashMap<String, SessionCache>>,
-    /// native_session_id → item 输出缓冲(command_output_page)。
-    outputs: Mutex<HashMap<String, HashMap<String, OutputBuffer>>>,
-    /// 已登记 adapter watcher 的会话。
-    watchers: Mutex<HashSet<String>>,
-    /// 已接 UploadLifecycle/PowerCoordinator watcher 的会话(每会话一次)。
-    lifecycle_wired: Mutex<HashSet<String>>,
+    /// (agentKind, native) → 会话缓存(观察与电源输入)。
+    sessions: Mutex<HashMap<SessionSlot, SessionCache>>,
+    /// (agentKind, native) → item 输出缓冲(command_output_page)。
+    outputs: Mutex<HashMap<SessionSlot, HashMap<String, OutputBuffer>>>,
+    /// 已登记 adapter watcher 的会话(仅 Codex 槽位)。
+    watchers: Mutex<HashSet<SessionSlot>>,
+    /// 已接 UploadLifecycle/PowerCoordinator watcher 的会话(每会话一次;仅 Codex)。
+    lifecycle_wired: Mutex<HashSet<SessionSlot>>,
     /// 活跃 transfer → 取消令牌(三端联动,§22.4)。
     transfers: Mutex<HashMap<String, CancellationToken>>,
     /// 上传句柄登记(transfer_id → upload handle token;v1 TransferResult 无
@@ -162,6 +186,8 @@ struct RuntimeInner {
     list_refresh_at: Mutex<Option<std::time::Instant>>,
     battery_powered: Mutex<bool>,
     stop: CancellationToken,
+    /// ZCode Hook 审批通路(ZC-01 原型;attach 后生效,未 attach 时零开销)。
+    zcode_hooks: std::sync::OnceLock<Arc<crate::zcode::ZcodeHooks>>,
 }
 
 /// Bridge 运行时。克隆廉价(内部全为句柄)。
@@ -206,6 +232,7 @@ impl BridgeRuntime {
                 list_refresh_at: Mutex::new(None),
                 battery_powered: Mutex::new(false),
                 stop: CancellationToken::new(),
+                zcode_hooks: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -224,6 +251,22 @@ impl BridgeRuntime {
 
     pub fn adapter(&self) -> &CodexAdapter {
         &self.inner.adapter
+    }
+
+    /// 关联 ZCode Hook 审批通路(幂等;首次关联生效)。
+    pub fn attach_zcode_hooks(&self, hooks: Arc<crate::zcode::ZcodeHooks>) {
+        let _ = self.inner.zcode_hooks.set(hooks);
+    }
+
+    /// 外部事件源(ZCode Hook 等)经现有事件通道分发(§17.4 语义不变:
+    /// 无订阅者时事件丢弃,不缓冲)。
+    pub async fn publish_external_event(
+        self: &Arc<Self>,
+        key: &dm::SessionKey,
+        event: dm::DomainEvent,
+    ) {
+        self.note_event(key, &event);
+        self.dispatch_domain_event(key, event).await;
     }
 
     /// 已签发的上传句柄(transfer_id → handle token;上层交给 Codex 的
@@ -385,25 +428,25 @@ impl BridgeRuntime {
             self.establish_list_stream(String::new(), None).await;
         }
         // ③ 详情流重建;活跃但无详情订阅的会话登记观察(§14 完成检测)。
-        let stream_sessions: Vec<String> = {
+        let stream_slots: Vec<SessionSlot> = {
             let state = self.inner.state.lock();
             state.session_streams.keys().cloned().collect()
         };
-        for native in stream_sessions {
-            self.establish_session_stream(&native, String::new(), None)
+        for slot in stream_slots {
+            self.establish_session_stream(&slot, String::new(), None)
                 .await;
         }
-        let active_sessions: Vec<String> = {
+        let active_slots: Vec<SessionSlot> = {
             self.inner
                 .sessions
                 .lock()
                 .iter()
-                .filter(|(_, c)| c.turn_active)
+                .filter(|(slot, c)| c.turn_active && slot.0 == dm::AgentKind::CodexDesktop)
                 .map(|(k, _)| k.clone())
                 .collect()
         };
-        for native in active_sessions {
-            let key = dm::SessionKey::codex(self.inner.device_id.clone(), native);
+        for slot in active_slots {
+            let key = slot.key(&self.inner.device_id);
             self.attach_session(&key).await;
         }
     }
@@ -476,8 +519,17 @@ impl BridgeRuntime {
                 self.establish_list_stream(correlation, upstream_id).await;
             }
             Some(pb::subscribe::Target::Session(key)) => {
-                let key = pm::session_key_from_proto(&key);
-                self.establish_session_stream(&key.native_session_id, correlation, upstream_id)
+                // 未知/缺失 agent_kind 显式拒绝,不默认当作 Codex(ZC-02)。
+                let Some(key) = pm::session_key_from_proto(&key) else {
+                    self.send_protocol_error(
+                        &correlation,
+                        dm::StableErrorCode::CapabilityUnsupported,
+                        "subscribe target has unknown agent kind",
+                    );
+                    return;
+                };
+                let slot = SessionSlot::of(&key);
+                self.establish_session_stream(&slot, correlation, upstream_id)
                     .await;
             }
             None => {
@@ -515,31 +567,18 @@ impl BridgeRuntime {
             {
                 Some(None)
             } else {
+                // 直接回推流所属槽位(含 agentKind;ZC-02),不再解析 stream_id。
                 state
                     .session_streams
                     .values()
                     .find(|s| s.stream_id == stream_id)
-                    .map(|s| {
-                        // 回推 native id:本地约定 "session:{native}",上游约定
-                        // "u-{device}-sess-{native}"(Relay 分配)。
-                        Some(
-                            s.stream_id
-                                .strip_prefix("session:")
-                                .map(str::to_string)
-                                .or_else(|| {
-                                    s.stream_id
-                                        .rsplit_once("-sess-")
-                                        .map(|(_, native)| native.to_string())
-                                })
-                                .unwrap_or_else(|| s.stream_id.clone()),
-                        )
-                    })
+                    .map(|s| s.slot.clone())
             }
         };
         match target {
             Some(None) => self.establish_list_stream(correlation, None).await,
-            Some(Some(native)) => {
-                self.establish_session_stream(&native, correlation, None)
+            Some(Some(slot)) => {
+                self.establish_session_stream(&slot, correlation, None)
                     .await
             }
             None => {}
@@ -566,6 +605,7 @@ impl BridgeRuntime {
             let epoch = state.epoch_counter;
             let stream = state.list_stream.get_or_insert_with(|| StreamState {
                 stream_id: "list".to_owned(),
+                slot: None,
                 epoch,
                 next_sequence: 1,
                 buffering: false,
@@ -585,6 +625,7 @@ impl BridgeRuntime {
         self.send_subscribed(&correlation, &stream_id, epoch);
 
         // 列表快照(§11.1):摘要 + 队列状态覆盖(§10.6;队列正文不出 Bridge)。
+        // ZC-02:ZCode 会话摘要(Hook 观察 + pending 注册表)一并纳入列表。
         let page = self
             .inner
             .adapter
@@ -600,6 +641,16 @@ impl BridgeRuntime {
             // 完整 history snapshot 只在详情订阅/运行态查询时读取，避免一个
             // 大历史任务阻塞其他任务的首屏与控制命令。
             summaries.push(pm::session_summary_to_proto(&summary));
+        }
+        if let Some(zcode) = self.inner.zcode_hooks.get() {
+            for summary in zcode.list_summaries() {
+                let key = summary.session_key.clone();
+                let mut proto = pm::session_summary_to_proto(&summary);
+                if let Ok(queue) = self.queue().queue_status(&key).await {
+                    proto.queue_state = pm::queue_state_to_proto(queue.state) as i32;
+                }
+                summaries.push(proto);
+            }
         }
         let batch = pb::SessionSummaryBatch {
             summaries,
@@ -631,23 +682,24 @@ impl BridgeRuntime {
 
     async fn establish_session_stream(
         self: &Arc<Self>,
-        native: &str,
+        slot: &SessionSlot,
         correlation: String,
         upstream_id: Option<String>,
     ) {
-        let key = dm::SessionKey::codex(self.inner.device_id.clone(), native.to_string());
+        let key = slot.key(&self.inner.device_id);
         self.attach_session(&key).await;
 
         let (stream_id, epoch) = {
             let mut state = self.inner.state.lock();
             state.epoch_counter += 1;
             let epoch = state.epoch_counter;
-            let stream_id = format!("session:{native}");
+            let stream_id = format!("session:{}:{}", slot.0.kind_name(), slot.1);
             let stream = state
                 .session_streams
-                .entry(native.to_string())
+                .entry(slot.clone())
                 .or_insert_with(|| StreamState {
                     stream_id: stream_id.clone(),
+                    slot: Some(slot.clone()),
                     epoch,
                     next_sequence: 1,
                     buffering: false,
@@ -666,16 +718,43 @@ impl BridgeRuntime {
         };
         self.send_subscribed(&correlation, &stream_id, epoch);
 
-        // RuntimeSnapshot(§11.2):在线 Bridge 权威来源;队列状态并入。
-        match self.inner.adapter.refresh_snapshot(&key).await {
-            Ok(mut snapshot) => {
-                if let Ok(queue) = self.queue().queue_status(&key).await {
-                    snapshot.queue = queue;
+        // RuntimeSnapshot(§11.2):按 agentKind 选择权威来源(ZC-02)。
+        // Codex = adapter 投影;ZCode = Hook 观察 + pending 注册表镜像。
+        let snapshot_result: Result<dm::RuntimeSnapshot, dm::BridgeError> = match slot.0 {
+            dm::AgentKind::CodexDesktop => {
+                let mut snapshot = self
+                    .inner
+                    .adapter
+                    .refresh_snapshot(&key)
+                    .await
+                    .map_err(adapter_err);
+                if let Ok(snapshot) = snapshot.as_mut() {
+                    if let Ok(queue) = self.queue().queue_status(&key).await {
+                        snapshot.queue = queue;
+                    }
                 }
-                self.note_snapshot(native, &snapshot);
+                snapshot
+            }
+            dm::AgentKind::ZcodeDesktop => match self.inner.zcode_hooks.get() {
+                Some(zcode) => {
+                    let mut snapshot = zcode.runtime_snapshot(&key);
+                    if let Ok(queue) = self.queue().queue_status(&key).await {
+                        snapshot.queue = queue;
+                    }
+                    Ok(snapshot)
+                }
+                None => Err(dm::BridgeError::new(
+                    dm::StableErrorCode::SessionNotFound,
+                    "zcode hook path is not attached",
+                )),
+            },
+        };
+        match snapshot_result {
+            Ok(snapshot) => {
+                self.note_snapshot(slot, &snapshot);
                 let proto = pm::runtime_snapshot_to_proto(&snapshot);
                 let mut state = self.inner.state.lock();
-                if let Some(stream) = state.session_streams.get_mut(native) {
+                if let Some(stream) = state.session_streams.get_mut(slot) {
                     stream.buffering = false;
                     let sequence = stream.assign_sequence();
                     self.send_stream_locked(
@@ -702,10 +781,10 @@ impl BridgeRuntime {
             }
             Err(err) => {
                 // 快照不可得:关缓冲并以 ProtocolError 说明(§27.6)。
-                tracing::debug!(code = %err.code(), "runtime snapshot unavailable for stream");
-                self.send_protocol_error(&correlation, err.code(), err.to_string());
+                tracing::debug!(code = %err.code, "runtime snapshot unavailable for stream");
+                self.send_protocol_error(&correlation, err.code, err.to_string());
                 let mut state = self.inner.state.lock();
-                if let Some(stream) = state.session_streams.get_mut(native) {
+                if let Some(stream) = state.session_streams.get_mut(slot) {
                     stream.buffering = false;
                 }
             }
@@ -731,22 +810,25 @@ impl BridgeRuntime {
 
     /// 登记 adapter watcher(每会话一次)并把事件泵入出站流;
     /// UploadLifecycle 与 PowerCoordinator 接同一 adapter 事件流(§14/§19)。
+    /// ZC-02:仅 Codex 槽位接 adapter;ZCode 会话为事件驱动(外部事件源),
+    /// 只登记缓存,不进 Codex 观察/上传/电源链路。
     pub async fn attach_session(self: &Arc<Self>, key: &dm::SessionKey) {
-        let native = key.native_session_id.clone();
+        let slot = SessionSlot::of(key);
         self.inner
             .sessions
             .lock()
-            .entry(native.clone())
+            .entry(slot.clone())
             .or_default();
-        if self.inner.watchers.lock().contains(&native) {
+        if slot.0 != dm::AgentKind::CodexDesktop || self.inner.watchers.lock().contains(&slot) {
             return;
         }
+        let native = key.native_session_id.clone();
         let (tx, mut rx) = mpsc::channel::<dm::DomainEvent>(1024);
         if self.inner.adapter.subscribe(key, tx).await.is_err() {
             return;
         }
-        self.inner.watchers.lock().insert(native.clone());
-        if self.inner.lifecycle_wired.lock().insert(native.clone()) {
+        self.inner.watchers.lock().insert(slot.clone());
+        if self.inner.lifecycle_wired.lock().insert(slot.clone()) {
             let _ = self
                 .inner
                 .uploads
@@ -765,12 +847,15 @@ impl BridgeRuntime {
                 runtime.note_event(&pump_key, &event);
                 runtime.dispatch_domain_event(&pump_key, event).await;
             }
-            runtime.inner.watchers.lock().remove(&native);
+            runtime.inner.watchers.lock().remove(&SessionSlot(
+                dm::AgentKind::CodexDesktop,
+                native,
+            ));
         });
     }
 
     async fn dispatch_domain_event(self: &Arc<Self>, key: &dm::SessionKey, event: dm::DomainEvent) {
-        let native = key.native_session_id.clone();
+        let slot = SessionSlot::of(key);
         // 摘要事件:并入 Bridge 本地队列状态(§10.6)。
         let mut proto_event = match pm::domain_event_to_proto(&event) {
             Some(event) => event,
@@ -787,7 +872,7 @@ impl BridgeRuntime {
         let is_summary = matches!(event, dm::DomainEvent::SessionSummaryChanged { .. });
         {
             let mut state = self.inner.state.lock();
-            if let Some(stream) = state.session_streams.get_mut(&native) {
+            if let Some(stream) = state.session_streams.get_mut(&slot) {
                 if stream.buffering {
                     stream.buffer.push(proto_event.clone());
                 } else {
@@ -847,7 +932,10 @@ impl BridgeRuntime {
 
     async fn handle_query(self: &Arc<Self>, request: pb::QueryRequest, correlation: String) {
         use pb::query_request::Query;
-        let session_key = request.session_key.as_ref().map(pm::session_key_from_proto);
+        let session_key = request
+            .session_key
+            .as_ref()
+            .and_then(pm::session_key_from_proto);
         let result: Result<pb::query_response::Result, dm::BridgeError> = match request.query {
             Some(Query::RuntimeSnapshot(_)) => self.query_runtime_snapshot(session_key).await,
             Some(Query::HistoryPage(page)) => {
@@ -908,16 +996,28 @@ impl BridgeRuntime {
         session_key: Option<dm::SessionKey>,
     ) -> Result<pb::query_response::Result, dm::BridgeError> {
         let key = self.require_key(session_key)?;
-        let mut snapshot = self
-            .inner
-            .adapter
-            .refresh_snapshot(&key)
-            .await
-            .map_err(adapter_err)?;
+        // 按 agentKind 选择权威来源(ZC-02);ZCode 无 Hook 通路时明确拒绝。
+        let mut snapshot = match key.agent_kind {
+            dm::AgentKind::CodexDesktop => self
+                .inner
+                .adapter
+                .refresh_snapshot(&key)
+                .await
+                .map_err(adapter_err)?,
+            dm::AgentKind::ZcodeDesktop => {
+                let zcode = self.inner.zcode_hooks.get().ok_or_else(|| {
+                    dm::BridgeError::new(
+                        dm::StableErrorCode::SessionNotFound,
+                        "zcode hook path is not attached",
+                    )
+                })?;
+                zcode.runtime_snapshot(&key)
+            }
+        };
         if let Ok(queue) = self.queue().queue_status(&key).await {
             snapshot.queue = queue;
         }
-        self.note_snapshot(&key.native_session_id, &snapshot);
+        self.note_snapshot(&SessionSlot::of(&key), &snapshot);
         Ok(pb::query_response::Result::RuntimeSnapshot(
             pm::runtime_snapshot_to_proto(&snapshot),
         ))
@@ -930,6 +1030,14 @@ impl BridgeRuntime {
         page_size: u32,
     ) -> Result<pb::query_response::Result, dm::BridgeError> {
         let key = self.require_key(session_key)?;
+        // ZC-02:ZCode Hook 通路无历史能力,明确 NOT_SUPPORTED,
+        // 不以 200 空页伪装(04 §8.9)。
+        if key.agent_kind != dm::AgentKind::CodexDesktop {
+            return Err(dm::BridgeError::new(
+                dm::StableErrorCode::CapabilityUnsupported,
+                "history is not available for zcode hook sessions",
+            ));
+        }
         // §27.5:默认 50、最大 200(0 → 默认)。
         let page_size = if page_size == 0 {
             50
@@ -955,6 +1063,13 @@ impl BridgeRuntime {
         page: &pb::CommandOutputPageQuery,
     ) -> Result<pb::query_response::Result, dm::BridgeError> {
         let key = self.require_key(session_key)?;
+        // ZC-02:ZCode Hook 通路无输出流,明确不支持。
+        if key.agent_kind != dm::AgentKind::CodexDesktop {
+            return Err(dm::BridgeError::new(
+                dm::StableErrorCode::CapabilityUnsupported,
+                "command output is not available for zcode hook sessions",
+            ));
+        }
         let item = page.item_id.as_ref().ok_or_else(|| {
             dm::BridgeError::new(dm::StableErrorCode::InternalError, "missing item id")
         })?;
@@ -967,7 +1082,7 @@ impl BridgeRuntime {
         let buffered = {
             let outputs = self.inner.outputs.lock();
             outputs
-                .get(&key.native_session_id)
+                .get(&SessionSlot::of(&key))
                 .and_then(|items| items.get(&item.id))
                 .map(|buffer| {
                     let start = (offset as usize).min(buffer.data.len());
@@ -1082,6 +1197,14 @@ impl BridgeRuntime {
         dm::BridgeError,
     > {
         let key = self.require_key(session_key)?;
+        // ZC-02:Git 只读能力仅对 Codex 会话;ZCode 无 cwd 投影,明确拒绝,
+        // 不允许同 native id 时误读 Codex 会话的工作区。
+        if key.agent_kind != dm::AgentKind::CodexDesktop {
+            return Err(dm::BridgeError::new(
+                dm::StableErrorCode::SessionNotFound,
+                "git data is not available for this agent kind",
+            ));
+        }
         let git = self.inner.git.clone().ok_or_else(|| {
             dm::BridgeError::new(
                 dm::StableErrorCode::InternalError,
@@ -1114,6 +1237,14 @@ impl BridgeRuntime {
         meta: &pb::FileMetadataQuery,
     ) -> Result<pb::FileMetadataData, dm::BridgeError> {
         let key = self.require_key(session_key)?;
+        // 文件授权按原生会话 ID 绑定;非 Codex 会话不进入文件面(ZC-02,
+        // 不复制 ZCode 专用版本),避免同 native id 时误用 Codex 授权。
+        if key.agent_kind != dm::AgentKind::CodexDesktop {
+            return Err(dm::BridgeError::new(
+                dm::StableErrorCode::FileOutsideScope,
+                "file transfers are not available for this agent kind",
+            ));
+        }
         let verified = self
             .inner
             .grants
@@ -1182,6 +1313,52 @@ impl BridgeRuntime {
     // -----------------------------------------------------------------
 
     async fn handle_command(self: &Arc<Self>, request: pb::CommandRequest, correlation: String) {
+        // ZCode Hook 审批/问答分派(ZC-01 原型):approval/question id 命中
+        // 本机 pending 注册表时由 Bridge 原子决定并直达等待中的 helper,
+        // 不经 Codex adapter 链路(能力 gate 与快照均属 Codex 语义)。
+        // 未命中则保持原 Codex 路径,行为零变化。
+        if let Some(zcode) = self.inner.zcode_hooks.get() {
+            // P1-6:分派前核对设备/agentKind/nativeSessionId 与登记绑定一致。
+            if zcode.matches_command(request.session_key.as_ref(), request.payload.as_ref()) {
+                let resolved = zcode.resolve_command(request.payload.as_ref()).await;
+                self.send_connection(
+                    &correlation,
+                    pb::envelope::Payload::CommandAccepted(pb::CommandAccepted {
+                        request_id: request.request_id.clone(),
+                        status: pb::CommandReceiptStatus::ReceiptAcceptedByBridge as i32,
+                        accepted_at: Some(now_timestamp()),
+                    }),
+                );
+                match resolved {
+                    Some(Ok(_)) => {
+                        self.send_command_result(
+                            &correlation,
+                            &request.request_id,
+                            pb::CommandReceiptStatus::ReceiptCompleted,
+                            None,
+                        );
+                    }
+                    Some(Err(err)) => {
+                        self.send_command_result(
+                            &correlation,
+                            &request.request_id,
+                            pb::CommandReceiptStatus::ReceiptRejected,
+                            Some(pm::stable_error_to_proto(err.code)),
+                        );
+                    }
+                    // resolve_command 只在有命中时返回 Some;命中后不会为 None。
+                    None => {
+                        self.send_command_result(
+                            &correlation,
+                            &request.request_id,
+                            pb::CommandReceiptStatus::ReceiptRejected,
+                            Some(pm::stable_error_to_proto(dm::StableErrorCode::InternalError)),
+                        );
+                    }
+                }
+                return;
+            }
+        }
         let caps = self.inner.gateway.current_capabilities();
         let domain_request = match pm::command_request_from_proto(&request, &caps) {
             Ok(request) => request,
@@ -1195,6 +1372,35 @@ impl BridgeRuntime {
                 return;
             }
         };
+        // ZC-02 正式路由:ZCode 会话只支持 Hook 审批/问答决定(上方按
+        // invoke_id 命中注册表处理);未命中(已过期/未知)或其余操作明确
+        // 拒绝,绝不落入 Codex 链路。
+        if domain_request.session_key.agent_kind == dm::AgentKind::ZcodeDesktop {
+            let is_answer = matches!(
+                request.payload,
+                Some(pb::command_request::Payload::AnswerApproval(_))
+                    | Some(pb::command_request::Payload::AnswerQuestion(_))
+            );
+            let (code, message) = if is_answer {
+                (
+                    dm::StableErrorCode::ApprovalExpired,
+                    "zcode decision window has closed (unknown or expired invoke)",
+                )
+            } else {
+                (
+                    dm::StableErrorCode::CapabilityUnsupported,
+                    "operation not supported for zcode hook sessions",
+                )
+            };
+            self.send_command_result(
+                &correlation,
+                &request.request_id,
+                pb::CommandReceiptStatus::ReceiptRejected,
+                Some(pm::stable_error_to_proto(code)),
+            );
+            tracing::debug!(code = %code, message, "zcode session command rejected");
+            return;
+        }
         let request_id = domain_request.request_id;
         // §15.3 队列替换:gateway 的 QueueNextTurn 是 set(replace=false);
         // REPLACE 先清除既有条目再排队(两次本地 SQLite 操作,非原子)。
@@ -1308,9 +1514,15 @@ impl BridgeRuntime {
     // 观察回调(observe.rs 调用;全部为缓存/轻量操作)
     // -----------------------------------------------------------------
 
+    /// 已登记观察的 Codex 会话 ID(§14 观察循环只轮询 Codex adapter 投影;
+    /// ZCode 会话为事件驱动,不轮询)。
     pub(crate) fn known_session_ids(&self) -> Vec<String> {
         let sessions = self.inner.sessions.lock();
-        let mut ids: Vec<String> = sessions.keys().cloned().collect();
+        let mut ids: Vec<String> = sessions
+            .keys()
+            .filter(|slot| slot.0 == dm::AgentKind::CodexDesktop)
+            .map(|slot| slot.1.clone())
+            .collect();
         ids.sort();
         ids
     }
@@ -1331,10 +1543,11 @@ impl BridgeRuntime {
     }
 
     pub(crate) fn observe_state_of(&self, native: &str) -> Option<observe::SessionObserveState> {
-        let cache = *self.inner.sessions.lock().get(native)?;
+        let slot = SessionSlot(dm::AgentKind::CodexDesktop, native.to_string());
+        let cache = *self.inner.sessions.lock().get(&slot)?;
         let state = self.inner.state.lock();
         Some(observe::SessionObserveState {
-            has_detail_subscription: state.session_streams.contains_key(native),
+            has_detail_subscription: state.session_streams.contains_key(&slot),
             has_list_subscription: state.list_stream.is_some(),
             turn_active: cache.turn_active,
         })
@@ -1344,16 +1557,17 @@ impl BridgeRuntime {
         self.inner.stop.cancelled().await;
     }
 
-    /// 单次轻量观察(§14):投影快照(不读完整历史)→ 差分缓存 →
-    /// 详情流低频确认 / idle 列表摘要刷新 / 电源状态推进。
+    /// 单次轻量观察(§14;仅 Codex 会话):投影快照(不读完整历史)→
+    /// 差分缓存 → 详情流低频确认 / idle 列表摘要刷新 / 电源状态推进。
     pub(crate) async fn observe_session(self: &Arc<Self>, native: &str) {
-        let key = dm::SessionKey::codex(self.inner.device_id.clone(), native.to_string());
+        let slot = SessionSlot(dm::AgentKind::CodexDesktop, native.to_string());
+        let key = slot.key(&self.inner.device_id);
         // 只对已有投影的会话观察:避免为未跟随会话触发 adapter 的快照等待。
         if !self
             .inner
             .sessions
             .lock()
-            .get(native)
+            .get(&slot)
             .copied()
             .unwrap_or_default()
             .has_snapshot
@@ -1366,13 +1580,13 @@ impl BridgeRuntime {
         if let Ok(queue) = self.queue().queue_status(&key).await {
             snapshot.queue = queue;
         }
-        let previous = self.note_snapshot(native, &snapshot);
+        let previous = self.note_snapshot(&slot, &snapshot);
         let changed = previous.map(|p| p.runtime_revision) != Some(snapshot.runtime_revision);
 
         // 详情订阅:revision 变化 → 低频确认快照(§14 snapshot 只作补偿/确认)。
         {
             let mut state = self.inner.state.lock();
-            if let Some(stream) = state.session_streams.get_mut(native) {
+            if let Some(stream) = state.session_streams.get_mut(&slot) {
                 if !stream.buffering && changed {
                     let sequence = stream.assign_sequence();
                     self.send_stream_locked(
@@ -1435,6 +1649,17 @@ impl BridgeRuntime {
             }
             summaries.push(pm::session_summary_to_proto(&summary));
         }
+        // 全量快照必须包含 ZCode 会话,否则会把它们从列表中"刷掉"(ZC-02)。
+        if let Some(zcode) = self.inner.zcode_hooks.get() {
+            for summary in zcode.list_summaries() {
+                let key = summary.session_key.clone();
+                let mut proto = pm::session_summary_to_proto(&summary);
+                if let Ok(queue) = self.queue().queue_status(&key).await {
+                    proto.queue_state = pm::queue_state_to_proto(queue.state) as i32;
+                }
+                summaries.push(proto);
+            }
+        }
         let batch = pb::SessionSummaryBatch {
             summaries,
             snapshot: true,
@@ -1477,10 +1702,10 @@ impl BridgeRuntime {
     // -----------------------------------------------------------------
 
     fn note_event(&self, key: &dm::SessionKey, event: &dm::DomainEvent) {
-        let native = key.native_session_id.clone();
+        let slot = SessionSlot::of(key);
         {
             let mut sessions = self.inner.sessions.lock();
-            let cache = sessions.entry(native.clone()).or_default();
+            let cache = sessions.entry(slot.clone()).or_default();
             match event {
                 dm::DomainEvent::TurnLifecycle { phase, .. } => {
                     cache.turn_active = matches!(
@@ -1505,7 +1730,7 @@ impl BridgeRuntime {
             } => {
                 let mut outputs = self.inner.outputs.lock();
                 let buffer = outputs
-                    .entry(native)
+                    .entry(slot)
                     .or_default()
                     .entry(item_id.id.clone())
                     .or_default();
@@ -1520,7 +1745,7 @@ impl BridgeRuntime {
             dm::DomainEvent::OutputReplace { item_id, bytes, .. } => {
                 let mut outputs = self.inner.outputs.lock();
                 let buffer = outputs
-                    .entry(native)
+                    .entry(slot)
                     .or_default()
                     .entry(item_id.id.clone())
                     .or_default();
@@ -1530,7 +1755,7 @@ impl BridgeRuntime {
             dm::DomainEvent::OutputFinal { item_id, .. } => {
                 let mut outputs = self.inner.outputs.lock();
                 if let Some(buffer) = outputs
-                    .get_mut(&native)
+                    .get_mut(&slot)
                     .and_then(|items| items.get_mut(&item_id.id))
                 {
                     buffer.is_final = true;
@@ -1541,9 +1766,9 @@ impl BridgeRuntime {
     }
 
     /// 记录快照缓存;返回先前缓存(观察差分用)。
-    fn note_snapshot(&self, native: &str, snapshot: &dm::RuntimeSnapshot) -> Option<SessionCache> {
+    fn note_snapshot(&self, slot: &SessionSlot, snapshot: &dm::RuntimeSnapshot) -> Option<SessionCache> {
         let mut sessions = self.inner.sessions.lock();
-        let cache = sessions.entry(native.to_string()).or_default();
+        let cache = sessions.entry(slot.clone()).or_default();
         let previous = *cache;
         cache.runtime_revision = snapshot.runtime_revision;
         cache.has_snapshot = true;

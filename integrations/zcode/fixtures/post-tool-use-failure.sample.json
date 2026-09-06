@@ -1,0 +1,11 @@
+{
+  "session_id": "sess_fixture_0001",
+  "transcript_path": "/tmp/zcode-fixture/transcript.jsonl",
+  "cwd": "/workspace/fixture-demo",
+  "hook_event_name": "PostToolUseFailure",
+  "tool_name": "Bash",
+  "tool_input": { "command": "exit 3" },
+  "tool_use_id": "tool_fixture_0002",
+  "error": "fixture error message",
+  "is_interrupt": false
+}

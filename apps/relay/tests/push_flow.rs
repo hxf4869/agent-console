@@ -247,6 +247,7 @@ async fn push_trigger_matrix_mute_switches_and_cleanup() {
     let seen = wait_seen(&sink, 1).await;
     assert_eq!(decoded(&seen, 0)["body"], "任务已完成");
     assert_eq!(decoded(&seen, 0)["title"], serde_json::Value::Null);
+    assert_eq!(decoded(&seen, 0)["kind"], "turnCompleted");
     assert_eq!(
         decoded(&seen, 0)["sessionId"],
         serde_json::json!(session_id)
@@ -281,6 +282,7 @@ async fn push_trigger_matrix_mute_switches_and_cleanup() {
         .await;
     let seen = wait_seen(&sink, 2).await;
     assert_eq!(decoded(&seen, 1)["body"], "任务未完成,已失败");
+    assert_eq!(decoded(&seen, 1)["kind"], "turnFailed");
 
     // 4. session mute 覆盖事件开关(§24):静音后 interrupted 不推送。
     let patch = reqwest::Client::new()
@@ -328,6 +330,7 @@ async fn push_trigger_matrix_mute_switches_and_cleanup() {
         .await;
     let seen = wait_seen(&sink, 3).await;
     assert_eq!(decoded(&seen, 2)["body"], "任务已中断");
+    assert_eq!(decoded(&seen, 2)["kind"], "turnInterrupted");
 
     // 6. 事件开关关闭:waitingApproval=false → 审批不推送(此前该 kind 从未推送,
     //    不受去重影响,可区分开关与去重)。
@@ -368,6 +371,7 @@ async fn push_trigger_matrix_mute_switches_and_cleanup() {
         .await;
     let seen = wait_seen(&sink, 4).await;
     assert_eq!(decoded(&seen, 3)["body"], "任务在等待风险审批");
+    assert_eq!(decoded(&seen, 3)["kind"], "waitingApproval");
     assert_eq!(decoded(&seen, 3)["title"], "推送测试");
 
     // 8. 410 → 订阅删除(§24 失效清理)。新会话(独立去重键)+ COMPLETED 触发推送,
@@ -483,4 +487,34 @@ async fn push_subscription_crud_and_disabled_without_config() {
         .await;
     // 摘要事件正常扇出、发送禁用路径无异常即视为通过。
     tokio::time::sleep(Duration::from_millis(400)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_vapid_public_key_endpoint() {
+    // 未配置 VAPID:enabled=false,publicKey=null(前端据此隐藏订阅入口)。
+    let env = setup(&[]).await;
+    let config: serde_json::Value =
+        get(&env.relay, "/agent-console/api/push/vapid-public-key")
+            .await
+            .json()
+            .await
+            .expect("config");
+    assert_eq!(config["enabled"], false);
+    assert_eq!(config["publicKey"], serde_json::Value::Null);
+
+    // fake sink + VAPID_PUBLIC_KEY:enabled=true 且公钥原样返回。
+    let (sink_base, _sink) = start_fake_sink().await;
+    let env = setup(&[
+        ("RELAY_PUSH_FAKE_SINK", sink_base.as_str()),
+        ("VAPID_PUBLIC_KEY", "test-vapid-public-key"),
+    ])
+    .await;
+    let config: serde_json::Value =
+        get(&env.relay, "/agent-console/api/push/vapid-public-key")
+            .await
+            .json()
+            .await
+            .expect("config");
+    assert_eq!(config["enabled"], true);
+    assert_eq!(config["publicKey"], "test-vapid-public-key");
 }

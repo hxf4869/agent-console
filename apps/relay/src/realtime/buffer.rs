@@ -5,14 +5,27 @@
 //! 2. 可由 snapshot 恢复(Recoverable):计划、命令状态、文件/Git 摘要、item 可见内容。
 //! 3. 可合并(Mergeable):高频输出增量、Token 用量更新、presence、心跳。
 //!
+//! 合并边界:
+//! - StreamBuffer(回放窗口)内的合并只服务于"重建快照后重放":调用方
+//!   (realtime::DStream)仅在窗口可证明连续时原样重放,否则重新向上游取
+//!   快照,绝不把压缩后的窗口当作同一 epoch 的连续事件直接续播。
+//! - Outbox(已分配下游 sequence 的发送队列)不做任何再合并:相邻序号
+//!   必须连续交付,Direct 控制消息顺序不可被压缩跨越;过载走显式
+//!   SlowConsumer/过载关闭恢复。
+//! - 合并 key 必须含流身份(epoch/设备经 `MergeInfo::scoped` 前缀),
+//!   生命周期/审批/Direct 无合并信息,不跨越。
+//!
 //! 压力策略:先合并第 3 类(相邻同 key 且偏移连续的输出增量无损合并、
 //! ReplaceLatest 只保留最新);仍不足时向慢 consumer 发 ResyncRequired 并断开,
 //! 绝不阻塞 Bridge 上游、绝不丢第 1 类。
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
-    time::Instant,
+    sync::{
+        atomic::Ordering,
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
+    },
+    time::{Duration, Instant},
 };
 
 use agent_console_protocol::{
@@ -51,6 +64,24 @@ pub enum MergeInfo {
     ReplaceLatest { key: String },
 }
 
+impl MergeInfo {
+    /// 给合并 key 附加流身份前缀(`stream/epoch/device`)。同一 DStream 的列表流
+    /// 会聚合多台上游设备,跨设备/跨流的同 item ID 不得交叉合并或替换;
+    /// Direct/生命周期/审批本就无合并信息,不跨越(§17.6)。
+    pub fn scoped(self, prefix: &str) -> Self {
+        match self {
+            MergeInfo::OutputAppend { key, offset, len } => MergeInfo::OutputAppend {
+                key: format!("{prefix}/{key}"),
+                offset,
+                len,
+            },
+            MergeInfo::ReplaceLatest { key } => MergeInfo::ReplaceLatest {
+                key: format!("{prefix}/{key}"),
+            },
+        }
+    }
+}
+
 /// 待发送/缓冲的流帧:保留解码后的 Envelope 以便重编号与合并,编码结果缓存一次。
 pub struct Frame {
     pub env: Envelope,
@@ -58,7 +89,7 @@ pub struct Frame {
     pub merge: Option<MergeInfo>,
     pub ts: Instant,
     pub bytes_len: usize,
-    encoded: OnceLock<WireBytes>,
+    encoded: OnceLock<Option<WireBytes>>,
 }
 
 impl Frame {
@@ -74,14 +105,11 @@ impl Frame {
         })
     }
 
-    /// 编码后的帧(缓存)。编码失败(理论不可达:源帧已过 1 MiB 校验)返回空帧。
-    pub fn encoded(&self) -> WireBytes {
+    /// 编码后的帧(缓存)。编码失败返回 None:调用方必须终止对应流并走恢复
+    /// 路径,绝不发送空二进制假帧(§17.6 单帧上限)。
+    pub fn encoded(&self) -> Option<WireBytes> {
         self.encoded
-            .get_or_init(|| {
-                encode_envelope(&self.env)
-                    .map(Into::into)
-                    .unwrap_or_default()
-            })
+            .get_or_init(|| encode_envelope(&self.env).ok().map(Into::into))
             .clone()
     }
 
@@ -217,10 +245,12 @@ fn merge_pair(a: &Frame, b: &Frame) -> Option<Arc<Frame>> {
         },
         _ => return None,
     };
-    if app_a.bytes.len() + bytes_b.len() > MAX_FRAME_BYTES {
+    app_a.bytes.extend_from_slice(bytes_b);
+    // 合并前检查完整 protobuf envelope 编码长度:只看输出字节之和可能仍越
+    // 单帧上限;越限则放弃合并(保留两帧),绝不产生编码失败的帧。
+    if env.encoded_len() > MAX_FRAME_BYTES {
         return None;
     }
-    app_a.bytes.extend_from_slice(bytes_b);
     Some(Frame::new(
         env,
         a.kind,
@@ -418,7 +448,7 @@ impl StreamBuffer {
 }
 
 // ---------------------------------------------------------------------------
-// Browser 发送队列(有界;慢 consumer 处理)
+// Browser 发送队列(有界 FIFO;慢 consumer 处理)
 // ---------------------------------------------------------------------------
 
 pub enum OutItem {
@@ -432,15 +462,38 @@ pub enum OutItem {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushError {
-    /// 队列满且合并后仍满:该 subscriber 是慢 consumer。
+    /// 队列已满(帧数或排队字节超预算):该 subscriber 是慢 consumer。
     SlowConsumer,
     /// 队列已关闭。
     Closed,
 }
 
+/// 诊断计数(§26;只用现有日志输出,不引入监控平台)。
+pub static OUTBOX_OVERLOAD_CLOSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static WS_WRITE_TIMEOUTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// 每 Browser 排队字节上限(§17.6:条数之外必须同时限字节;单个合法快照
+/// ≤ 1 MiB 必须能容纳)。与 `limits::BROWSER_QUEUE_MAX_FRAMES` 同级的连接级预算。
+pub const BROWSER_QUEUE_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// 关键直发消息(回执/Resync/错误)在普通帧预算之外保留的固定小空间;
+/// 控制区也耗尽时直接关闭连接,由客户端重连后用快照与回执查询恢复。
+pub const DIRECT_RESERVE_BYTES: usize = 1024 * 1024;
+/// 单次 sink 写入的可取消时间预算;超时丢弃整个连接,不在原 sink 上继续写半帧。
+pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// 每 Browser 有界发送队列(§17.6)。
+///
+/// 不变量:
+/// - 已分配下游 sequence 的帧入队后不再合并/替换:Outbox 只做有界 FIFO,
+///   过载走显式 `SlowConsumer` 恢复(调用方 ResyncRequired + 断开),保证
+///   客户端看到的 sequence 连续、Direct 控制消息顺序不被压缩跨越。
+/// - Frame 受帧数与字节双预算约束;Direct 在帧预算之外占用保留区,保留区
+///   耗尽即自我关闭(过载关闭计数 +1)。
 pub struct Outbox {
     capacity: usize,
+    max_bytes: usize,
     inner: Mutex<OutboxInner>,
     notify: tokio::sync::Notify,
 }
@@ -448,16 +501,20 @@ pub struct Outbox {
 struct OutboxInner {
     items: VecDeque<OutItem>,
     frames: usize,
+    /// 排队字节(Frame 编码长度 + Direct 字节数;Bytes 共享不重复计)。
+    bytes: usize,
     closed: bool,
 }
 
 impl Outbox {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, max_bytes: usize) -> Self {
         Self {
             capacity,
+            max_bytes,
             inner: Mutex::new(OutboxInner {
                 items: VecDeque::new(),
                 frames: 0,
+                bytes: 0,
                 closed: false,
             }),
             notify: tokio::sync::Notify::new(),
@@ -468,57 +525,84 @@ impl Outbox {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// 队列中的流帧条数(诊断用;字节预算见 `queued_bytes`)。
     pub fn len(&self) -> usize {
         self.lock().frames
+    }
+
+    /// 当前排队字节(含 Frame 与 Direct;诊断计数来源)。
+    pub fn queued_bytes(&self) -> usize {
+        self.lock().bytes
     }
 
     pub fn is_closed(&self) -> bool {
         self.lock().closed
     }
 
-    /// 推送流帧。满时先对队列做一次合并扫描;仍满则返回 `SlowConsumer`,
+    /// 推送流帧。帧数或排队字节超预算时返回 `SlowConsumer`(不入队),
     /// 由调用方发送 ResyncRequired 并断开该 subscriber,不阻塞上游。
+    /// 不做已编号帧的再合并:相邻序号必须连续交付(§17.5)。
     pub fn push_frame(&self, frame: Arc<Frame>) -> Result<(), PushError> {
         let mut g = self.lock();
         if g.closed {
             return Err(PushError::Closed);
         }
-        g.items.push_back(OutItem::Frame(frame));
-        g.frames += 1;
-        if g.frames > self.capacity {
-            let OutboxInner { items, frames, .. } = &mut *g;
-            coalesce_outbox(items, frames);
-            if g.frames > self.capacity {
-                // 撤回刚推入的帧,由调用方走 resync+断开路径。
-                if let Some(OutItem::Frame(_)) = g.items.pop_back() {
-                    g.frames -= 1;
-                }
-                return Err(PushError::SlowConsumer);
-            }
+        if g.frames + 1 > self.capacity || g.bytes + frame.bytes_len > self.max_bytes {
+            return Err(PushError::SlowConsumer);
         }
+        g.bytes += frame.bytes_len;
+        g.frames += 1;
+        g.items.push_back(OutItem::Frame(frame));
         drop(g);
         self.notify.notify_waiters();
         Ok(())
     }
 
-    /// 推送直发帧(P1 语义):关闭后丢弃;容量不足时仍入队(直发帧低频且关键)。
+    /// 推送直发帧(P1 语义):关闭后丢弃;普通帧预算之外可用保留区,
+    /// 保留区也耗尽时自我关闭(稳定 close reason),绝不无限入队。
     pub fn push_direct(&self, bytes: WireBytes) -> bool {
-        {
+        let overload = {
             let mut g = self.lock();
             if g.closed {
                 return false;
             }
-            g.items.push_back(OutItem::Direct(bytes));
+            if bytes.is_empty() {
+                // 编码失败产生的空帧绝不入队(显式错误由编码方记录)。
+                return false;
+            }
+            let over = g.bytes + bytes.len() > self.max_bytes + DIRECT_RESERVE_BYTES;
+            if !over {
+                g.bytes += bytes.len();
+                g.items.push_back(OutItem::Direct(bytes));
+            }
+            over
+        };
+        if overload {
+            OUTBOX_OVERLOAD_CLOSES.fetch_add(1, Ordering::Relaxed);
+            self.close("OUTBOX_OVERLOAD");
+            return false;
         }
         self.notify.notify_waiters();
         true
     }
 
+    /// 关闭连接(稳定 close reason)。丢弃尚未发送的可恢复流帧(重连后由
+    /// 快照恢复),保留关键直发消息,Close 项随后即发,不排在大输出后面。
     pub fn close(&self, reason: &'static str) {
         {
             let mut g = self.lock();
             if !g.closed {
                 g.closed = true;
+                g.items.retain(|item| !matches!(item, OutItem::Frame(_)));
+                g.frames = 0;
+                g.bytes = g
+                    .items
+                    .iter()
+                    .map(|i| match i {
+                        OutItem::Direct(bytes) => bytes.len(),
+                        _ => 0,
+                    })
+                    .sum();
                 g.items.push_back(OutItem::Close(reason));
             }
         }
@@ -536,8 +620,15 @@ impl Outbox {
                 let mut g = self.lock();
                 match g.items.pop_front() {
                     Some(item) => {
-                        if matches!(item, OutItem::Frame(_)) {
-                            g.frames -= 1;
+                        match &item {
+                            OutItem::Frame(f) => {
+                                g.frames -= 1;
+                                g.bytes = g.bytes.saturating_sub(f.bytes_len);
+                            }
+                            OutItem::Direct(bytes) => {
+                                g.bytes = g.bytes.saturating_sub(bytes.len());
+                            }
+                            OutItem::Close(_) => {}
                         }
                         return Some(item);
                     }
@@ -551,40 +642,6 @@ impl Outbox {
             notified.await;
         }
     }
-}
-
-/// 对 outbox 队列做一次合并扫描(只处理 Frame 项,Direct 项保持原位)。
-fn coalesce_outbox(items: &mut VecDeque<OutItem>, frames: &mut usize) {
-    let mut buf: VecDeque<Arc<Frame>> = items
-        .iter()
-        .filter_map(|i| match i {
-            OutItem::Frame(f) => Some(f.clone()),
-            _ => None,
-        })
-        .collect();
-    let before = buf.len();
-    let mut bytes = buf.iter().map(|f| f.bytes_len).sum();
-    coalesce(&mut buf, &mut bytes);
-    if buf.len() == before {
-        return;
-    }
-    let mut new_items: VecDeque<OutItem> = VecDeque::with_capacity(items.len());
-    let mut it = buf.into_iter();
-    for item in items.drain(..) {
-        match item {
-            OutItem::Frame(_) => {
-                if let Some(f) = it.next() {
-                    new_items.push_back(OutItem::Frame(f));
-                }
-            }
-            other => new_items.push_back(other),
-        }
-    }
-    *frames = new_items
-        .iter()
-        .filter(|i| matches!(i, OutItem::Frame(_)))
-        .count();
-    *items = new_items;
 }
 
 #[cfg(test)]
@@ -742,7 +799,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_slow_consumer_detected() {
-        let outbox = Outbox::new(4);
+        let outbox = Outbox::new(4, BROWSER_QUEUE_MAX_BYTES);
         for i in 0..4u64 {
             assert!(outbox
                 .push_frame(frame_of(&append_env(i, i * 100, 10, "item-1")))
@@ -754,21 +811,206 @@ mod tests {
         assert!(outbox.recv().await.is_some());
     }
 
+    /// close 丢弃尚未发送的流帧(可恢复数据),此后只有 Close 项(§17.6)。
     #[tokio::test]
     async fn outbox_recv_returns_items_then_none_after_close() {
-        let outbox = Outbox::new(8);
+        let outbox = Outbox::new(8, BROWSER_QUEUE_MAX_BYTES);
         outbox
             .push_frame(frame_of(&append_env(0, 0, 4, "i")))
             .unwrap();
         outbox.close("AUTH_EXPIRED");
-        let mut count = 0;
+        let mut kinds = Vec::new();
         while let Some(item) = outbox.recv().await {
-            if matches!(item, OutItem::Close(_)) {
+            match item {
+                OutItem::Frame(_) => kinds.push("frame"),
+                OutItem::Direct(_) => kinds.push("direct"),
+                OutItem::Close(_) => {
+                    kinds.push("close");
+                    break;
+                }
+            }
+        }
+        assert_eq!(kinds, vec!["close"]);
+        assert!(outbox.recv().await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // AC-02/AC-03 回归:已编号帧不再合并、字节预算、Direct 顺序与收尾。
+    // -----------------------------------------------------------------------
+
+    /// T05:连续 101/102/103 输出施加队列压力 → 序号必须原样保留,
+    /// 不得把 101/102 合并成 101 造成客户端缺帧判定。
+    #[tokio::test]
+    async fn outbox_pressure_preserves_assigned_sequences() {
+        let outbox = Outbox::new(3, BROWSER_QUEUE_MAX_BYTES);
+        // 相邻且偏移连续:旧实现会在压力下把它们合并为一帧。
+        for seq in [101u64, 102, 103] {
+            outbox
+                .push_frame(frame_of(&append_env(
+                    seq,
+                    (seq - 101) * 10,
+                    10,
+                    "item-1",
+                )))
+                .unwrap();
+        }
+        let extra = outbox.push_frame(frame_of(&append_env(104, 30, 10, "item-1")));
+        assert_eq!(extra, Err(PushError::SlowConsumer));
+        // 逐条取出三帧(队列未关闭,recv 在取完后会阻塞,不 drain 到 None)。
+        let mut seqs = Vec::new();
+        for _ in 0..3 {
+            match outbox.recv().await {
+                Some(OutItem::Frame(f)) => seqs.push(f.env.sequence),
+                _ => panic!("expected stream frame"),
+            }
+        }
+        assert_eq!(seqs, vec![101, 102, 103], "merged sequences must survive");
+    }
+
+    /// 字节预算:单帧超预算返回 SlowConsumer,不部分入队。
+    #[test]
+    fn outbox_byte_budget_rejects_oversized_frame() {
+        let outbox = Outbox::new(64, 4 * 1024);
+        let big = frame_of(&append_env(1, 0, 8 * 1024, "item-1"));
+        assert_eq!(outbox.push_frame(big), Err(PushError::SlowConsumer));
+        assert_eq!(outbox.queued_bytes(), 0);
+    }
+
+    /// T06:两个流相同 item ID → 合并 key 含流身份,不交叉合并。
+    #[test]
+    fn same_item_id_across_streams_never_merges() {
+        let scoped = |seq: u64, offset: u64, scope: &str| {
+            let env = append_env(seq, offset, 10, "item-1");
+            let event = match env.payload.as_ref().unwrap() {
+                envelope::Payload::EventBatch(b) => &b.events[0],
+                _ => unreachable!(),
+            };
+            let (kind, merge) = classify(event.event.as_ref().unwrap());
+            Frame::new(env, kind, merge.map(|m| m.scoped(scope)))
+        };
+        let a1 = scoped(1, 0, "stream-A/1/dev-1");
+        let a2 = scoped(2, 10, "stream-A/1/dev-1");
+        let b2 = scoped(2, 10, "stream-B/1/dev-2");
+        assert!(
+            merge_pair(&a1, &b2).is_none(),
+            "cross-stream same item id must not merge"
+        );
+        assert!(merge_pair(&a1, &a2).is_some(), "same stream keeps mergeable");
+    }
+
+    /// T08/T13:Frame、Direct、Frame 顺序保持;close 丢弃未发送流帧、
+    /// 保留 Direct 与 Close,Close 不排在大输出后面。
+    #[tokio::test]
+    async fn outbox_close_drops_frames_keeps_direct_order() {
+        let outbox = Outbox::new(8, BROWSER_QUEUE_MAX_BYTES);
+        outbox
+            .push_frame(frame_of(&append_env(1, 0, 10, "i")))
+            .unwrap();
+        outbox.push_direct(vec![1u8; 32].into());
+        outbox
+            .push_frame(frame_of(&append_env(2, 10, 10, "i")))
+            .unwrap();
+        outbox.close("AUTH_EXPIRED");
+        let mut kinds = Vec::new();
+        while let Some(item) = outbox.recv().await {
+            match item {
+                OutItem::Frame(_) => kinds.push("frame"),
+                OutItem::Direct(_) => kinds.push("direct"),
+                OutItem::Close(_) => {
+                    kinds.push("close");
+                    break;
+                }
+            }
+        }
+        assert_eq!(kinds, vec!["direct", "close"], "frames dropped, direct kept before close");
+        assert_eq!(outbox.queued_bytes(), 0);
+        assert!(outbox.recv().await.is_none());
+    }
+
+    /// T09:完整 envelope 接近编码上限 → 合并被拒绝(保留两帧),绝不空帧;
+    /// 超限 envelope 编码失败返回 None 而非空字节。
+    #[test]
+    fn merge_near_frame_limit_is_refused_and_encode_failure_is_explicit() {
+        // 输出字节之和 < MAX_FRAME_BYTES,但完整 envelope 编码越限:
+        // 头部留出的 envelope 开销余量(12 字节)小于字段编码开销,
+        // 旧实现只看原始字节之和会放行该合并。
+        let head_len = MAX_FRAME_BYTES - 512;
+        let a = frame_of(&append_env(1, 0, head_len, "item-1"));
+        let tail_len = 500usize;
+        assert!(head_len + tail_len <= MAX_FRAME_BYTES);
+        let b = frame_of(&append_env(2, head_len as u64, tail_len, "item-1"));
+        assert!(a.bytes_len <= MAX_FRAME_BYTES && b.bytes_len <= MAX_FRAME_BYTES);
+        assert!(merge_pair(&a, &b).is_none(), "merge must check full encoded_len");
+        // 编码失败显式返回 None,不产生空帧。
+        let oversized = frame_of(&append_env(1, 0, MAX_FRAME_BYTES + 1, "item-1"));
+        assert_eq!(oversized.encoded(), None);
+        assert_eq!(a.encoded().map(|b| b.len()), Some(a.bytes_len));
+    }
+
+    /// T11:大量 Direct 消息、浏览器停止读取 → 保留区耗尽后明确自我关闭,
+    /// 排队字节有界。
+    #[tokio::test]
+    async fn direct_flood_closes_connection_with_bounded_queue() {
+        let outbox = Outbox::new(64, 4 * 1024);
+        let mut accepted = 0;
+        for _ in 0..10_000 {
+            if !outbox.push_direct(vec![7u8; 512].into()) {
                 break;
             }
-            count += 1;
+            accepted += 1;
         }
-        assert_eq!(count, 1);
-        assert!(outbox.recv().await.is_none());
+        assert!(outbox.is_closed(), "control reserve exhaustion must close");
+        assert_eq!(
+            outbox.queued_bytes(),
+            accepted * 512,
+            "queued bytes bounded by accepted items only"
+        );
+        // Close 项最终可被取出。
+        let mut saw_close = false;
+        while let Some(item) = outbox.recv().await {
+            if matches!(item, OutItem::Close("OUTBOX_OVERLOAD")) {
+                saw_close = true;
+                break;
+            }
+        }
+        assert!(saw_close);
+        assert!(OUTBOX_OVERLOAD_CLOSES.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// ReplaceLatest 同 key 只保留最新(key 含流身份后跨流不互替)。
+    #[test]
+    fn replace_latest_respects_scoped_keys() {
+        let presence_env = |seq: u64| {
+            let mut env = critical_env(seq);
+            env.payload = Some(envelope::Payload::EventBatch(EventBatch {
+                stream_id: "s".into(),
+                events: vec![DomainEvent {
+                    emitted_at: None,
+                    event: Some(domain_event::Event::DevicePresenceChanged(
+                        agent_console_protocol::v1::DevicePresenceChanged {
+                            presence: Some(agent_console_protocol::v1::DevicePresence {
+                                device_id: "d1".into(),
+                                ..Default::default()
+                            }),
+                        },
+                    )),
+                }],
+            }));
+            env
+        };
+        let scoped = |seq: u64, scope: &str| {
+            let env = presence_env(seq);
+            let event = match env.payload.as_ref().unwrap() {
+                envelope::Payload::EventBatch(b) => &b.events[0],
+                _ => unreachable!(),
+            };
+            let (kind, merge) = classify(event.event.as_ref().unwrap());
+            Frame::new(env, kind, merge.map(|m| m.scoped(scope)))
+        };
+        let mut buf = StreamBuffer::new(100, usize::MAX, std::time::Duration::from_secs(60));
+        buf.insert(scoped(1, "stream-A/1/dev-1"));
+        buf.insert(scoped(2, "stream-A/1/dev-1"));
+        buf.insert(scoped(3, "stream-B/1/dev-2"));
+        assert_eq!(buf.len(), 2, "same scope replaced; other scope kept");
     }
 }

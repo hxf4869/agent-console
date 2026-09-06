@@ -21,10 +21,13 @@ import "google/protobuf/timestamp.proto";
 // Agent / Client 标识
 // ---------------------------------------------------------------------------
 
-// 第一版只有 CODEX_DESKTOP(§9.1);保留枚举以便未来出现第二个真实 Adapter。
+// Agent 种类(§9.1)。枚举值只追加,不得改动或复用既有数值(§17.1);
+// 同一 package 内枚举值共享命名空间,故统一带 AGENT_KIND_ 前缀。
 enum AgentKind {
   AGENT_KIND_UNSPECIFIED = 0;
   CODEX_DESKTOP = 1;
+  // ZCode Desktop(官方 Hook / MCP 通路;ZC-02)。接收方必须容忍未知枚举值。
+  ZCODE_DESKTOP = 2;
 }
 
 // WebSocket 两端角色(§17.2 Hello 握手)。

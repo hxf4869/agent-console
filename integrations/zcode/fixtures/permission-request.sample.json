@@ -1,0 +1,12 @@
+{
+  "session_id": "sess_fixture_0001",
+  "transcript_path": "/tmp/zcode-fixture/transcript.jsonl",
+  "cwd": "/workspace/fixture-demo",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo fixture-safe-command"
+  },
+  "tool_use_id": "tool_fixture_0001"
+}

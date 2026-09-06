@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   Activity,
+  ArrowDown,
   ArrowLeft,
   ChevronRight,
   CircleAlert,
@@ -16,17 +17,19 @@ import {
   Settings2,
   X,
 } from 'lucide-vue-next'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
 import NoticeBanner from '@/components/NoticeBanner.vue'
 import QueueComposer from '@/components/QueueComposer.vue'
+import SaveToToolboxDialog from '@/components/SaveToToolboxDialog.vue'
 import SessionSettings from '@/components/SessionSettings.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import TimelineItemCard from '@/components/TimelineItemCard.vue'
 import UiButton from '@/components/UiButton.vue'
 import { useBottomSheetFocus } from '@/composables/useBottomSheetFocus'
-import { connectionLabel, phaseLabel, queueLabel } from '@/lib/presentation'
+import { createTimelineFollow } from '@/composables/useTimelineFollow'
+import { agentKindDisplay, capabilitySourceLabel, connectionLabel, phaseLabel, queueLabel } from '@/lib/presentation'
 import { useConsoleStore } from '@/store/console'
 import type { ControlOperation, RuntimeSnapshot } from '@/transport/types'
 
@@ -37,11 +40,14 @@ const {
   state,
   initialize,
   ensureRuntime,
+  acquireRuntime,
+  releaseRuntime,
   loadOlderHistory,
   presenceFor,
   availability,
   sendCommand,
   answerAttention,
+  notify,
 } = useConsoleStore()
 const loading = ref(true)
 const errorMessage = ref('')
@@ -83,11 +89,21 @@ function syncMobileViewport(event: MediaQueryListEvent): void {
 }
 
 onMounted(() => mobileMedia.addEventListener('change', syncMobileViewport))
-onBeforeUnmount(() => mobileMedia.removeEventListener('change', syncMobileViewport))
+onBeforeUnmount(() => {
+  mobileMedia.removeEventListener('change', syncMobileViewport)
+  // 离开详情:释放该会话的详情订阅(引用计数,多视图共享时不提前释放)。
+  if (sessionId.value) releaseRuntime(sessionId.value)
+})
+
+// 会话切换代次:旧会话的慢请求返回后不得覆盖新会话的加载/错误状态(T22)。
+let loadToken = 0
 
 watch(
   sessionId,
-  async (id) => {
+  async (id, previousId) => {
+    if (previousId && previousId !== id) releaseRuntime(previousId)
+    if (id) acquireRuntime(id)
+    const token = ++loadToken
     loading.value = true
     errorMessage.value = ''
     mobileSection.value = 'activity'
@@ -96,9 +112,11 @@ watch(
       await initialize()
       await ensureRuntime(id)
     } catch (error) {
-      errorMessage.value = error instanceof Error ? error.message : '无法读取任务运行态。'
+      if (token === loadToken) {
+        errorMessage.value = error instanceof Error ? error.message : '无法读取任务运行态。'
+      }
     } finally {
-      loading.value = false
+      if (token === loadToken) loading.value = false
     }
   },
   { immediate: true },
@@ -123,6 +141,42 @@ function interruptTurn(): void {
     void sendCommand(sessionId.value, 'INTERRUPT')
   }
 }
+
+// UX-04:接近底部才自动跟随;向上阅读显示"有新输出 · 回到底部"。
+const timelineEl = ref<HTMLElement | null>(null)
+const follow = createTimelineFollow()
+
+watch(
+  () => runtime.value?.timeline,
+  async () => {
+    await nextTick()
+    const element = timelineEl.value
+    if (element) follow.onArrival(element)
+  },
+  { deep: true },
+)
+
+function jumpToBottom(): void {
+  const element = timelineEl.value
+  if (element) follow.jumpToBottom(element)
+}
+
+// UX-09:选中的片段只驻留内存,弹层确认后才调用 Toolbox 保存 API。
+const saveDialogOpen = ref(false)
+const saveSnippet = ref<{ text: string; agentDisplay: string; projectDisplay: string } | null>(null)
+
+function openSaveDialog(payload: { source: string; text: string }): void {
+  saveSnippet.value = {
+    text: payload.text,
+    agentDisplay: agentKindDisplay(session.value?.agentKind ?? ''),
+    projectDisplay: session.value?.projectDisplay || '未知项目',
+  }
+  saveDialogOpen.value = true
+}
+
+function onSaved(message: string): void {
+  notify(message, 'success')
+}
 </script>
 
 <template>
@@ -145,6 +199,9 @@ function interruptTurn(): void {
             <span class="phase-dot" :class="{ 'is-running': runtime.phase === 'RUNNING' }" />
             {{ phaseLabel[runtime.phase] }}
             <span class="mono">{{ session?.nativeSessionId ?? sessionId }}</span>
+            <span :title="capabilitySourceLabel(session?.agentKind ?? '')">
+              {{ agentKindDisplay(session?.agentKind ?? '') }}
+            </span>
           </div>
           <h1>{{ session?.title ?? sessionId }}</h1>
           <p><GitBranch :size="12" aria-hidden="true" />{{ session?.branch ?? 'unknown' }}</p>
@@ -205,28 +262,46 @@ function interruptTurn(): void {
       <section ref="contentPane" class="content-pane" aria-label="任务内容" tabindex="-1">
         <div class="content-toolbar">
           <strong>动态</strong>
-          <UiButton
-            v-if="state.historyCursors[sessionId]"
-            variant="quiet"
-            size="small"
-            :disabled="Boolean(state.historyLoading[sessionId])"
-            @click="loadOlderHistory(sessionId)"
-          >
-            <template #icon>
-              <LoaderCircle v-if="state.historyLoading[sessionId]" class="spin" aria-hidden="true" />
-              <History v-else aria-hidden="true" />
-            </template>
-            {{ state.historyLoading[sessionId] ? '读取中' : '更早记录' }}
-          </UiButton>
+          <div class="content-toolbar__tools">
+            <span v-if="state.historyCursors[sessionId]" class="history-hint">仅保留最近输出窗口</span>
+            <UiButton
+              v-if="state.historyCursors[sessionId]"
+              variant="quiet"
+              size="small"
+              :disabled="Boolean(state.historyLoading[sessionId])"
+              @click="loadOlderHistory(sessionId)"
+            >
+              <template #icon>
+                <LoaderCircle v-if="state.historyLoading[sessionId]" class="spin" aria-hidden="true" />
+                <History v-else aria-hidden="true" />
+              </template>
+              {{ state.historyLoading[sessionId] ? '读取中' : '更早记录' }}
+            </UiButton>
+          </div>
         </div>
 
-        <div v-if="!isMobileViewport" class="desktop-timeline">
+        <div
+          v-if="!isMobileViewport"
+          ref="timelineEl"
+          class="desktop-timeline"
+          @scroll="follow.onScroll($event.target as HTMLElement)"
+        >
           <TimelineItemCard
             v-for="item in runtime.timeline"
             :key="item.id"
             :item="item"
             :session-id="sessionId"
+            @save="openSaveDialog"
           />
+          <button
+            v-if="!follow.pinnedToBottom.value"
+            type="button"
+            class="new-output-pill"
+            @click="jumpToBottom"
+          >
+            <ArrowDown :size="14" aria-hidden="true" />
+            有新输出{{ follow.newOutputCount.value > 1 ? `（${follow.newOutputCount.value}）` : '' }} · 回到底部
+          </button>
         </div>
 
         <div v-if="isMobileViewport" v-show="mobileSection === 'activity'" class="mobile-section mobile-activity">
@@ -235,6 +310,7 @@ function interruptTurn(): void {
             :key="item.id"
             :item="item"
             :session-id="sessionId"
+            @save="openSaveDialog"
           />
         </div>
 
@@ -293,6 +369,13 @@ function interruptTurn(): void {
         />
       </section>
 
+      <SaveToToolboxDialog
+        :open="saveDialogOpen"
+        :snippet="saveSnippet"
+        @close="saveDialogOpen = false"
+        @saved="onSaved"
+      />
+
       <aside class="task-inspector" aria-label="任务检查器">
         <section class="runtime-overview">
           <header><MonitorDot :size="16" aria-hidden="true" /><strong>运行态</strong></header>
@@ -336,7 +419,7 @@ function interruptTurn(): void {
       tabindex="-1"
       @keydown="onSheetKeydown"
     >
-      <header><strong id="attention-sheet-title">Codex 提问</strong><button type="button" aria-label="关闭提问" @click="closeSheet"><X :size="18" /></button></header>
+      <header><strong id="attention-sheet-title">提问 · {{ agentKindDisplay(session?.agentKind ?? '') }}</strong><button type="button" aria-label="关闭提问" @click="closeSheet"><X :size="18" /></button></header>
       <p>{{ selectedAttention.description }}</p>
       <footer>
         <UiButton
@@ -507,6 +590,35 @@ function interruptTurn(): void {
   padding: 6px 14px 6px 18px;
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-nav);
+}
+
+.content-toolbar__tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.history-hint {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.new-output-pill {
+  position: sticky;
+  bottom: 10px;
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 6px;
+  margin: 0 auto;
+  padding: 5px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font-size: 11px;
+  font-weight: 700;
+  box-shadow: 0 6px 18px rgb(0 0 0 / 20%);
 }
 
 .content-toolbar strong {

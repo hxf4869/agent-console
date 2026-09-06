@@ -20,7 +20,10 @@ import { useRoute } from 'vue-router'
 import NoticeBanner from '@/components/NoticeBanner.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import UiButton from '@/components/UiButton.vue'
+import VersionPanel from '@/components/VersionPanel.vue'
 import { useBottomSheetFocus } from '@/composables/useBottomSheetFocus'
+import { usePushNotifications } from '@/composables/usePushNotifications'
+import { buildDiagnosticsReport } from '@/lib/diagnostics'
 import { connectionLabel, formatDateTime } from '@/lib/presentation'
 import { useConsoleStore } from '@/store/console'
 
@@ -31,6 +34,8 @@ const {
   lookupPairing,
   approvePairing,
   revokeDevice,
+  toggleNotifySuccess,
+  componentVersions,
 } = useConsoleStore()
 const route = useRoute()
 const selectedDevice = ref('')
@@ -44,6 +49,8 @@ const { sheetElement, sheetOpen, openSheet, closeSheet, onSheetKeydown } = useBo
   () => deviceListElement.value,
   '#device-sheet',
 )
+const { pushState, pushBusy, pushMessage, refreshPushState, toggleBrowserPush } =
+  usePushNotifications()
 
 const currentDevice = computed(() =>
   state.devices.find((device) => device.id === selectedDevice.value) ?? state.devices[0],
@@ -69,7 +76,10 @@ const capabilities = computed(() => [
   { label: '新建 / 改名 / 归档 / Fork / 后台停止', status: '不支持', tone: 'warning' as const },
 ])
 
-onMounted(() => void loadDevices())
+onMounted(() => {
+  void loadDevices()
+  void refreshPushState()
+})
 
 watch(
   () => state.devices.map((device) => device.id),
@@ -124,6 +134,37 @@ async function revokeCurrentDevice(): Promise<void> {
   if (!device || device.revoked) return
   if (!window.confirm(`确认撤销设备“${device.displayName}”？Bridge 会立即断开。`)) return
   await revokeDevice(device.id)
+}
+
+/** 诊断报告(UX-02):白名单字段;不含路径/标题正文/命令/凭据。 */
+const diagnosticsCopied = ref(false)
+
+async function copyDiagnostics(): Promise<void> {
+  const device = currentDevice.value
+  const runtimeCapability = deviceRuntime.value?.capabilities
+  try {
+    await navigator.clipboard.writeText(
+      buildDiagnosticsReport({
+        link: state.link,
+        versions: componentVersions(),
+        device: {
+          displayName: '',
+          connection: device?.connection ?? state.connection,
+          platform: device?.platform ?? '',
+          architecture: device?.architecture ?? '',
+        },
+        controlMode: device?.controlMode ?? 'UNAVAILABLE',
+        compatibility: device?.compatibility ?? 'DEGRADED',
+        ...(runtimeCapability ? { capabilities: runtimeCapability } : {}),
+        ...(state.receipts[0] ? { lastReceipt: state.receipts[0] } : {}),
+        now: new Date().toISOString(),
+      }),
+    )
+    diagnosticsCopied.value = true
+    window.setTimeout(() => (diagnosticsCopied.value = false), 1600)
+  } catch {
+    diagnosticsCopied.value = false
+  }
 }
 </script>
 
@@ -262,6 +303,39 @@ async function revokeCurrentDevice(): Promise<void> {
               <StatusBadge :tone="capability.tone">{{ capability.status }}</StatusBadge>
             </div>
           </div>
+        </section>
+
+        <VersionPanel :device="currentDevice" />
+
+        <section class="detail-card diagnostics-card" aria-labelledby="diagnostics-title">
+          <header>
+            <div><h2 id="diagnostics-title">诊断</h2></div>
+            <StatusBadge tone="neutral">仅含白名单字段</StatusBadge>
+          </header>
+          <p>复制版本、平台、连接阶段、错误码、时间与各操作验证状态；不含路径、标题正文、命令与凭据。</p>
+          <footer>
+            <UiButton variant="secondary" size="small" @click="copyDiagnostics">
+              {{ diagnosticsCopied ? '已复制诊断' : '复制诊断信息' }}
+            </UiButton>
+            <label class="notify-toggle">
+              <input
+                type="checkbox"
+                :checked="state.notifySuccessEnabled"
+                @change="toggleNotifySuccess"
+              />
+              任务完成也提醒（默认关闭；失败与待处理始终提醒）
+            </label>
+            <label class="notify-toggle">
+              <input
+                type="checkbox"
+                :checked="pushState === 'subscribed'"
+                :disabled="pushBusy || pushState === 'unsupported' || pushState === 'unconfigured' || pushState === 'denied'"
+                @change="toggleBrowserPush"
+              />
+              后台推送（关闭页面后经系统通知提醒）
+            </label>
+            <p v-if="pushMessage" class="push-hint">{{ pushMessage }}</p>
+          </footer>
         </section>
 
       </section>
@@ -596,6 +670,42 @@ async function revokeCurrentDevice(): Promise<void> {
 
 .capability-list > div:last-child {
   border: 0;
+}
+
+.diagnostics-card > p {
+  padding: 0 12px;
+  margin: 10px 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.diagnostics-card > footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px 12px;
+}
+
+.notify-toggle {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.notify-toggle input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+}
+
+.push-hint {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 
 .capability-list > div > svg {

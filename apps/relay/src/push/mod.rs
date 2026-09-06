@@ -1,11 +1,12 @@
 //! Web Push 后端(§24):
 //! - 订阅/设置的 HTTP CRUD(挂 /agent-console/api/push 下,浏览器身份认证);
+//! - VAPID 公钥只读端点 /push/vapid-public-key(前端 applicationServerKey 来源);
 //! - 触发事件:turn completed/failed/interrupted、等待问题、等待风险审批;
 //!   普通进度、输出增量、token 更新不推送;session mute 覆盖事件开关;
 //! - 默认通知正文只写通用状态(不含标题/prompt/文件名/分支/项目);
 //!   用户显式开启 showTitle 后才含 title(仍不含正文);
-//! - payload 带内部 session ID 与安全相对 deep link(`/agent-console/s/{uuid}`),
-//!   不带本机路径(§24);
+//! - payload 带内部 session ID、机器可读 kind 与安全相对 deep link
+//!   (`/agent-console/s/{uuid}`),不带本机路径,不含 ticket/批准参数(§24);
 //! - VAPID 私钥只从 `VAPID_PRIVATE_KEY_FILE` 指向的文件加载,不进仓库与日志;
 //!   未配置时 push 发送禁用(订阅仍可存储);
 //! - 发送失败不改变任务状态;404/410 → 删除订阅。
@@ -59,6 +60,17 @@ impl PushEventKind {
             PushEventKind::TurnInterrupted => 3,
             PushEventKind::WaitingQuestion => 4,
             PushEventKind::WaitingApproval => 5,
+        }
+    }
+
+    /// payload 中的机器可读事件名(与通知设置 JSON 键一致;无凭据语义)。
+    pub fn name(self) -> &'static str {
+        match self {
+            PushEventKind::TurnCompleted => "turnCompleted",
+            PushEventKind::TurnFailed => "turnFailed",
+            PushEventKind::TurnInterrupted => "turnInterrupted",
+            PushEventKind::WaitingQuestion => "waitingQuestion",
+            PushEventKind::WaitingApproval => "waitingApproval",
         }
     }
 
@@ -284,6 +296,8 @@ pub struct PushState {
     sender: Box<dyn PushSender>,
     /// VAPID/fake sink 未配置时禁用发送(订阅仍可存储,§24)。
     pub enabled: bool,
+    /// VAPID application server key(公钥;供前端 pushManager.subscribe 使用)。
+    pub public_key: Option<String>,
     /// (session, kind) → 上次推送时间(去重窗口)。
     dedup: Mutex<HashMap<(uuid::Uuid, u8), Instant>>,
 }
@@ -291,6 +305,9 @@ pub struct PushState {
 impl PushState {
     /// 环境装配:fake sink(测试)优先,其次 VAPID 文件;均未配置 → 禁用。
     pub fn from_env() -> Arc<PushState> {
+        let public_key = std::env::var("VAPID_PUBLIC_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
         if let Ok(sink) = std::env::var("RELAY_PUSH_FAKE_SINK") {
             if !sink.is_empty() {
                 tracing::info!(target: "relay::push", "push sender: fake forwarding sink");
@@ -300,6 +317,7 @@ impl PushState {
                         http: reqwest::Client::new(),
                     }),
                     enabled: true,
+                    public_key,
                     dedup: Mutex::new(HashMap::new()),
                 });
             }
@@ -313,13 +331,13 @@ impl PushState {
         match pem {
             Some(private_pem) => match WebPushSender::new(private_pem.clone(), subject) {
                 Ok(sender) => {
-                    // public key(VAPID_PUBLIC_KEY)供前端 applicationServerKey 使用;
-                    // 私钥内容与 endpoint 一样不进日志(§25.3)。
-                    let _ = std::env::var("VAPID_PUBLIC_KEY").is_ok();
+                    // public_key(VAPID_PUBLIC_KEY)经 /push/vapid-public-key 提供给前端
+                    // applicationServerKey;私钥内容与 endpoint 一样不进日志(§25.3)。
                     tracing::info!(target: "relay::push", "push sender: web-push (VAPID)");
                     Arc::new(Self {
                         sender: Box::new(sender),
                         enabled: true,
+                        public_key,
                         dedup: Mutex::new(HashMap::new()),
                     })
                 }
@@ -328,6 +346,7 @@ impl PushState {
                     Arc::new(Self {
                         sender: Box::new(DisabledSender),
                         enabled: false,
+                        public_key,
                         dedup: Mutex::new(HashMap::new()),
                     })
                 }
@@ -337,6 +356,7 @@ impl PushState {
                 Arc::new(Self {
                     sender: Box::new(DisabledSender),
                     enabled: false,
+                    public_key,
                     dedup: Mutex::new(HashMap::new()),
                 })
             }
@@ -405,6 +425,7 @@ pub async fn notify(app: &AppState, triggers: &[PushTrigger]) {
         }
         let payload = serde_json::json!({
             "sessionId": session.id,
+            "kind": trigger.kind.name(),
             "deepLink": format!("/agent-console/s/{}", session.id),
             "title": if settings.show_title { serde_json::json!(session.title) } else { serde_json::Value::Null },
             "body": trigger.kind.generic_body(),
@@ -540,6 +561,7 @@ pub fn routes() -> Router<AppState> {
             put(update_subscription).delete(delete_subscription),
         )
         .route("/push/settings", get(get_settings).put(put_settings))
+        .route("/push/vapid-public-key", get(get_vapid_public_key))
 }
 
 fn err(status: StatusCode, code: Code, message: &str) -> Response {
@@ -762,6 +784,25 @@ async fn get_settings(
     };
     let settings = load_settings(&app.db, ident.owner_id).await;
     (StatusCode::OK, Json(settings.to_json())).into_response()
+}
+
+/// VAPID application server key(只读;未配置时 publicKey 为 null,前端据此隐藏订阅入口)。
+async fn get_vapid_public_key(
+    State(app): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = require_identity(&app, addr, &headers) {
+        return resp;
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "enabled": app.push.enabled,
+            "publicKey": app.push.public_key,
+        })),
+    )
+        .into_response()
 }
 
 async fn put_settings(

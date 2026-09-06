@@ -20,6 +20,10 @@ pub struct RelayClientOptions {
     pub reconnect_initial_backoff: Duration,
     pub reconnect_max_backoff: Duration,
     pub reconnect_jitter: Duration,
+    /// 连接(含 WS 握手)单次预算(§26.2;超时按连接失败进入退避)。
+    pub connect_budget: Duration,
+    /// 单帧写出预算(§26.2/§26.4;超时判链路失活并断开)。
+    pub send_budget: Duration,
     pub outbound_capacity: usize,
     pub inbound_capacity: usize,
 }
@@ -35,6 +39,8 @@ impl RelayClientOptions {
             reconnect_initial_backoff: crate::config::RECONNECT_INITIAL_BACKOFF,
             reconnect_max_backoff: crate::config::RECONNECT_MAX_BACKOFF,
             reconnect_jitter: crate::config::RECONNECT_JITTER,
+            connect_budget: crate::config::CONNECT_BUDGET,
+            send_budget: crate::config::SEND_BUDGET,
             outbound_capacity: crate::config::OUTBOUND_QUEUE_CAPACITY,
             inbound_capacity: crate::config::INBOUND_QUEUE_CAPACITY,
         }

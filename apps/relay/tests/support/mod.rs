@@ -40,6 +40,7 @@ pub struct Postgres {
 
 impl Postgres {
     /// 启动一次性 postgres:17-alpine 容器(随机宿主端口);Drop 时强制清理。
+    /// docker run 偶发瞬时失败(并发启动/端口竞争),最多重试 3 次。
     pub async fn start() -> Postgres {
         // 防御性清理此前测试进程异常退出遗留的容器。
         let _ = Command::new("docker")
@@ -54,40 +55,44 @@ impl Postgres {
                         .output();
                 }
             });
-        let name = format!("relay-it-pg-{}", uuid::Uuid::new_v4().simple());
-        let free = free_port();
-        let out = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "-d",
-                "--name",
-                &name,
-                "-e",
-                "POSTGRES_PASSWORD=test",
-                "-e",
-                "POSTGRES_USER=test",
-                "-p",
-                &format!("127.0.0.1:{free}:5432"),
-                "postgres:17-alpine",
-            ])
-            .output()
-            .expect("docker run");
-        assert!(
-            out.status.success(),
-            "docker run failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let url = format!("postgres://test:test@127.0.0.1:{free}/postgres");
-        // 等待就绪。
-        for _ in 0..120 {
-            if let Ok(pool) = sqlx::postgres::PgPool::connect(&url).await {
-                pool.close().await;
-                return Postgres { name, port: free };
+        let mut last_err = String::new();
+        for _ in 0..3 {
+            let name = format!("relay-it-pg-{}", uuid::Uuid::new_v4().simple());
+            let free = free_port();
+            let out = Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "-d",
+                    "--name",
+                    &name,
+                    "-e",
+                    "POSTGRES_PASSWORD=test",
+                    "-e",
+                    "POSTGRES_USER=test",
+                    "-p",
+                    &format!("127.0.0.1:{free}:5432"),
+                    "postgres:17-alpine",
+                ])
+                .output()
+                .expect("docker run");
+            if !out.status.success() {
+                last_err = String::from_utf8_lossy(&out.stderr).to_string();
+                continue;
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            let url = format!("postgres://test:test@127.0.0.1:{free}/postgres");
+            // 等待就绪。
+            for _ in 0..120 {
+                if let Ok(pool) = sqlx::postgres::PgPool::connect(&url).await {
+                    pool.close().await;
+                    return Postgres { name, port: free };
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let _ = Command::new("docker").args(["rm", "-f", &name]).status();
+            last_err = "postgres container not ready in time".into();
         }
-        panic!("postgres container not ready in time");
+        panic!("docker run failed after retries: {last_err}");
     }
 
     /// 新建空数据库并返回其 URL(每个测试独立库,迁移从空库执行)。
@@ -297,6 +302,21 @@ impl FakeToolbox {
     pub fn issue_ticket(&self, ttl: chrono::Duration) -> String {
         let ticket = format!("tk-{}", uuid::Uuid::new_v4().simple());
         self.insert_ticket(ticket.clone(), ttl);
+        ticket
+    }
+
+    /// 为指定 auth session 签发 ticket(多会话场景:撤销隔离测试用)。
+    pub fn issue_ticket_for(&self, session: uuid::Uuid, ttl: chrono::Duration) -> String {
+        let ticket = format!("tk-{}", uuid::Uuid::new_v4().simple());
+        self.tickets.lock().unwrap().insert(
+            ticket.clone(),
+            TicketRec {
+                session,
+                owner: OWNER,
+                expires_at: chrono::Utc::now() + ttl,
+                consumed: false,
+            },
+        );
         ticket
     }
 

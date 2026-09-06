@@ -16,16 +16,19 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import DeviceSettingsNav from '@/components/DeviceSettingsNav.vue'
+import NoticeBanner from '@/components/NoticeBanner.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import TaskListNav from '@/components/TaskListNav.vue'
+import UiButton from '@/components/UiButton.vue'
 import { useTheme } from '@/composables/useTheme'
+import { connectionExplanation } from '@/lib/diagnostics'
 import { connectionLabel } from '@/lib/presentation'
 import { useConsoleStore } from '@/store/console'
 
 const route = useRoute()
 const router = useRouter()
 const { theme, toggleTheme } = useTheme()
-const { state, pendingAttention, toggleConnection } = useConsoleStore()
+const { state, pendingAttention, toggleConnection, retryConnection } = useConsoleStore()
 const navDialog = ref<HTMLDialogElement | null>(null)
 const mainElement = ref<HTMLElement | null>(null)
 const searchInput = ref<HTMLInputElement | null>(null)
@@ -41,6 +44,18 @@ const connectionTone = computed(() => {
   if (state.connection === 'ONLINE') return 'success'
   if (state.connection === 'CONNECTING') return 'warning'
   return 'danger'
+})
+
+/** 浏览器→Relay 链路的用户可读说明(IN-01/UX-02);正常在线时不打扰。 */
+const linkBanner = computed(() => {
+  if (state.link.state === 'ONLINE' && !state.startupError) return undefined
+  return connectionExplanation({
+    link: state.link,
+    deviceConnection: 'ONLINE',
+    controlMode: 'LIMITED_CONTROL',
+    compatibility: 'VERIFIED',
+    supportsNativeQuestion: true,
+  })
 })
 
 function openNavigation(): void {
@@ -157,6 +172,14 @@ watch(
         </aside>
 
         <main id="main-content" ref="mainElement" class="app-main" tabindex="-1">
+          <div v-if="linkBanner" class="link-banner">
+            <NoticeBanner tone="danger" title="实时连接未接通">
+              {{ linkBanner }}
+            </NoticeBanner>
+            <UiButton variant="secondary" size="small" class="link-banner__retry" @click="retryConnection">
+              重试连接
+            </UiButton>
+          </div>
           <slot />
         </main>
       </div>
@@ -453,6 +476,22 @@ watch(
   min-height: 0;
   overflow: auto;
   outline: 0;
+}
+
+.link-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px var(--page-gutter) 0;
+}
+
+.link-banner > .notice {
+  flex: 1;
+  min-width: 0;
+}
+
+.link-banner__retry {
+  flex: 0 0 auto;
 }
 
 .nav-dialog {

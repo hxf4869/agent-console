@@ -486,7 +486,11 @@ async fn detail_pipeline_outputs_and_command_receipts() {
         })
         .await;
     let subscribed = Outbox::find_subscribed(&events).expect("Subscribed 缺失");
-    assert_eq!(subscribed.stream_id, format!("session:{CONV_FAST}"));
+    // ZC-02:本地流 id 携带 agentKind("session:{kind}:{native}")。
+    assert_eq!(
+        subscribed.stream_id,
+        format!("session:codex-desktop:{CONV_FAST}")
+    );
     assert!(
         Outbox::payload_of(&events).any(|p| matches!(p, envelope::Payload::RuntimeSnapshot(_))),
         "订阅后先发 RuntimeSnapshot(§17.4)"

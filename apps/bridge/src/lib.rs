@@ -12,3 +12,4 @@ pub mod pairing;
 pub mod power;
 pub mod runtime;
 pub mod transport;
+pub mod zcode;

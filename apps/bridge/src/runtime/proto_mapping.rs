@@ -5,8 +5,8 @@
 //! - `OutputText`/`OutputBytes` 正文只进对应 payload 字段;本模块不打印、
 //!   不记录任何正文(§13/§25.3)。
 //! - turn/item 的 `synthetic` 标记原样保留(§9.2)。
-//! - `agent_kind` 恒为 `CODEX_DESKTOP`(§9.1;未知 proto 数值按首版唯一
-//!   Adapter 处理,不猜测第二 Agent)。
+//! - `agent_kind` 按会话键如实映射(CODEX_DESKTOP / ZCODE_DESKTOP,ZC-02);
+//!   未知 proto 数值显式拒绝,不默认当作 Codex。
 //! - 领域 `ItemContent::Opaque` 在 v1 proto 无对应 variant(§17.3 禁止为
 //!   未消化原生数据开通道):映射返回 `None`,由调用方跳过该事件;领域层
 //!   仍保留完整信息。
@@ -46,7 +46,7 @@ pub fn opt_timestamp_from_proto(value: &Option<Timestamp>) -> Option<DateTime<Ut
 pub fn session_key_to_proto(key: &dm::SessionKey) -> pb::SessionKey {
     pb::SessionKey {
         device_id: key.device_id.clone(),
-        agent_kind: pb::AgentKind::CodexDesktop as i32,
+        agent_kind: key.agent_kind.proto_value(),
         native_session_id: key.native_session_id.clone(),
         relay_session_uuid: key
             .relay_session_uuid
@@ -55,13 +55,15 @@ pub fn session_key_to_proto(key: &dm::SessionKey) -> pb::SessionKey {
     }
 }
 
-pub fn session_key_from_proto(key: &pb::SessionKey) -> dm::SessionKey {
-    dm::SessionKey {
+/// proto SessionKey → 领域。`agent_kind` 未知/未指定时返回 None:
+/// 调用方必须显式拒绝,不得默认当作 Codex(ZC-02 路由约束)。
+pub fn session_key_from_proto(key: &pb::SessionKey) -> Option<dm::SessionKey> {
+    Some(dm::SessionKey {
         device_id: key.device_id.clone(),
-        agent_kind: dm::AgentKind::CodexDesktop,
+        agent_kind: dm::AgentKind::from_proto_value(key.agent_kind)?,
         native_session_id: key.native_session_id.clone(),
         relay_session_uuid: Uuid::parse_str(&key.relay_session_uuid).ok(),
-    }
+    })
 }
 
 pub fn turn_id_to_proto(id: &dm::TurnId) -> pb::TurnId {
@@ -399,7 +401,7 @@ pub fn session_summary_to_proto(summary: &dm::SessionSummary) -> pb::SessionSumm
             .as_ref()
             .map(|t| t.as_str().to_owned())
             .unwrap_or_default(),
-        agent_kind: pb::AgentKind::CodexDesktop as i32,
+        agent_kind: summary.session_key.agent_kind.proto_value(),
         project_display_name: summary.project_display_name.clone().unwrap_or_default(),
         current_branch: summary.current_branch.clone().unwrap_or_default(),
         updated_at: opt_timestamp_to_proto(summary.updated_at),
@@ -423,19 +425,19 @@ pub fn session_summary_to_proto(summary: &dm::SessionSummary) -> pb::SessionSumm
     }
 }
 
-pub fn session_summary_from_proto(p: &pb::SessionSummary) -> dm::SessionSummary {
-    dm::SessionSummary {
-        session_key: p
-            .session_key
-            .as_ref()
-            .map(session_key_from_proto)
-            .unwrap_or_else(|| dm::SessionKey::codex("", "")),
+pub fn session_summary_from_proto(p: &pb::SessionSummary) -> Option<dm::SessionSummary> {
+    let session_key = p
+        .session_key
+        .as_ref()
+        .and_then(session_key_from_proto)?;
+    Some(dm::SessionSummary {
+        session_key: session_key.clone(),
         title: if p.title.is_empty() {
             None
         } else {
             Some(dm::OutputText::new(p.title.clone()))
         },
-        agent_kind: dm::AgentKind::CodexDesktop,
+        agent_kind: session_key.agent_kind,
         project_display_name: if p.project_display_name.is_empty() {
             None
         } else {
@@ -492,7 +494,7 @@ pub fn session_summary_from_proto(p: &pb::SessionSummary) -> dm::SessionSummary 
         pinned: p.pinned,
         muted: p.muted,
         archived: p.archived,
-    }
+    })
 }
 
 pub fn queue_status_to_proto(queue: &dm::QueueStatus) -> pb::QueueStatus {
@@ -1444,11 +1446,11 @@ pub fn command_request_from_proto(
     let session_key = p
         .session_key
         .as_ref()
-        .map(session_key_from_proto)
+        .and_then(session_key_from_proto)
         .ok_or_else(|| {
             dm::BridgeError::new(
-                dm::StableErrorCode::InternalError,
-                "command request missing session key",
+                dm::StableErrorCode::CapabilityUnsupported,
+                "command request has unknown or missing agent kind",
             )
         })?;
     let unsupported = |what: &str| {
@@ -1626,12 +1628,31 @@ mod tests {
         assert_eq!(proto.title, "fixture-title");
         assert_eq!(proto.pending_attention_kinds.len(), 1);
         assert_eq!(proto.queue_state, pb::QueueState::Queued as i32);
-        let back = session_summary_from_proto(&proto);
+        let back = session_summary_from_proto(&proto).unwrap();
         assert_eq!(back.session_key, summary.session_key);
         assert_eq!(back.title, summary.title);
         assert_eq!(back.control_mode, summary.control_mode);
         assert_eq!(back.queue_state, summary.queue_state);
         assert_eq!(back.pinned, true);
+    }
+
+    /// ZC-02:ZCode 摘要 kind 往返保真;未知 kind 不默认转换为 Codex。
+    #[test]
+    fn session_summary_kind_roundtrip_and_unknown_rejected() {
+        let mut summary = sample_summary();
+        summary.session_key = dm::SessionKey::zcode("device-1", "native-1");
+        summary.agent_kind = dm::AgentKind::ZcodeDesktop;
+        let proto = session_summary_to_proto(&summary);
+        assert_eq!(proto.agent_kind, pb::AgentKind::ZcodeDesktop as i32);
+        let back = session_summary_from_proto(&proto).unwrap();
+        assert_eq!(back.session_key.agent_kind, dm::AgentKind::ZcodeDesktop);
+
+        let mut unknown = proto.clone();
+        unknown.session_key.as_mut().unwrap().agent_kind = 99;
+        assert!(session_summary_from_proto(&unknown).is_none());
+        let mut unspecified = proto.clone();
+        unspecified.session_key.as_mut().unwrap().agent_kind = 0;
+        assert!(session_summary_from_proto(&unspecified).is_none());
     }
 
     #[test]

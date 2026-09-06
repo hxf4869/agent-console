@@ -92,7 +92,10 @@ pub async fn serve(config: Config) -> anyhow::Result<RelayServer> {
         // 文件数据面 Browser 端点(§22.4/§22.5)。
         .merge(transfers::browser_routes())
         .merge(push::routes())
-        .merge(audit::routes());
+        .merge(audit::routes())
+        // 版本信息(部署/诊断用):relay 版本 + 线上协议版本;无门禁,
+        // 经网关 /agent-console/api/* 可达(唯一路由合同,不留双份)。
+        .route("/version", get(version));
 
     let app = Router::new()
         .route("/health", get(health))
@@ -241,4 +244,12 @@ pub async fn cleanup_expired(app: &AppState) {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// 版本端点:relay crate 版本 + 协议 crate 的线上协议版本(只读常量引用)。
+async fn version() -> impl axum::response::IntoResponse {
+    axum::Json(serde_json::json!({
+        "relayVersion": env!("CARGO_PKG_VERSION"),
+        "protocolVersion": agent_console_protocol::codec::PROTOCOL_VERSION,
+    }))
 }

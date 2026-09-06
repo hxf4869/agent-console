@@ -91,7 +91,12 @@ async fn live_handshake_owner_snapshot_and_history() {
         .expect("connect + initialize");
     println!("client id assigned: {}", client.client_id());
 
-    let Some(thread_id) = pick_recent_thread_id().await else {
+    // AC_REAL_THREAD 优先(专用测试会话采样,N01~N06);缺省取最近会话。
+    let thread_id = match std::env::var("AC_REAL_THREAD") {
+        Ok(id) if !id.trim().is_empty() => Some(id.trim().to_string()),
+        _ => pick_recent_thread_id().await,
+    };
+    let Some(thread_id) = thread_id else {
         println!("no threads in local state db; handshake-only verification done");
         return;
     };
@@ -148,6 +153,10 @@ async fn live_handshake_owner_snapshot_and_history() {
                 let shape = snapshot_shape(conversation_state);
                 if let Value::Object(map) = &shape {
                     println!("snapshot top-level keys: {}", map.len());
+                    // 键名清单(诊断用;键名本身无会话内容,兼容文档记录口径)。
+                    let mut names: Vec<&String> = map.keys().collect();
+                    names.sort();
+                    println!("snapshot top-level key names: {names:?}");
                     for key in [
                         "id",
                         "title",
@@ -157,8 +166,56 @@ async fn live_handshake_owner_snapshot_and_history() {
                         "threadRuntimeStatus",
                         "latestModel",
                         "latestReasoningEffort",
+                        // 0.153.4 原生问题/审批相关候选键(N01~N06 采样观察)。
+                        "pendingQuestions",
+                        "pendingApprovals",
+                        "requests",
+                        "attention",
                     ] {
                         println!("  has key {key}: {}", map.contains_key(key));
+                    }
+                }
+                // requests[] 元素结构指纹(原生问题/审批在 follower 可见状态中的
+                // 真实落点;只输出 method 名、键名集合与 options 计数,无内容)。
+                if let Some(requests) = conversation_state.get("requests").and_then(Value::as_array)
+                {
+                    println!("requests array length: {}", requests.len());
+                    for (i, r) in requests.iter().enumerate() {
+                        let method = r.get("method").and_then(Value::as_str).unwrap_or("?");
+                        let completed = r.get("completed").map(|v| v.to_string());
+                        let mut keys: Vec<&String> =
+                            r.as_object().map(|m| m.keys().collect()).unwrap_or_default();
+                        keys.sort();
+                        println!(
+                            "  requests[{i}]: method={method} completed={} keys={keys:?}",
+                            completed.as_deref().unwrap_or("?")
+                        );
+                        if let Some(params) = r.get("params") {
+                            let mut pkeys: Vec<&String> = params
+                                .as_object()
+                                .map(|m| m.keys().collect())
+                                .unwrap_or_default();
+                            pkeys.sort();
+                            println!("    params keys: {pkeys:?}");
+                            if let Some(questions) =
+                                params.get("questions").and_then(Value::as_array)
+                            {
+                                println!("    questions count: {}", questions.len());
+                                for (qi, q) in questions.iter().enumerate() {
+                                    let mut qkeys: Vec<&String> = q
+                                        .as_object()
+                                        .map(|m| m.keys().collect())
+                                        .unwrap_or_default();
+                                    qkeys.sort();
+                                    let opt_count =
+                                        q.get("options").and_then(Value::as_array).map(|a| a.len());
+                                    println!(
+                                        "    questions[{qi}] keys={qkeys:?} options={}",
+                                        opt_count.map(|n| n.to_string()).unwrap_or("?".into())
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }

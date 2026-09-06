@@ -487,9 +487,7 @@ impl QueueManager {
 fn session_ref(key: &SessionKey) -> SessionKeyRef {
     SessionKeyRef {
         device_id: key.device_id.clone(),
-        agent_kind: match key.agent_kind {
-            crate::domain::AgentKind::CodexDesktop => 1,
-        },
+        agent_kind: key.agent_kind.proto_value() as i64,
         native_session_id: key.native_session_id.clone(),
     }
 }

@@ -3,11 +3,12 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Agent 种类;首版只有 CODEX_DESKTOP(§9.1)。
+/// Agent 种类(§9.1);ZC-02 起支持 Codex 与 ZCode 双 Agent。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentKind {
     CodexDesktop,
+    ZcodeDesktop,
 }
 
 /// 复合原生会话键(§9.1):`(device_id, agent_kind, native_session_id)`。
@@ -24,11 +25,22 @@ pub struct SessionKey {
 }
 
 impl SessionKey {
-    /// 构造 Codex Desktop 会话键(首版唯一 agent kind)。
+    /// 构造 Codex Desktop 会话键。
     pub fn codex(device_id: impl Into<String>, native_session_id: impl Into<String>) -> Self {
         Self {
             device_id: device_id.into(),
             agent_kind: AgentKind::CodexDesktop,
+            native_session_id: native_session_id.into(),
+            relay_session_uuid: None,
+        }
+    }
+
+    /// 构造 ZCode Desktop 会话键(ZC-02;native id 不再加 `zcode:` 前缀,
+    /// 隔离由 agent_kind 维度承担)。
+    pub fn zcode(device_id: impl Into<String>, native_session_id: impl Into<String>) -> Self {
+        Self {
+            device_id: device_id.into(),
+            agent_kind: AgentKind::ZcodeDesktop,
             native_session_id: native_session_id.into(),
             relay_session_uuid: None,
         }
@@ -48,10 +60,29 @@ impl std::fmt::Display for SessionKey {
 }
 
 impl AgentKind {
-    /// 稳定的种类名(URL/日志使用)。
+    /// 稳定的种类名(URL/日志/Relay 持久化使用;与 proto 枚举名一一对应)。
     pub fn kind_name(self) -> &'static str {
         match self {
             AgentKind::CodexDesktop => "codex-desktop",
+            AgentKind::ZcodeDesktop => "zcode-desktop",
+        }
+    }
+
+    /// proto 枚举数值(与 `agent_console.v1.AgentKind` 一致;追加时同步)。
+    pub fn proto_value(self) -> i32 {
+        match self {
+            AgentKind::CodexDesktop => 1,
+            AgentKind::ZcodeDesktop => 2,
+        }
+    }
+
+    /// 由 proto 数值解析;未知/UNSPECIFIED 返回 None,调用方必须显式拒绝,
+    /// 不得默认当作 Codex(ZC-02 路由约束)。
+    pub fn from_proto_value(value: i32) -> Option<Self> {
+        match value {
+            1 => Some(AgentKind::CodexDesktop),
+            2 => Some(AgentKind::ZcodeDesktop),
+            _ => None,
         }
     }
 }

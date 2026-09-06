@@ -1,0 +1,7 @@
+{
+  "session_id": "sess_fixture_0001",
+  "transcript_path": "/tmp/zcode-fixture/transcript.jsonl",
+  "cwd": "/workspace/fixture-demo",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "fixture prompt text"
+}

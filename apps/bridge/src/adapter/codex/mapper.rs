@@ -440,6 +440,17 @@ impl SessionMapper {
     // -----------------------------------------------------------------
 
     /// 从当前投影状态构建 RuntimeSnapshot;尚未收到快照时返回 None。
+    /// requests[] 回退路径问题的结构化投影(AnswerQuestion 回答 payload
+    /// 组装的数据源;从当前权威状态实时重投影,路由身份与每题身份分离,
+    /// 见 [`projection::extract_requests_questions_detail`])。
+    pub(crate) fn pending_request_questions(&self) -> Vec<projection::RequestsQuestion> {
+        self.state
+            .as_ref()
+            .map(projection::extract_requests_questions_detail)
+            .unwrap_or_default()
+    }
+
+    /// 当前运行快照(§11.2 投影形态)。
     pub fn runtime_snapshot(&self) -> Option<RuntimeSnapshot> {
         let state = self.state.as_ref()?;
         let questions = projection::extract_questions(state);

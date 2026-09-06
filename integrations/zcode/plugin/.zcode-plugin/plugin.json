@@ -1,0 +1,5 @@
+{
+  "name": "agent-console-bridge",
+  "version": "0.1.0",
+  "description": "Forward explicit ZCode permission requests and minimal session status to the user's Agent Console"
+}

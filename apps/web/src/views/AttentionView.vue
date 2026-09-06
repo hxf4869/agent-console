@@ -6,19 +6,37 @@ import {
   ChevronRight,
   CircleHelp,
   Clock3,
+  Copy,
+  Check,
   ShieldAlert,
+  WifiOff,
   X,
 } from 'lucide-vue-next'
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
 import StatusBadge from '@/components/StatusBadge.vue'
 import UiButton from '@/components/UiButton.vue'
 import { useBottomSheetFocus } from '@/composables/useBottomSheetFocus'
-import { formatClock } from '@/lib/presentation'
-import { useConsoleStore } from '@/store/console'
-import type { ControlOperation } from '@/transport/types'
+import { answerStateFeedback, connectionExplanation } from '@/lib/diagnostics'
+import { agentKindDisplay, capabilitySourceLabel, formatClock, formatWaitingDuration } from '@/lib/presentation'
 
-const { pendingAttention, state, ensureRuntime, availability, answerAttention, presenceFor } = useConsoleStore()
+/** 会话所属 Agent 种类(未知会话回退 UNSPECIFIED,展示为"未知 Agent")。 */
+function agentKindOf(sessionId: string | undefined): string {
+  if (!sessionId) return 'AGENT_KIND_UNSPECIFIED'
+  return state.sessions.find((session) => session.id === sessionId)?.agentKind ?? 'AGENT_KIND_UNSPECIFIED'
+}
+import { projectAttentionInbox, useConsoleStore, type AttentionInboxEntry } from '@/store/console'
+import type { AttentionItem, ControlOperation } from '@/transport/types'
+
+const {
+  state,
+  pendingAttention,
+  ensureRuntime,
+  availability,
+  answerAttention,
+  verifyRequest,
+  presenceFor,
+} = useConsoleStore()
 const selectedId = ref('approval-9b4d')
 const filter = ref<'all' | 'risk' | 'question'>('all')
 const inboxPane = ref<HTMLElement | null>(null)
@@ -27,43 +45,114 @@ const { sheetElement, sheetOpen, openSheet, closeSheet, onSheetKeydown } = useBo
   '#decision-sheet',
 )
 
+/** 等待时长随时间推进;不需要秒级精度。 */
+const now = ref(Date.now())
+const nowTimer = window.setInterval(() => (now.value = Date.now()), 30_000)
+onBeforeUnmount(() => window.clearInterval(nowTimer))
+
+const inbox = computed(() =>
+  projectAttentionInbox({
+    sessions: state.sessions,
+    runtimes: state.runtimes,
+    resolvedAttentionIds: state.resolvedAttentionIds,
+    nowMs: now.value,
+  }),
+)
+const inboxEntries = computed<AttentionInboxEntry[]>(() => [
+  ...inbox.value.active,
+  ...inbox.value.offlineDegraded,
+])
+
 const visibleAttention = computed(() =>
-  pendingAttention.value.filter((item) => {
-    if (filter.value === 'risk') return item.kind === 'RISK_APPROVAL'
-    if (filter.value === 'question') return item.kind === 'USER_QUESTION'
+  inboxEntries.value.filter((entry) => {
+    if (filter.value === 'risk') return entry.kind === 'RISK_APPROVAL'
+    if (filter.value === 'question') return entry.kind === 'USER_QUESTION'
     return true
   }),
 )
-const selected = computed(() =>
-  visibleAttention.value.find((item) => item.id === selectedId.value) ?? visibleAttention.value[0],
+const selected = computed(
+  () =>
+    visibleAttention.value.find((entry) => entry.attention.id === selectedId.value) ??
+    visibleAttention.value[0],
 )
+const selectedAttention = computed<AttentionItem | undefined>(() => selected.value?.attention)
 const selectedSession = computed(() =>
-  state.sessions.find((session) => session.id === selected.value?.sessionId),
+  state.sessions.find((session) => session.id === selected.value?.attention.sessionId),
 )
 const selectedRuntime = computed(() =>
-  selected.value ? state.runtimes[selected.value.sessionId] : undefined,
+  selected.value ? state.runtimes[selected.value.attention.sessionId] : undefined,
 )
-const selectedPresence = computed(() => presenceFor(selected.value?.sessionId))
+const selectedPresence = computed(() => presenceFor(selected.value?.attention.sessionId))
 const selectedOperation = computed<ControlOperation>(() =>
   selected.value?.kind === 'RISK_APPROVAL' ? 'ANSWER_APPROVAL' : 'ANSWER_QUESTION',
 )
 const selectedAvailability = computed(() =>
   selected.value
-    ? availability(selected.value.sessionId, selectedOperation.value)
+    ? availability(selected.value.attention.sessionId, selectedOperation.value)
     : { enabled: false, reason: '没有待处理项。' },
 )
-const riskCount = computed(() => pendingAttention.value.filter((item) => item.kind === 'RISK_APPROVAL').length)
-const questionCount = computed(() => pendingAttention.value.filter((item) => item.kind === 'USER_QUESTION').length)
+const selectedAnswerState = computed(() =>
+  selected.value ? state.answerStates[selected.value.attention.id] : undefined,
+)
+const selectedFeedback = computed(() => answerStateFeedback(selectedAnswerState.value))
+const selectedExplanation = computed(() =>
+  connectionExplanation({
+    link: state.link,
+    deviceConnection: selectedPresence.value.connection,
+    controlMode: selectedPresence.value.controlMode,
+    compatibility: selectedPresence.value.compatibility,
+    supportsNativeQuestion: selectedRuntime.value
+      ? selectedRuntime.value.capabilities.operations.ANSWER_QUESTION
+      : false,
+    ...(selectedAnswerState.value
+      ? {
+          lastAnswerReceipt: {
+            requestId: selectedAnswerState.value.requestId,
+            status: selectedAnswerState.value.submittedStatus,
+            ...(selectedAnswerState.value.errorCode
+              ? { errorCode: selectedAnswerState.value.errorCode }
+              : {}),
+          },
+        }
+      : {}),
+  }),
+)
+
+const riskCount = computed(
+  () => inboxEntries.value.filter((entry) => entry.kind === 'RISK_APPROVAL' && !entry.offlineDegraded).length,
+)
+const questionCount = computed(
+  () => inboxEntries.value.filter((entry) => entry.kind === 'USER_QUESTION' && !entry.offlineDegraded).length,
+)
 const runningSessions = computed(() => state.sessions.filter((session) => session.phase === 'RUNNING').slice(0, 2))
 const recentSessions = computed(() => state.sessions.filter((session) => session.phase !== 'RUNNING').slice(0, 2))
+
+/** 回答草稿按原生 attention ID 绑定;同一会话的状态更新不清空正在输入的内容。 */
+const answerDrafts = reactive<Record<string, string>>({})
+const diagnosticsCopied = ref(false)
+
+/** 提交后的持久状态反馈(UX-05):留在页面,不只靠 toast;轮次失败时升级为"已允许，执行失败"。 */
+const submittedIds = ref<string[]>([])
+const submittedStrips = computed(() =>
+  submittedIds.value
+    .map((id) => ({ id, feedback: answerStateFeedback(state.answerStates[id]) }))
+    .filter((entry) => entry.feedback.text),
+)
+
+async function verifySubmitted(id: string): Promise<void> {
+  const requestId = state.answerStates[id]?.requestId
+  if (requestId) await verifyRequest(requestId)
+}
 
 onMounted(() => {
   void Promise.all(pendingAttention.value.map((item) => ensureRuntime(item.sessionId)))
 })
 
-watch(visibleAttention, (items) => {
-  if (!items.some((item) => item.id === selectedId.value)) selectedId.value = items[0]?.id ?? ''
-  if (!items.length) void closeSheet()
+watch(inboxEntries, (entries) => {
+  if (!entries.some((entry) => entry.attention.id === selectedId.value)) {
+    selectedId.value = entries[0]?.attention.id ?? ''
+  }
+  if (!entries.length) void closeSheet()
 })
 
 function selectAttention(id: string, event: MouseEvent): void {
@@ -72,43 +161,108 @@ function selectAttention(id: string, event: MouseEvent): void {
 }
 
 async function respond(attentionId: string, optionId: string): Promise<void> {
-  await answerAttention(attentionId, optionId)
+  await answerAttention(attentionId, optionId, answerDrafts[attentionId])
+  if (state.answerStates[attentionId] && !submittedIds.value.includes(attentionId)) {
+    submittedIds.value.unshift(attentionId)
+    if (submittedIds.value.length > 3) submittedIds.value.length = 3
+  }
   await closeSheet()
+}
+
+async function verifyCurrentAnswer(): Promise<void> {
+  const answerState = selectedAnswerState.value
+  if (!answerState) return
+  await verifyRequest(answerState.requestId)
+}
+
+/** 复制审批信息(UX-05):白名单字段,不带凭据/token/绝对路径。 */
+async function copyCurrentAttention(): Promise<void> {
+  const attention = selectedAttention.value
+  if (!attention) return
+  const lines = [
+    `类型: ${attention.kind === 'RISK_APPROVAL' ? '风险审批' : '提问'} · ${agentKindDisplay(agentKindOf(attention.sessionId))}`,
+    attention.requestAction ? `请求操作: ${attention.requestAction}` : undefined,
+    attention.risk ? `风险说明: ${attention.risk}` : undefined,
+    `项目: ${selected.value?.projectDisplay ?? '未知'}`,
+    `创建时间: ${attention.createdAt}`,
+  ].filter(Boolean)
+  try {
+    await navigator.clipboard.writeText(lines.join('\n'))
+    diagnosticsCopied.value = true
+    window.setTimeout(() => (diagnosticsCopied.value = false), 1600)
+  } catch {
+    diagnosticsCopied.value = false
+  }
+}
+
+function dismissExpiredNotice(id: string): void {
+  const index = state.expiredNotices.findIndex((notice) => notice.id === id)
+  if (index >= 0) state.expiredNotices.splice(index, 1)
 }
 </script>
 
 <template>
   <div class="attention-page">
-    <div v-if="pendingAttention.length" class="attention-layout">
+    <div v-if="inboxEntries.length" class="attention-layout">
       <section ref="inboxPane" class="inbox-pane" aria-label="待处理列表" tabindex="-1">
+        <div
+          v-for="strip in submittedStrips"
+          :key="strip.id"
+          class="submitted-strip"
+          role="status"
+        >
+          <CheckCircle2 :size="14" aria-hidden="true" />
+          <span>{{ strip.feedback.text }}</span>
+          <button
+            v-if="strip.feedback.canVerify"
+            type="button"
+            class="submitted-strip__verify"
+            @click="verifySubmitted(strip.id)"
+          >
+            核对结果
+          </button>
+        </div>
         <header class="inbox-header">
-          <div><h1>待处理</h1><span>{{ pendingAttention.length }}</span></div>
+          <div><h1>待处理</h1><span>{{ inbox.active.length }}</span></div>
         </header>
 
+        <div class="inbox-expired" role="status" v-if="state.expiredNotices.length">
+          <CheckCircle2 :size="14" aria-hidden="true" />
+          <span>一项请求已关闭：可能已过期或已在本机处理。</span>
+          <button type="button" aria-label="关闭提示" @click="dismissExpiredNotice(state.expiredNotices[0]!.id)">
+            <X :size="13" />
+          </button>
+        </div>
+
         <div class="inbox-filters" aria-label="待处理分类">
-          <button type="button" :aria-pressed="filter === 'all'" @click="filter = 'all'">全部 {{ pendingAttention.length }}</button>
+          <button type="button" :aria-pressed="filter === 'all'" @click="filter = 'all'">全部 {{ inbox.active.length }}</button>
           <button type="button" :aria-pressed="filter === 'risk'" @click="filter = 'risk'">审批 {{ riskCount }}</button>
           <button type="button" :aria-pressed="filter === 'question'" @click="filter = 'question'">提问 {{ questionCount }}</button>
         </div>
 
         <div class="inbox-list">
           <button
-            v-for="item in visibleAttention"
-            :key="item.id"
+            v-for="entry in visibleAttention"
+            :key="entry.attention.id"
             type="button"
             class="inbox-row"
-            :class="{ 'is-selected': selected?.id === item.id }"
-            @click="selectAttention(item.id, $event)"
+            :class="{ 'is-selected': selected?.attention.id === entry.attention.id, 'is-degraded': entry.offlineDegraded }"
+            @click="selectAttention(entry.attention.id, $event)"
           >
-            <span class="inbox-row__icon" :class="{ 'is-risk': item.kind === 'RISK_APPROVAL' }">
-              <ShieldAlert v-if="item.kind === 'RISK_APPROVAL'" :size="17" aria-hidden="true" />
+            <span class="inbox-row__icon" :class="{ 'is-risk': entry.kind === 'RISK_APPROVAL' }">
+              <WifiOff v-if="entry.offlineDegraded" :size="17" aria-hidden="true" />
+              <ShieldAlert v-else-if="entry.kind === 'RISK_APPROVAL'" :size="17" aria-hidden="true" />
               <CircleHelp v-else :size="17" aria-hidden="true" />
             </span>
             <span class="inbox-row__body">
-              <strong>{{ item.title }}</strong>
-              <small>{{ item.kind === 'RISK_APPROVAL' ? '等待风险审批' : item.description }}</small>
+              <strong>{{ entry.attention.title }}</strong>
+              <small>{{ entry.attention.kind === 'RISK_APPROVAL' && !entry.offlineDegraded ? `等待风险审批 · ${agentKindDisplay(agentKindOf(entry.attention.sessionId))}` : entry.offlineDegraded ? '离线 · 最后已知信息' : entry.attention.description }}</small>
+              <small class="inbox-row__meta">
+                {{ entry.projectDisplay }} · {{ entry.deviceName }} · {{ formatWaitingDuration(entry.waitingMs) || formatClock(entry.attention.createdAt) }}
+              </small>
             </span>
-            <time :datetime="item.createdAt">{{ formatClock(item.createdAt) }}</time>
+            <time v-if="!entry.offlineDegraded" :datetime="entry.attention.createdAt">{{ formatClock(entry.attention.createdAt) }}</time>
+            <StatusBadge v-else tone="warning">离线</StatusBadge>
             <ChevronRight :size="15" aria-hidden="true" />
           </button>
         </div>
@@ -157,29 +311,40 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
             <span :class="{ 'is-risk': selected.kind === 'RISK_APPROVAL' }">
               <ShieldAlert v-if="selected.kind === 'RISK_APPROVAL'" :size="16" />
               <CircleHelp v-else :size="16" />
-              {{ selected.kind === 'RISK_APPROVAL' ? '风险审批' : 'Codex 提问' }}
+              {{ selected.kind === 'RISK_APPROVAL' ? '风险审批' : '提问' }} ·
+              {{ agentKindDisplay(agentKindOf(selected.attention.sessionId)) }}
             </span>
-            <h2 id="decision-sheet-title">{{ selected.title }}</h2>
+            <h2 id="decision-sheet-title">{{ selected.attention.title }}</h2>
           </div>
           <button class="decision-close" type="button" aria-label="关闭决策详情" @click="closeSheet">
             <X :size="18" />
           </button>
-          <RouterLink class="open-task" :to="`/tasks/${selected.sessionId}`">打开任务<ChevronRight :size="14" /></RouterLink>
+          <RouterLink class="open-task" :to="`/tasks/${selected.attention.sessionId}`">打开任务<ChevronRight :size="14" /></RouterLink>
         </header>
 
         <div class="decision-body">
+          <p class="decision-explanation" role="note">{{ selectedExplanation }}</p>
+
           <section class="decision-request">
-            <span>{{ selected.requestAction ? '请求操作' : '问题' }}</span>
-            <p>{{ selected.requestAction ?? selected.description }}</p>
+            <span>{{ selected.attention.requestAction ? '请求操作' : '问题' }}</span>
+            <p>{{ selected.attention.requestAction ?? selected.attention.description }}</p>
           </section>
 
-          <details v-if="selected.risk" class="risk-disclosure">
+          <section class="decision-context-facts" aria-label="请求上下文">
+            <div><span>目标工作区</span><strong>{{ selected.projectDisplay }}</strong></div>
+            <div><span>设备</span><strong>{{ selectedPresence.displayName }}</strong></div>
+            <div><span>等待时长</span><strong>{{ formatWaitingDuration(selected.waitingMs) || '刚刚' }}</strong></div>
+            <div><span>能力来源</span><strong>{{ capabilitySourceLabel(agentKindOf(selected.attention.sessionId)) }}</strong></div>
+            <div><span>生效范围</span><strong>{{ selected.kind === 'RISK_APPROVAL' ? '仅本次请求' : '仅本轮' }}</strong></div>
+          </section>
+
+          <details v-if="selected.attention.risk" class="risk-disclosure">
             <summary>
               <AlertTriangle :size="16" aria-hidden="true" />
-              <span>{{ selected.risk }}</span>
+              <span>{{ selected.attention.risk }}</span>
               <ChevronDown :size="16" aria-hidden="true" />
             </summary>
-            <p>影响范围需要在执行前核对；当前审批只对本次请求生效。</p>
+            <p>影响范围需要在执行前核对；审批只对本次请求生效，不会产生扩大范围的决定。</p>
           </details>
 
           <section v-if="state.fixtureMode && selected.kind === 'RISK_APPROVAL'" class="evidence-panel">
@@ -192,33 +357,77 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
             </div>
           </section>
 
-          <div class="decision-context mono">{{ selected.sessionId }} · {{ selected.turnId }}</div>
+          <div class="decision-context mono">{{ selected.attention.sessionId }} · {{ selected.attention.turnId }}</div>
         </div>
 
         <footer class="decision-actions">
-          <span v-if="!selectedAvailability.enabled">{{ selectedAvailability.reason }}</span>
-          <UiButton
-            v-for="option in selected.options"
-            :key="option.id"
-            :variant="option.emphasis === 'primary' ? 'primary' : 'secondary'"
-            :disabled="!selectedAvailability.enabled"
-            @click="respond(selected.id, option.id)"
+          <div v-if="selectedFeedback.text" class="decision-feedback" role="status">
+            <span>{{ selectedFeedback.text }}</span>
+            <UiButton
+              v-if="selectedFeedback.canVerify"
+              variant="secondary"
+              size="small"
+              @click="verifyCurrentAnswer"
+            >
+              核对结果
+            </UiButton>
+          </div>
+          <p v-else-if="!selectedAvailability.enabled && !selected.offlineDegraded" class="decision-unavailable">
+            {{ selectedAvailability.reason }}
+          </p>
+          <p v-else-if="selected.offlineDegraded" class="decision-unavailable">
+            设备离线：显示最后已知信息，回复无法提交；恢复连接后重新处理。
+          </p>
+          <textarea
+            v-if="selected.attention.allowFreeText && !selected.offlineDegraded"
+            v-model="answerDrafts[selected.attention.id]"
+            class="decision-freetext"
+            rows="2"
+            placeholder="补充自由文本回答（可选）…"
+            aria-label="自由文本回答"
+          />
+          <!-- 0.153.4 审批投影 decisions 为空:保持卡片可见,如实解释没有可决定按钮,不臆造选项。 -->
+          <p
+            v-if="!selected.attention.options.length && !selected.offlineDegraded"
+            class="decision-unavailable"
+            role="note"
           >
-            {{ option.label }}
-          </UiButton>
+            此版本尚未验证远程审批回复，请在桌面端处理。
+          </p>
+          <div class="decision-actions__row">
+            <UiButton
+              variant="quiet"
+              size="small"
+              class="decision-copy"
+              @click="copyCurrentAttention"
+            >
+              <template #icon><Check v-if="diagnosticsCopied" aria-hidden="true" /><Copy v-else aria-hidden="true" /></template>
+              {{ diagnosticsCopied ? '已复制' : '复制审批信息' }}
+            </UiButton>
+            <UiButton
+              v-for="option in selected.attention.options"
+              :key="option.id"
+              :variant="option.emphasis === 'primary' ? 'primary' : 'secondary'"
+              :disabled="!selectedAvailability.enabled || selected.offlineDegraded"
+              @click="respond(selected.attention.id, option.id)"
+            >
+              {{ option.label }}
+            </UiButton>
+          </div>
         </footer>
       </section>
 
       <aside v-if="selected" class="decision-inspector" aria-label="任务上下文">
         <div class="inspector-tabs">
           <strong>状态</strong>
-          <RouterLink :to="`/tasks/${selected.sessionId}`">任务设置</RouterLink>
+          <RouterLink :to="`/tasks/${selected.attention.sessionId}`">任务设置</RouterLink>
         </div>
         <dl>
           <div><dt>项目</dt><dd>{{ selectedSession?.projectDisplay || '—' }}</dd></div>
-          <div><dt>轮次</dt><dd class="mono">{{ selected.turnId }}</dd></div>
+          <div><dt>Agent</dt><dd>{{ agentKindDisplay(agentKindOf(selected.attention.sessionId)) }}</dd></div>
+          <div><dt>轮次</dt><dd class="mono">{{ selected.attention.turnId }}</dd></div>
           <div><dt>设备</dt><dd>{{ selectedPresence.displayName }}</dd></div>
-          <div><dt>连接</dt><dd><span class="online-dot" />{{ selectedPresence.connection }}</dd></div>
+          <div><dt>连接</dt><dd><span class="online-dot" :class="{ 'is-off': selectedPresence.connection !== 'ONLINE' }" />{{ selectedPresence.connection }}</dd></div>
           <div><dt>控制</dt><dd class="mono">{{ selectedPresence.controlMode }}</dd></div>
           <div><dt>模型</dt><dd>{{ selectedRuntime?.settings.model || '只读/未提供' }}</dd></div>
           <div><dt>权限</dt><dd>{{ selectedRuntime?.settings.permissionMode || '只读/未提供' }}</dd></div>
@@ -235,7 +444,7 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
     <section v-else class="attention-empty">
       <CheckCircle2 :size="32" aria-hidden="true" />
       <h1>已全部处理</h1>
-      <p>新的问题或审批会出现在这里。</p>
+      <p>新的问题或审批会出现在这里。已关闭的请求可能已过期或已在本机处理。</p>
       <UiButton variant="secondary" @click="$router.push('/tasks')">查看任务</UiButton>
     </section>
   </div>
@@ -285,6 +494,38 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
   border-bottom: 1px solid var(--border-subtle);
 }
 
+.submitted-strip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--success), transparent 60%);
+  background: color-mix(in srgb, var(--success), transparent 92%);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.submitted-strip > svg {
+  flex: 0 0 auto;
+  color: var(--success);
+}
+
+.submitted-strip > span {
+  flex: 1;
+  min-width: 0;
+}
+
+.submitted-strip__verify {
+  min-height: 26px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+  background: var(--bg-surface);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+}
+
 .inbox-header > div {
   display: flex;
   align-items: baseline;
@@ -300,6 +541,39 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
 .inbox-header span {
   color: var(--warning);
   font: 11px var(--font-mono);
+}
+
+.inbox-expired {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--warning), transparent 60%);
+  background: color-mix(in srgb, var(--warning), transparent 92%);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.inbox-expired svg {
+  flex: 0 0 auto;
+  color: var(--warning);
+}
+
+.inbox-expired > span {
+  flex: 1;
+  min-width: 0;
+}
+
+.inbox-expired button {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-muted);
 }
 
 .decision-close {
@@ -377,6 +651,10 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
   box-shadow: inset 1px 0 var(--accent);
 }
 
+.inbox-row.is-degraded {
+  opacity: 0.82;
+}
+
 .inbox-row__icon {
   display: grid;
   width: 30px;
@@ -414,6 +692,10 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
 .inbox-row time {
   color: var(--text-muted);
   font-size: 10px;
+}
+
+.inbox-row__meta {
+  color: var(--text-muted);
 }
 
 .inbox-row > svg {
@@ -486,6 +768,10 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
   background: var(--success);
 }
 
+.online-dot.is-off {
+  background: var(--danger);
+}
+
 .decision-workspace {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
@@ -552,6 +838,17 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
   padding: clamp(18px, 2.4vw, 34px);
 }
 
+.decision-explanation {
+  max-width: 760px;
+  padding: 9px 11px;
+  margin: 0 0 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
 .decision-request > span {
   color: var(--text-muted);
   font-size: 10px;
@@ -565,6 +862,39 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
   font-size: clamp(18px, 1.6vw, 24px);
   font-weight: 620;
   line-height: 1.45;
+}
+
+.decision-context-facts {
+  display: grid;
+  max-width: 760px;
+  grid-template-columns: repeat(2, 1fr);
+  margin-bottom: 18px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  background: var(--bg-surface);
+}
+
+.decision-context-facts > div {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 10px;
+}
+
+.decision-context-facts span {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.decision-context-facts strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .risk-disclosure {
@@ -637,17 +967,63 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
 
 .decision-actions {
   min-height: 62px;
-  justify-content: flex-end;
-  gap: 8px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 7px;
   padding: 9px 14px;
   border-top: 1px solid var(--border-subtle);
   background: var(--bg-surface);
 }
 
-.decision-actions > span {
-  flex: 1;
+.decision-feedback {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent), transparent 55%);
+  border-radius: var(--radius-control);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  font-size: 11px;
+}
+
+.decision-unavailable {
+  margin: 0;
   color: var(--warning);
-  font-size: 10px;
+  font-size: 11px;
+}
+
+.decision-freetext {
+  width: 100%;
+  resize: vertical;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  outline: 0;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.decision-freetext:focus {
+  border-color: var(--focus-ring);
+}
+
+.decision-actions__row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.decision-actions__row > .ui-button {
+  min-height: 40px;
+}
+
+.decision-copy {
+  margin-right: auto;
 }
 
 .decision-inspector {
@@ -834,7 +1210,7 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
     bottom: calc(58px + env(safe-area-inset-bottom));
     left: 0;
     display: grid;
-    max-height: min(68dvh, 610px);
+    max-height: min(72dvh, 640px);
     overflow: hidden;
     border-top: 1px solid var(--border-strong);
     border-radius: 14px 14px 0 0;
@@ -902,12 +1278,12 @@ async function respond(attentionId: string, optionId: string): Promise<void> {
     padding: 9px 10px;
   }
 
-  .decision-actions > .ui-button {
+  .decision-actions__row > .ui-button {
     flex: 1;
   }
 
-  .decision-actions > span {
-    flex-basis: 100%;
+  .decision-copy {
+    flex: 0 0 auto;
   }
 }
 </style>

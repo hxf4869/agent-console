@@ -8,6 +8,23 @@ export type BackgroundCommandState = 'RUNNING' | 'COMPLETED' | 'FAILED' | 'STOPP
 export type AttentionKind = 'USER_QUESTION' | 'RISK_APPROVAL'
 export type OutputAuthority = 'LIVE_PREVIEW' | 'AUTHORITATIVE_FINAL' | 'FINAL_OUTPUT_UNAVAILABLE'
 
+/** Browser→Relay 实时链路最近一次推进/失败所在的阶段。 */
+export type RelayLinkStage = 'TICKET' | 'HANDSHAKE' | 'HELLO' | 'CONNECTED' | 'HEARTBEAT' | 'STREAM' | 'RECONNECT'
+
+export interface RelayLinkState {
+  state: DeviceConnection
+  stage: RelayLinkStage
+  /** 稳定错误码(如 PROTOCOL_VERSION_MISMATCH、HTTP_503、HANDSHAKE_TIMEOUT)。 */
+  errorCode?: string
+  /** 终态:协议不匹配等需要人工升级后重试,transport 停止自动重连。 */
+  terminal?: boolean
+  /** 取票(Tail HTTP 经 Toolbox 网关)是否成功过:用于区分"Relay 不可达但 Toolbox 可用"。 */
+  toolboxReachable?: boolean
+  /** 自动重连尝试次数(仅 RECONNECT 阶段)。 */
+  reconnectAttempt?: number
+  updatedAt: string
+}
+
 export type ControlOperation =
   | 'START_TURN'
   | 'SET_QUEUE'
@@ -70,6 +87,8 @@ export interface DevicePresence {
 export interface SessionSummary {
   id: string
   nativeSessionId: string
+  /** Agent 种类(proto 枚举名,如 CODEX_DESKTOP / ZCODE_DESKTOP;未知值原样保留)。 */
+  agentKind: string
   title: string
   projectDisplay: string
   branch: string
@@ -290,6 +309,7 @@ export interface CommandReceipt {
 
 export type ConsoleEvent =
   | { type: 'connection'; state: DeviceConnection }
+  | { type: 'link'; link: RelayLinkState }
   | { type: 'auth-expired' }
   | { type: 'sessions'; sessions: SessionSummary[]; snapshot: boolean }
   | { type: 'runtime-snapshot'; sessionId: string; runtime: RuntimeSnapshot }
@@ -304,13 +324,36 @@ export type ConsoleEvent =
   | { type: 'resync-required'; sessionId: string; reason: string }
   | { type: 'receipt'; receipt: CommandReceipt }
 
+export interface OutputTextOptions {
+  cursor?: string
+  signal?: AbortSignal
+}
+
+/** 一次问题/审批回复的可观察状态(UX-02/UX-05)。 */
+export interface AnswerState {
+  requestId: string
+  submittedStatus: ReceiptStatus
+  errorCode?: string
+  /** 审批已允许但所属轮次最终失败:显示"已允许，执行失败"。 */
+  execution?: 'FAILED'
+  at: string
+}
+
 export interface ConsoleTransport {
   connect(onEvent: (event: ConsoleEvent) => void): Promise<() => void>
+  /** 手动重试实时链路(协议终态或自动重连间隙由用户触发);不重置应用状态。 */
+  retryLink(): void
+  /** 按 requestId 只读查询已持久化的回执;无记录返回 undefined。 */
+  getReceipt(requestId: string): Promise<CommandReceipt | undefined>
   listSessions(cursor?: string): Promise<Page<SessionSummary>>
   getRuntimeSnapshot(
     sessionId: string,
     options?: { includeHistory?: boolean },
   ): Promise<RuntimeSnapshot>
+  /** 视图等明确消费者声明需要某会话详情流:重连恢复该目标,无活跃流则订阅(幂等)。 */
+  retainRuntime(sessionId: string): void
+  /** 释放详情订阅:不再随重连恢复,并向服务端发送 Unsubscribe(幂等)。 */
+  releaseRuntime(sessionId: string): void
   getHistory(sessionId: string, cursor?: string): Promise<Page<TimelineItem>>
   getDevices(): Promise<DeviceSummary[]>
   lookupPairing(shortCode: string): Promise<PairingChallenge>
@@ -322,7 +365,7 @@ export interface ConsoleTransport {
   previewFile(sessionId: string, handle: string, fileName?: string): Promise<Response>
   downloadFile(sessionId: string, handle: string, fileName?: string): Promise<Response>
   uploadFile(sessionId: string, file: File): Promise<UploadResult>
-  getOutputText(sessionId: string, itemId: string, cursor?: string): Promise<string>
+  getOutputText(sessionId: string, itemId: string, options?: OutputTextOptions): Promise<string>
   requestResync(sessionId: string): void
   sendCommand(request: CommandRequest): Promise<CommandReceipt>
 }

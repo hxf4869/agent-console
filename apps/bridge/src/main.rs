@@ -47,7 +47,11 @@ fn main() -> std::process::ExitCode {
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    // stderr:helper 子命令(zcode-hook / mcp-stdio)的 stdout 只承载协议。
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +102,25 @@ enum Command {
     Inspect {
         #[command(subcommand)]
         action: InspectAction,
+    },
+    /// ZCode Hook helper(04 §8.4):stdin 为原生 Hook JSON;stdout 仅输出
+    /// 协议 JSON(诊断走 stderr)。由插件 hooks.json 以固定 argv 调用。
+    ZcodeHook {
+        /// Hook socket 路径覆盖(缺省 data_dir/zcode-hook.sock)。
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// 远程等待预算 ms(默认 45000;ZCode 官方 Hook 预算 60s)。
+        #[arg(long, default_value_t = bridge::zcode::contract::DEFAULT_REMOTE_WAIT_MS)]
+        wait_ms: u64,
+    },
+    /// ZCode MCP stdio server(04 §8.8):工具 agent_console.ask_user。
+    McpStdio {
+        /// Hook socket 路径覆盖(缺省 data_dir/zcode-hook.sock)。
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// 问答等待预算 ms(默认 45000;超时返回 expired)。
+        #[arg(long, default_value_t = bridge::zcode::contract::DEFAULT_REMOTE_WAIT_MS)]
+        wait_ms: u64,
     },
 }
 
@@ -167,6 +190,23 @@ async fn dispatch(cli: Cli) -> anyhow::Result<std::process::ExitCode> {
                 InspectAction::Session { id } => cmd_inspect_session(cfg, id).await?,
             }
         }
+        Command::ZcodeHook { socket, wait_ms } => {
+            let config = bridge::zcode::helper::HelperConfig {
+                socket_path: socket
+                    .unwrap_or_else(bridge::zcode::helper::default_socket_path),
+                wait_ms,
+            };
+            let code = bridge::zcode::helper::run_hook(config).await;
+            return Ok(std::process::ExitCode::from(code as u8));
+        }
+        Command::McpStdio { socket, wait_ms } => {
+            let config = bridge::zcode::helper::HelperConfig {
+                socket_path: socket
+                    .unwrap_or_else(bridge::zcode::helper::default_socket_path),
+                wait_ms,
+            };
+            bridge::zcode::mcp::serve(config, tokio::io::stdin(), tokio::io::stdout()).await?;
+        }
     }
     Ok(std::process::ExitCode::SUCCESS)
 }
@@ -226,6 +266,9 @@ fn adapter_config(
     config.write_method_probes =
         bridge::capabilities::verified_write_probes(version_report.as_deref());
     config.version_report = version_report;
+    // attach 生命周期按同一固定 argv 重新探测版本:Desktop 运行中更新为
+    // 未知版本时,写能力保持关闭(§5),只恢复可证明的读取能力。
+    config.version_binary = Some(bridge::adapter::codex::ipc::discovery::default_version_binary());
     config
 }
 
@@ -328,6 +371,28 @@ async fn cmd_run(cfg: BridgeConfig, keychain: Arc<dyn KeychainStore>) -> anyhow:
     let _ = runtime_slot.set(runtime.clone());
     let observer = runtime.start_observation();
     let power_poller = spawn_power_poller(runtime.clone());
+
+    // ---- ZCode Hook 审批通路(ZC-01 原型;socket 绑定失败不阻断 run) ----
+    let zcode_hooks = Arc::new(bridge::zcode::ZcodeHooks::new(
+        runtime.device_id().to_string(),
+        cfg.data_dir.join("zcode-hook.sock"),
+    ));
+    zcode_hooks.set_runtime(&runtime);
+    runtime.attach_zcode_hooks(zcode_hooks.clone());
+    let zcode_server = match bridge::zcode::serve(
+        bridge::zcode::HookServerConfig {
+            socket_path: zcode_hooks.socket_path().to_path_buf(),
+        },
+        zcode_hooks.clone(),
+    )
+    .await
+    {
+        Ok(task) => Some(task),
+        Err(err) => {
+            tracing::warn!(error = %err, "zcode hook socket unavailable; remote approval disabled");
+            None
+        }
+    };
     tracing::info!("bridge run started");
 
     loop {
@@ -346,10 +411,15 @@ async fn cmd_run(cfg: BridgeConfig, keychain: Arc<dyn KeychainStore>) -> anyhow:
         }
     }
     // §26.4 优雅停机:gateway 停止接受并给未完成命令补 OUTCOME_UNKNOWN →
-    // 停观察与电源断言 → 断开 Relay。
+    // 停观察与电源断言 → 停 ZCode hook socket(旧 pending 随进程失效)→
+    // 断开 Relay。
     runtime.shutdown().await;
     power_poller.abort();
     observer.abort();
+    if let Some(task) = zcode_server {
+        task.abort();
+        bridge::zcode::server::remove_socket(zcode_hooks.socket_path());
+    }
     shutdown_relay(&handle).await;
     Ok(())
 }

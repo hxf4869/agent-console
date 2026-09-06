@@ -1,14 +1,31 @@
 <script setup lang="ts">
-import { Check, Copy, LoaderCircle, Radio, RefreshCw, TriangleAlert } from 'lucide-vue-next'
-import { ref } from 'vue'
+import { Check, ChevronDown, ChevronUp, Copy, LoaderCircle, Radio, RefreshCw, Save, TriangleAlert } from 'lucide-vue-next'
+import { computed, ref } from 'vue'
 
 import StatusBadge from '@/components/StatusBadge.vue'
 import { authorityLabel } from '@/lib/presentation'
+import { utf8Length } from '@/transport/output-reducer'
 import type { OutputState } from '@/transport/types'
 
-const props = defineProps<{ output: OutputState }>()
-const emit = defineEmits<{ load: [] }>()
+const props = withDefaults(
+  defineProps<{
+    output: OutputState
+    /** 命令输出默认折叠(UX-04);用户可手动展开。 */
+    defaultCollapsed?: boolean
+  }>(),
+  { defaultCollapsed: false },
+)
+const emit = defineEmits<{ load: []; save: [text: string] }>()
 const copied = ref(false)
+const expanded = ref(!props.defaultCollapsed)
+
+/**
+ * 当前显示是否只是"保留窗口"的一部分(UX-04):
+ * 字节数大于当前文本,或尚未定稿,都不能把当前预览当完整输出复制。
+ */
+const windowed = computed(
+  () => props.output.byteLength > utf8Length(props.output.text) || (!props.output.isFinal && props.output.loadState !== 'FAILED'),
+)
 
 async function copyOutput(): Promise<void> {
   try {
@@ -34,41 +51,78 @@ async function copyOutput(): Promise<void> {
       <span class="mono">rev {{ output.revision }} · {{ output.byteLength }} B</span>
       <button
         type="button"
-        class="output-block__copy"
-        :disabled="!output.text || output.loadState === 'LOADING'"
-        :aria-label="copied ? '已复制输出' : '复制输出'"
-        @click="copyOutput"
+        class="output-block__toggle"
+        :aria-expanded="expanded"
+        :aria-label="expanded ? '折叠输出' : '展开输出'"
+        @click="expanded = !expanded"
       >
-        <Check v-if="copied" :size="14" aria-hidden="true" />
-        <Copy v-else :size="14" aria-hidden="true" />
+        <ChevronUp v-if="expanded" :size="14" aria-hidden="true" />
+        <ChevronDown v-else :size="14" aria-hidden="true" />
       </button>
     </header>
     <div v-if="output.hasGap" class="output-block__gap">
       <TriangleAlert :size="14" aria-hidden="true" />
       输出存在缺口；不要把当前预览视为完整执行结果。
     </div>
-    <div v-if="output.loadState" class="output-block__deferred" role="status">
-      <span>
-        {{
-          output.loadState === 'FAILED'
-            ? '最终输出暂时不可用。'
-            : output.loadState === 'LOADING'
-              ? '正在读取最终输出…'
-              : '最终输出将在需要时读取。'
-        }}
-      </span>
-      <button
-        type="button"
-        class="output-block__load"
-        :disabled="output.loadState === 'LOADING'"
-        @click="emit('load')"
-      >
-        <LoaderCircle v-if="output.loadState === 'LOADING'" class="spin" :size="14" aria-hidden="true" />
-        <RefreshCw v-else :size="14" aria-hidden="true" />
-        {{ output.loadState === 'FAILED' ? '重试' : '加载输出' }}
-      </button>
+    <div v-if="!expanded" class="output-block__collapsed">
+      <span>输出已折叠（{{ output.byteLength }} B）。</span>
+      <button type="button" @click="expanded = true">展开输出</button>
     </div>
-    <pre v-else><code>{{ output.text || '（暂无输出）' }}</code></pre>
+    <template v-else>
+      <div v-if="output.loadState" class="output-block__deferred" role="status">
+        <span>
+          {{
+            output.loadState === 'FAILED'
+              ? '最终输出暂时不可用。'
+              : output.loadState === 'LOADING'
+                ? '正在读取最终输出…'
+                : '最终输出将在需要时读取。'
+          }}
+        </span>
+        <button
+          type="button"
+          class="output-block__load"
+          :disabled="output.loadState === 'LOADING'"
+          @click="emit('load')"
+        >
+          <LoaderCircle v-if="output.loadState === 'LOADING'" class="spin" :size="14" aria-hidden="true" />
+          <RefreshCw v-else :size="14" aria-hidden="true" />
+          {{ output.loadState === 'FAILED' ? '重试' : '加载输出' }}
+        </button>
+      </div>
+      <template v-else>
+        <pre><code>{{ output.text || '（暂无输出）' }}</code></pre>
+        <div class="output-block__copybar">
+          <span v-if="windowed" class="output-block__window-note">
+            仅保留当前窗口内容，不是完整输出；完整内容请先加载输出。
+          </span>
+          <span v-else class="output-block__window-note output-block__window-note--ok">
+            当前显示即完整可取内容。
+          </span>
+          <button
+            v-if="output.text"
+            type="button"
+            class="output-block__copy"
+            :aria-label="copied ? '已复制输出' : windowed ? '复制当前显示' : '复制完整输出'"
+            @click="copyOutput"
+          >
+            <Check v-if="copied" :size="14" aria-hidden="true" />
+            <Copy v-else :size="14" aria-hidden="true" />
+            {{ windowed ? '复制当前显示' : '复制完整输出' }}
+          </button>
+          <button
+            v-if="output.text"
+            type="button"
+            class="output-block__toolbox"
+            :aria-label="'保存到工具箱'"
+            @click="emit('save', output.text)"
+          >
+            <Save :size="14" aria-hidden="true" />
+            保存到工具箱
+          </button>
+        </div>
+      </template>
+    </template>
   </section>
 </template>
 
@@ -97,19 +151,25 @@ async function copyOutput(): Promise<void> {
   text-align: right;
 }
 
-.output-block__copy {
-  display: grid;
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  place-items: center;
+.output-block__toggle,
+.output-block__copy,
+.output-block__toolbox {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
   border: 0;
   border-radius: var(--radius-control);
   background: transparent;
   color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
 }
 
-.output-block__copy:hover:not(:disabled) {
+.output-block__toggle:hover,
+.output-block__copy:hover:not(:disabled),
+.output-block__toolbox:hover {
   background: var(--bg-elevated);
   color: var(--text-primary);
 }
@@ -117,6 +177,32 @@ async function copyOutput(): Promise<void> {
 .output-block__copy:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+.output-block__toolbox {
+  color: var(--accent);
+}
+
+.output-block__collapsed {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.output-block__collapsed button {
+  min-height: 28px;
+  padding: 3px 9px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 650;
 }
 
 .output-block__deferred {
@@ -188,14 +274,35 @@ async function copyOutput(): Promise<void> {
   overflow-wrap: anywhere;
 }
 
+.output-block__copybar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 9px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+}
+
+.output-block__window-note {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.output-block__window-note--ok {
+  color: var(--success);
+}
+
 @media (max-width: 599px) {
   .output-block header {
     min-height: 50px;
   }
 
-  .output-block__copy {
-    width: 44px;
-    height: 44px;
+  .output-block__toggle,
+  .output-block__copy,
+  .output-block__toolbox {
+    min-height: 44px;
   }
 
   .output-block__deferred {
@@ -206,6 +313,10 @@ async function copyOutput(): Promise<void> {
   .output-block__load {
     min-height: 44px;
     justify-content: center;
+  }
+
+  .output-block__copybar {
+    flex-wrap: wrap;
   }
 }
 </style>

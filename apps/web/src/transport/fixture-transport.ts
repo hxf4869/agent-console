@@ -31,9 +31,16 @@ export class FixtureConsoleTransport implements ConsoleTransport {
   async connect(onEvent: (event: ConsoleEvent) => void): Promise<() => void> {
     this.#listener = onEvent
     onEvent({ type: 'connection', state: 'CONNECTING' })
+    onEvent({ type: 'link', link: { state: 'CONNECTING', stage: 'TICKET', toolboxReachable: true, updatedAt: new Date().toISOString() } })
 
     this.#timers.push(
       window.setTimeout(() => onEvent({ type: 'connection', state: 'ONLINE' }), 180),
+      window.setTimeout(() => {
+        onEvent({
+          type: 'link',
+          link: { state: 'ONLINE', stage: 'CONNECTED', toolboxReachable: true, updatedAt: new Date().toISOString() },
+        })
+      }, 180),
       window.setTimeout(() => {
         const command = onlineRuntime.timeline.find((item) => item.type === 'command')
         if (!command || command.type !== 'command') return
@@ -247,8 +254,22 @@ export class FixtureConsoleTransport implements ConsoleTransport {
     }
   }
 
-  async getOutputText(): Promise<string> {
+  async getOutputText(
+    _sessionId: string,
+    _itemId: string,
+    _options?: { cursor?: string; signal?: AbortSignal },
+  ): Promise<string> {
     return 'fixture authoritative output'
+  }
+
+  retainRuntime(_sessionId: string): void {}
+
+  releaseRuntime(_sessionId: string): void {}
+
+  retryLink(): void {}
+
+  async getReceipt(_requestId: string): Promise<CommandReceipt | undefined> {
+    return undefined
   }
 
   requestResync(sessionId: string): void {

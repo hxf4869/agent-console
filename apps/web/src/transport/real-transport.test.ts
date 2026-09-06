@@ -165,16 +165,21 @@ describe('real transport contract mapping', () => {
       constructor(_url: string | URL, _protocols?: string | string[]) {
         super()
         const index = FakeWebSocket.instances.push(this) - 1
-        window.setTimeout(() => {
-          if (index === 0) {
+        if (index === 0) {
+          // 首个连接在 clock=0 注册 0ms timer,advanceTimersByTimeAsync 可触发。
+          window.setTimeout(() => {
             this.readyState = FakeWebSocket.OPEN
             this.dispatchEvent(new Event('open'))
             this.dispatchEvent(new MessageEvent('message', { data: helloFrame }))
-            return
-          }
+          }, 0)
+          return
+        }
+        // 重试连接立即以网络错误关闭;用真实微任务触发,tick 循环不会执行
+        // "fire 期间在微任务链中注册的 0ms timer"。
+        queueMicrotask(() => {
           this.readyState = FakeWebSocket.CLOSED
           this.dispatchEvent(new CloseEvent('close', { code: 1006, reason: 'NETWORK' }))
-        }, 0)
+        })
       }
 
       send(): void {}

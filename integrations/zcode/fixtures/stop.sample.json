@@ -1,0 +1,8 @@
+{
+  "session_id": "sess_fixture_0001",
+  "transcript_path": "/tmp/zcode-fixture/transcript.jsonl",
+  "cwd": "/workspace/fixture-demo",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "fixture final message"
+}

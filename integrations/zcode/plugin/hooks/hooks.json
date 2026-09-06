@@ -1,0 +1,77 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "/ABSOLUTE/PATH/bridge",
+            "args": ["zcode-hook"],
+            "timeoutMs": 60000,
+            "statusMessage": "Waiting for Agent Console approval"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "/ABSOLUTE/PATH/bridge",
+            "args": ["zcode-hook"],
+            "timeoutMs": 10000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "/ABSOLUTE/PATH/bridge",
+            "args": ["zcode-hook"],
+            "timeoutMs": 10000
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "/ABSOLUTE/PATH/bridge",
+            "args": ["zcode-hook"],
+            "timeoutMs": 10000
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "/ABSOLUTE/PATH/bridge",
+            "args": ["zcode-hook"],
+            "timeoutMs": 10000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "/ABSOLUTE/PATH/bridge",
+            "args": ["zcode-hook"],
+            "timeoutMs": 10000
+          }
+        ]
+      }
+    ]
+  }
+}

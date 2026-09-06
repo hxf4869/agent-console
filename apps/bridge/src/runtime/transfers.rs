@@ -69,7 +69,7 @@ async fn handle_download(
     correlation: String,
 ) {
     let device = runtime.device_id().to_owned();
-    let Some(session_key) = offer.session_key.as_ref().map(pm::session_key_from_proto) else {
+    let Some(session_key) = offer.session_key.as_ref().and_then(pm::session_key_from_proto) else {
         runtime.send_transfer_ready(
             &offer.transfer_id,
             false,
@@ -259,7 +259,7 @@ async fn handle_upload(
     correlation: String,
 ) {
     let device = runtime.device_id().to_owned();
-    let Some(session_key) = offer.session_key.as_ref().map(pm::session_key_from_proto) else {
+    let Some(session_key) = offer.session_key.as_ref().and_then(pm::session_key_from_proto) else {
         runtime.send_transfer_ready(
             &offer.transfer_id,
             false,

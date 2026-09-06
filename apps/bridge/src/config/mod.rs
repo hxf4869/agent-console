@@ -24,6 +24,12 @@ pub const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 pub const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// 重连退避随机抖动上限,避免惊群。
 pub const RECONNECT_JITTER: Duration = Duration::from_millis(250);
+/// 连接(含 WS 握手)单次预算:超时即按连接失败进入退避(§26.2 初始值;
+/// 网络黑洞下不能依赖 OS 级分钟超时,也不能让 shutdown 等待连接)。
+pub const CONNECT_BUDGET: Duration = Duration::from_secs(10);
+/// 单帧写出预算:超过即判链路失活,断开进入退避重连(§26.2/§26.4;
+/// 不重放结果未知的写:出站帧由上层按 epoch/快照语义重同步)。
+pub const SEND_BUDGET: Duration = Duration::from_secs(10);
 /// 对 Relay 发送队列容量(有界,§17.6;满时调用方立即得到错误,不阻塞)。
 pub const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 /// 上层接收分发队列容量;满时断开重连以触发重同步(§26.4 慢 consumer 策略)。

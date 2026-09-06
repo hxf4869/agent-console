@@ -48,9 +48,11 @@ use buffer::{classify, Frame, FrameKind, Outbox, PushError, StreamBuffer};
 pub enum TargetTag {
     /// 列表订阅:该 owner 全部在线设备的 SessionSummary。
     List,
-    /// 详情订阅:单会话流。
+    /// 详情订阅:单会话流。agent_kind 为 proto 枚举数值(未知值原样保留,
+    /// ZC-02:不同 Agent 的同 native id 会话不共享上游流)。
     Session {
         device: uuid::Uuid,
+        agent_kind: i32,
         native_session_id: String,
     },
 }
@@ -104,9 +106,61 @@ impl DStream {
         }
     }
 
-    /// 缓存 snapshot 的锚点 sequence(最早一条)。
-    fn snapshot_anchor(&self) -> Option<u64> {
-        self.snapshots.front().map(|f| f.env.sequence)
+    /// 最新缓存 snapshot 的 sequence(重放锚点)。
+    fn latest_snapshot_seq(&self) -> Option<u64> {
+        self.snapshots.back().map(|f| f.env.sequence)
+    }
+
+    /// 可重放的连续事件窗口:缓冲中位于最新 snapshot 之后的事件必须恰好
+    /// 连续覆盖 `base+1 .. next_seq-1`。窗口发生过合并/淘汰(压缩)时返回
+    /// None,调用方必须改为向上游重取快照,不能把压缩窗口当作同一 epoch
+    /// 的连续事件直接续播(否则客户端会判定缺口,形成 Resync 风暴)。
+    fn replay_window(&self) -> Option<Vec<Arc<Frame>>> {
+        let base = self.latest_snapshot_seq()?;
+        let expected_start = base.checked_add(1)?;
+        let window: Vec<Arc<Frame>> = self
+            .buffer
+            .items
+            .iter()
+            .filter(|f| f.env.sequence > base)
+            .cloned()
+            .collect();
+        if window.len() as u64 != self.next_seq.checked_sub(expected_start)? {
+            return None;
+        }
+        for (i, f) in window.iter().enumerate() {
+            if f.env.sequence != expected_start + i as u64 {
+                return None;
+            }
+        }
+        Some(window)
+    }
+
+    /// 该流的全部上游绑定重取快照(已有 fresh snapshot 在途的绑定不重复订阅,
+    /// 避免 epoch 抖动);清空缓存并让订阅者回到 awaiting 状态。
+    fn refresh_snapshot_envs(&mut self) -> Vec<(uuid::Uuid, Envelope)> {
+        self.snapshots.clear();
+        self.buffer.clear();
+        for subscriber in self.subscribers.values_mut() {
+            subscriber.awaiting_snapshot = true;
+        }
+        let tag = self.key.1.clone();
+        self.upstreams
+            .values_mut()
+            .filter_map(|binding| {
+                if !binding.snapshot_received {
+                    // 同一流已有 fresh snapshot 在途:只等待,不再发 Subscribe。
+                    return None;
+                }
+                binding.epoch = 0;
+                binding.last_seq = 0;
+                binding.snapshot_received = false;
+                Some((
+                    binding.device,
+                    Hub::upstream_subscribe_env(binding.device, &tag),
+                ))
+            })
+            .collect()
     }
 }
 
@@ -194,9 +248,11 @@ fn upstream_stream_id(device: uuid::Uuid, tag: &TargetTag) -> String {
         TargetTag::List => format!("u-{device}-list"),
         TargetTag::Session {
             device,
+            agent_kind,
             native_session_id,
         } => {
-            format!("u-{device}-sess-{native_session_id}")
+            // agent_kind 计入上游流键:同机双 Agent 同 native id 不串流(ZC-02)。
+            format!("u-{device}-sess-{agent_kind}-{native_session_id}")
         }
     }
 }
@@ -503,8 +559,10 @@ impl Hub {
         let payload_target = match target {
             TargetTag::List => subscribe_target_list(),
             TargetTag::Session {
-                native_session_id, ..
-            } => subscribe_target_session(device, native_session_id),
+                device,
+                agent_kind,
+                native_session_id,
+            } => subscribe_target_session(*device, *agent_kind, native_session_id),
         };
         let mut env = base_envelope(
             &device.to_string(),
@@ -622,45 +680,62 @@ impl Hub {
         }
         drop(g1);
         // 挂接 subscriber(§17.4 步骤 2):有 snapshot 则立刻按顺序回放。
-        let mut g = self.inner.lock().unwrap();
-        if !g.browsers.contains_key(&conn_id) {
-            return;
-        }
-        let HubInner {
-            streams,
-            browsers,
-            browser_streams,
-            ..
-        } = &mut *g;
-        let ds = streams
-            .entry(key.clone())
-            .or_insert_with(|| DStream::new(key.clone()));
-        let outbox = browsers.get(&conn_id).map(|b| b.outbox.clone());
-        let Some(outbox) = outbox else { return };
-        let has_snapshot = !ds.snapshots.is_empty();
+        let mut refreshes: Vec<(uuid::Uuid, Envelope)> = Vec::new();
         {
-            let sub = ds.subscribers.entry(conn_id).or_insert(SubscriberState {
-                awaiting_snapshot: !has_snapshot,
-                acked: 0,
-            });
-            sub.awaiting_snapshot = !has_snapshot;
-        }
-        browser_streams.entry(conn_id).or_default().insert(key);
+            let mut g = self.inner.lock().unwrap();
+            if !g.browsers.contains_key(&conn_id) {
+                return;
+            }
+            let HubInner {
+                streams,
+                browsers,
+                browser_streams,
+                ..
+            } = &mut *g;
+            let ds = streams
+                .entry(key.clone())
+                .or_insert_with(|| DStream::new(key.clone()));
+            let outbox = browsers.get(&conn_id).map(|b| b.outbox.clone());
+            let Some(outbox) = outbox else { return };
+            let has_snapshot = !ds.snapshots.is_empty();
+            {
+                let sub = ds.subscribers.entry(conn_id).or_insert(SubscriberState {
+                    awaiting_snapshot: !has_snapshot,
+                    acked: 0,
+                });
+                sub.awaiting_snapshot = !has_snapshot;
+            }
+            browser_streams.entry(conn_id).or_default().insert(key);
 
-        if has_snapshot {
-            // 已有 snapshot:Subscribed → snapshot → 缓冲事件(§17.4 步骤 5)。
-            let epoch = ds.epoch;
-            let anchor = ds.snapshot_anchor().unwrap_or(0);
-            outbox.push_direct(encode_direct(&subscribed_env(&ds.stream_id, epoch, anchor)));
-            for snap in &ds.snapshots {
-                let _ = outbox.push_frame(snap.clone());
+            if has_snapshot {
+                if let Some(window) = ds.replay_window() {
+                    // 窗口可证明连续:Subscribed 锚定最新快照 → 全部缓存快照
+                    // (覆盖列表流的各设备)→ 连续事件窗口(§17.4 步骤 5)。
+                    let epoch = ds.epoch;
+                    let base = ds.latest_snapshot_seq().unwrap_or(0);
+                    outbox.push_direct(encode_direct(&subscribed_env(
+                        &ds.stream_id,
+                        epoch,
+                        base,
+                    )));
+                    for snap in &ds.snapshots {
+                        let _ = outbox.push_frame(snap.clone());
+                    }
+                    for frame in &window {
+                        let _ = outbox.push_frame(frame.clone());
+                    }
+                } else {
+                    // 窗口被合并/淘汰过,无法证明连续:重取上游权威快照,
+                    // 不给单个订阅者临时编号后再接回全局序号(避免 resync 风暴)。
+                    refreshes = ds.refresh_snapshot_envs();
+                }
             }
-            for (i, frame) in ds.buffer.items.iter().enumerate() {
-                let _ = outbox.push_frame(frame.renumbered(epoch, anchor + 1 + i as u64));
-            }
+            // 尚无 snapshot 时不预发 Subscribed:到达后由 flush 统一按
+            // Subscribed → snapshot → 缓冲事件发送(§17.4 顺序唯一)。
         }
-        // 尚无 snapshot 时不预发 Subscribed:到达后由 flush 统一按
-        // Subscribed → snapshot → 缓冲事件发送(§17.4 顺序唯一)。
+        for (device, env) in refreshes {
+            self.send_to_bridge(device, env);
+        }
     }
 
     pub fn browser_unsubscribe(&self, conn_id: uuid::Uuid, stream_id: &str) {
@@ -680,8 +755,10 @@ impl Hub {
         }
     }
 
-    /// Browser ResyncRequest(§17.5):列表流窗口内重放；单会话详情向 Bridge
-    /// 重取完整 RuntimeSnapshot，避免合并窗口的序号空洞反复触发 resync。
+    /// Browser ResyncRequest(§17.5):列表流在窗口可证明连续时原样重放
+    /// (最新快照 + 连续事件);窗口被合并/淘汰过或尚无快照时,向上游重取
+    /// 权威快照。单会话详情始终向 Bridge 重取完整 RuntimeSnapshot,避免
+    /// 合并窗口的序号空洞反复触发 resync。
     pub fn browser_resync(&self, conn_id: uuid::Uuid, stream_id: &str) {
         let mut g = self.inner.lock().unwrap();
         let Some(key) = g
@@ -693,71 +770,53 @@ impl Hub {
             return;
         };
 
-        if matches!(key.1, TargetTag::Session { .. }) {
-            let tag = key.1.clone();
-            let refreshes = {
-                let Some(ds) = g.streams.get_mut(&key) else {
-                    return;
-                };
-                if !ds.subscribers.contains_key(&conn_id) {
-                    return;
-                }
-                for subscriber in ds.subscribers.values_mut() {
-                    subscriber.awaiting_snapshot = true;
-                }
-                ds.snapshots.clear();
-                ds.buffer.clear();
-                ds.upstreams
-                    .values_mut()
-                    .filter_map(|binding| {
-                        // false 表示同一详情流已有 fresh snapshot 在途；后续
-                        // resync 只等待它，不能再发 Subscribe 造成 epoch 抖动。
-                        if !binding.snapshot_received {
-                            return None;
-                        }
-                        binding.epoch = 0;
-                        binding.last_seq = 0;
-                        binding.snapshot_received = false;
-                        Some((
-                            binding.device,
-                            Self::upstream_subscribe_env(binding.device, &tag),
-                        ))
-                    })
-                    .collect::<Vec<_>>()
+        let refreshes: Vec<(uuid::Uuid, Envelope)> = {
+            let HubInner {
+                streams,
+                browsers,
+                ..
+            } = &mut *g;
+            let Some(ds) = streams.get_mut(&key) else {
+                return;
             };
-            for (device, env) in refreshes {
-                Self::send_to_bridge_locked(&g, device, env);
+            if !ds.subscribers.contains_key(&conn_id) {
+                return;
             }
-            return;
-        }
-
-        let HubInner {
-            streams, browsers, ..
-        } = &mut *g;
-        let Some(ds) = streams.get_mut(&key) else {
-            return;
+            if matches!(key.1, TargetTag::Session { .. }) {
+                // 详情流:权威快照重取(全部订阅者回到 awaiting)。
+                ds.refresh_snapshot_envs()
+            } else {
+                match ds.replay_window() {
+                    Some(window) => {
+                        if let Some(sub) = ds.subscribers.get_mut(&conn_id) {
+                            sub.awaiting_snapshot = false;
+                        }
+                        let Some(outbox) =
+                            browsers.get(&conn_id).map(|b| b.outbox.clone())
+                        else {
+                            return;
+                        };
+                        let (epoch, stream_id) = (ds.epoch, ds.stream_id.clone());
+                        let base = ds.latest_snapshot_seq().unwrap_or(0);
+                        outbox.push_direct(encode_direct(&subscribed_env(
+                            &stream_id, epoch, base,
+                        )));
+                        // 快照覆盖列表订阅的各设备:全部缓存快照按序重发,
+                        // 单台设备的局部快照不会清空其余设备。
+                        for snap in &ds.snapshots {
+                            let _ = outbox.push_frame(snap.clone());
+                        }
+                        for frame in &window {
+                            let _ = outbox.push_frame(frame.clone());
+                        }
+                        Vec::new()
+                    }
+                    None => ds.refresh_snapshot_envs(),
+                }
+            }
         };
-        match ds.snapshot_anchor() {
-            Some(anchor) => {
-                if let Some(sub) = ds.subscribers.get_mut(&conn_id) {
-                    sub.awaiting_snapshot = false;
-                }
-                let outbox = browsers.get(&conn_id).map(|b| b.outbox.clone());
-                let Some(outbox) = outbox else { return };
-                let (epoch, stream_id) = (ds.epoch, ds.stream_id.clone());
-                outbox.push_direct(encode_direct(&subscribed_env(&stream_id, epoch, anchor)));
-                for snap in &ds.snapshots {
-                    let _ = outbox.push_frame(snap.clone());
-                }
-                for (i, frame) in ds.buffer.items.iter().enumerate() {
-                    let _ = outbox.push_frame(frame.renumbered(epoch, anchor + 1 + i as u64));
-                }
-            }
-            None => {
-                if let Some(sub) = ds.subscribers.get_mut(&conn_id) {
-                    sub.awaiting_snapshot = true;
-                }
-            }
+        for (device, env) in refreshes {
+            Self::send_to_bridge_locked(&g, device, env);
         }
     }
 
@@ -905,7 +964,13 @@ impl Hub {
         // flush(§17.4 步骤 5):等待 snapshot 的订阅者按 Subscribed → snapshot → 缓冲;
         // 已活跃订阅者把 snapshot 当普通帧应用。
         let (anchor, stream_id, epoch) = (seq, ds.stream_id.clone(), ds.epoch);
-        let buffered: Vec<Arc<Frame>> = ds.buffer.items.iter().cloned().collect();
+        let buffered: Vec<Arc<Frame>> = ds
+            .buffer
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, f)| f.renumbered(epoch, anchor + 1 + i as u64))
+            .collect();
         // 缓冲帧会从 anchor+1 连续重编号；推进全局 next_seq，避免下一条
         // 实时帧复用回放序号并让客户端立刻再次判定 gap。
         ds.next_seq = ds.next_seq.max(
@@ -928,13 +993,19 @@ impl Hub {
                 let _ = outbox.push_frame(frame.clone());
                 // 缓冲事件在 snapshot 之后投递:为该订阅者重新编号,保证同
                 // stream+epoch 内 sequence 单调(§17.5)。
-                for (i, f) in buffered.iter().enumerate() {
-                    let _ = outbox.push_frame(f.renumbered(epoch, anchor + 1 + i as u64));
+                for f in &buffered {
+                    let _ = outbox.push_frame(f.clone());
                 }
                 ds.subscribers.get_mut(&conn_id).unwrap().awaiting_snapshot = false;
             } else {
                 let _ = outbox.push_frame(frame.clone());
             }
+        }
+        // 缓冲窗口原位改写为 snapshot 之后的连续区间(与新快照同 epoch 的
+        // 连续坐标),后续回放可证明连续;原快照覆盖的旧事件不再以旧坐标
+        // 重放,无法证明连续时由调用方重取快照。
+        for (i, f) in ds.buffer.items.iter_mut().enumerate() {
+            *f = f.renumbered(epoch, anchor + 1 + i as u64);
         }
     }
 
@@ -970,13 +1041,18 @@ impl Hub {
         }
 
         // push 触发映射(§24):turn 终态 / 等待问题 / 等待审批。
-        // 列表流上仅摘要事件携带目标会话;详情流用 tag 目标。
-        let (tag_device, tag_native) = match &key.1 {
+        // 列表流上仅摘要事件携带目标会话;详情流用 tag 目标(含 agent_kind)。
+        let (tag_device, tag_native, tag_agent_kind) = match &key.1 {
             TargetTag::Session {
                 device,
+                agent_kind,
                 native_session_id,
-            } => (Some(*device), Some(native_session_id.clone())),
-            TargetTag::List => (None, None),
+            } => (
+                Some(*device),
+                Some(native_session_id.clone()),
+                agent_kind_name(*agent_kind),
+            ),
+            TargetTag::List => (None, None, String::new()),
         };
         let owner = key.0;
         for event in &events {
@@ -989,11 +1065,7 @@ impl Hub {
                     ),
                     None => continue,
                 },
-                _ => (
-                    tag_device,
-                    tag_native.clone(),
-                    "AGENT_KIND_CODEX_DESKTOP".to_string(),
-                ),
+                _ => (tag_device, tag_native.clone(), tag_agent_kind.clone()),
             };
             let (Some(device), Some(native)) = (device, native) else {
                 continue;
@@ -1017,9 +1089,13 @@ impl Hub {
             return push_triggers;
         };
         let device = env.device_id.clone();
+        // 合并 key 附加流身份(stream/epoch/上游设备):同一列表流聚合多台
+        // 设备、同一浏览器聚合多个流,同 item ID 不得交叉合并或替换(§17.6)。
+        let merge_scope = format!("{}/{}/{}", ds.stream_id, ds.epoch, device);
         let mut slow_all: Vec<uuid::Uuid> = Vec::new();
         for event in events {
             let (kind, merge) = classify(&event);
+            let merge = merge.map(|m| m.scoped(&merge_scope));
             let seq = ds.next_seq;
             ds.next_seq += 1;
             let mut frame_env = base_envelope(
@@ -1252,10 +1328,21 @@ impl Hub {
                 worst = Some((key.clone(), ds.buffer.bytes));
             }
         }
+        let mut queued = 0u64;
         for bc in g.browsers.values() {
-            total += (bc.outbox.len() * 1024) as u64; // 队列字节按帧均 1 KiB 估算
+            queued += bc.outbox.queued_bytes() as u64;
         }
+        total += queued;
         self.global_buffer_bytes.store(total, Ordering::Relaxed);
+        tracing::debug!(
+            target: "relay::realtime",
+            browsers = g.browsers.len(),
+            streams = g.streams.len(),
+            queued_bytes = queued,
+            overload_closes = buffer::OUTBOX_OVERLOAD_CLOSES.load(Ordering::Relaxed),
+            write_timeouts = buffer::WS_WRITE_TIMEOUTS.load(Ordering::Relaxed),
+            "relay realtime diagnostics"
+        );
         if total > limits::GLOBAL_BUFFER_MAX_BYTES as u64 {
             if let Some((key, _)) = worst {
                 if let Some(ds) = g.streams.get_mut(&key) {
@@ -1607,6 +1694,9 @@ impl Hub {
                 }
                 let tag = TargetTag::Session {
                     device,
+                    // 原样保留浏览器的 agent_kind(未知值不默认转 Codex,ZC-02;
+                    // 由 Bridge 显式拒绝)。
+                    agent_kind: key.agent_kind,
                     native_session_id: key.native_session_id.clone(),
                 };
                 self.browser_subscribe(conn_id, (ident.owner_id, tag.clone()), vec![(device, tag)]);
@@ -1858,10 +1948,15 @@ fn subscribe_target_list() -> subscribe::Target {
     subscribe::Target::List(SessionList {})
 }
 
-fn subscribe_target_session(device: uuid::Uuid, native_session_id: &str) -> subscribe::Target {
+fn subscribe_target_session(
+    device: uuid::Uuid,
+    agent_kind: i32,
+    native_session_id: &str,
+) -> subscribe::Target {
     subscribe::Target::Session(SessionKey {
         device_id: device.to_string(),
-        agent_kind: agent_console_protocol::v1::AgentKind::CodexDesktop as i32,
+        // 浏览器声明的 agent_kind 原样透传(ZC-02;未知值由 Bridge 拒绝)。
+        agent_kind,
         native_session_id: native_session_id.to_string(),
         relay_session_uuid: String::new(),
     })
@@ -1880,5 +1975,65 @@ pub fn operation_name(op: &agent_console_protocol::v1::Operation) -> String {
 impl Default for Hub {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ZC-02:同机双 Agent 同 nativeSessionId 时,上游流键与发给 Bridge 的
+    /// 订阅目标必须按 agent_kind 区分,详情流/事件/命令路由互不串线。
+    #[test]
+    fn upstream_keys_distinguish_agent_kind_for_same_native_id() {
+        let device = uuid::Uuid::new_v4();
+        let codex = TargetTag::Session {
+            device,
+            agent_kind: agent_console_protocol::v1::AgentKind::CodexDesktop as i32,
+            native_session_id: "dup-1".to_string(),
+        };
+        let zcode = TargetTag::Session {
+            device,
+            agent_kind: agent_console_protocol::v1::AgentKind::ZcodeDesktop as i32,
+            native_session_id: "dup-1".to_string(),
+        };
+        assert_ne!(codex, zcode, "DKey 必须按 agent_kind 区分");
+        assert_ne!(
+            upstream_stream_id(device, &codex),
+            upstream_stream_id(device, &zcode),
+            "上游流键必须按 agent_kind 区分"
+        );
+        // 上游 Subscribe 信封携带各自真实 agent_kind(Relay → Bridge)。
+        let env = Hub::upstream_subscribe_env(device, &zcode);
+        match env.payload {
+            Some(envelope::Payload::Subscribe(sub)) => match sub.target {
+                Some(subscribe::Target::Session(key)) => {
+                    assert_eq!(
+                        key.agent_kind,
+                        agent_console_protocol::v1::AgentKind::ZcodeDesktop as i32
+                    );
+                    assert_eq!(key.native_session_id, "dup-1");
+                }
+                other => panic!("unexpected target {other:?}"),
+            },
+            other => panic!("unexpected payload {other:?}"),
+        }
+    }
+
+    /// 未知 agent_kind 数值在流键中同样彼此隔离(不默认折叠为 Codex)。
+    #[test]
+    fn unknown_agent_kind_values_stay_isolated() {
+        let device = uuid::Uuid::new_v4();
+        let codex = TargetTag::Session {
+            device,
+            agent_kind: 1,
+            native_session_id: "dup-1".to_string(),
+        };
+        let unknown = TargetTag::Session {
+            device,
+            agent_kind: 9,
+            native_session_id: "dup-1".to_string(),
+        };
+        assert_ne!(upstream_stream_id(device, &codex), upstream_stream_id(device, &unknown));
     }
 }

@@ -385,6 +385,25 @@ async fn offline_device_returns_device_offline_for_queries() {
     assert_eq!(body["error"]["code"], "DEVICE_OFFLINE");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn version_endpoint_reports_relay_and_protocol_versions() {
+    let env = setup(&[]).await;
+    // 网关按 /agent-console/api/* 原样转发:版本端点必须挂在该前缀下。
+    let resp = http_get(&env.relay, "/agent-console/api/version", &[]).await;
+    assert!(resp.status().is_success(), "GET /version must succeed");
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(
+        body["relayVersion"].as_str(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "relay version must match the relay crate version"
+    );
+    assert_eq!(
+        body["protocolVersion"].as_u64(),
+        Some(agent_console_protocol::codec::PROTOCOL_VERSION as u64),
+        "protocol version must match the protocol crate constant"
+    );
+}
+
 // 引用保持:确保 QueryRequest/GitSummaryQuery 类型被编译器检查(转发侧字段一致性)。
 #[allow(dead_code)]
 fn _type_witness(_q: QueryRequest, _g: GitSummaryQuery) {}
