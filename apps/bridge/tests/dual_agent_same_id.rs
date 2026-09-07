@@ -310,6 +310,14 @@ async fn read_reply(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> 
     serde_json::from_str(line.trim()).unwrap()
 }
 
+/// 模拟新 helper 合同(R2-ZC01):收到决定并完成原生输出后回发交付确认行。
+async fn send_delivery_ack(writer: &mut tokio::net::unix::OwnedWriteHalf, invoke_id: &str) {
+    let mut line = contract::delivery_ack_json(invoke_id);
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+}
+
 async fn wait_registered(hooks: &ZcodeHooks, invoke_id: &str) {
     for _ in 0..200 {
         if hooks.registry().get(invoke_id).is_some() {
@@ -530,26 +538,32 @@ async fn detail_streams_route_events_by_agent_kind() {
 #[tokio::test]
 async fn commands_and_queries_are_kind_scoped() {
     let mut dual = setup("cmd").await;
-    let (_guard, mut reader) =
+    let (mut guard, mut reader) =
         send_invoke(&dual.zcode_socket, &permission_invoke("z-cmd-1")).await;
     wait_registered(&dual.hooks, "z-cmd-1").await;
 
-    // ① ZCode 决定(同 ID,kind=ZCODE_DESKTOP)→ COMPLETED,helper 收到 allowed。
-    dual.runtime
-        .handle_envelope(command(
-            pb::AgentKind::ZcodeDesktop,
-            DUP_ID,
-            pb::Operation::AnswerApproval,
-            command_request::Payload::AnswerApproval(pb::AnswerApprovalPayload {
-                approval_id: "z-cmd-1".to_string(),
-                decision_id: "allow".to_string(),
-            }),
-        ))
-        .await;
+    // ① ZCode 决定(同 ID,kind=ZCODE_DESKTOP)→ COMPLETED,helper 收到
+    // allowed;命令与 helper 应答并发(真实时序),完成原生输出后回 ack。
+    let runtime_for_cmd = dual.runtime.clone();
+    let cmd_task = tokio::spawn(async move {
+        runtime_for_cmd
+            .handle_envelope(command(
+                pb::AgentKind::ZcodeDesktop,
+                DUP_ID,
+                pb::Operation::AnswerApproval,
+                command_request::Payload::AnswerApproval(pb::AnswerApprovalPayload {
+                    approval_id: "z-cmd-1".to_string(),
+                    decision_id: "allow".to_string(),
+                }),
+            ))
+            .await;
+    });
     let reply = tokio::time::timeout(Duration::from_secs(3), read_reply(&mut reader))
         .await
         .expect("helper reply in time");
     assert_eq!(reply.status, contract::STATUS_ALLOWED);
+    send_delivery_ack(&mut guard, "z-cmd-1").await;
+    cmd_task.await.expect("command task must not panic");
     let envelopes = dual.outbox.collect_until(4, Duration::from_secs(3)).await;
     assert!(
         envelopes.iter().any(|env| matches!(

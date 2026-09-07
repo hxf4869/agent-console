@@ -71,6 +71,9 @@ struct UpstreamBinding {
     epoch: u64,
     /// 已处理到的上游批 sequence(去重水位;0 表示未定)。
     last_seq: u64,
+    /// 当前在途快照覆盖的上游水位(§17.4 步骤 3:Subscribed.base_sequence)。
+    /// 快照到达时据此只清除确实被覆盖的缓冲事件,内容层不会回退。
+    snapshot_covers: u64,
     snapshot_received: bool,
 }
 
@@ -80,13 +83,17 @@ struct DStream {
     stream_id: String,
     epoch: u64,
     next_seq: u64,
-    /// 已缓存的 snapshot 帧(会话流通常 1 条;列表流每设备一条,有界)。
+    /// 各上游设备最新缓存的 snapshot 帧(会话流 1 条;列表流每设备一条)。
     snapshots: VecDeque<Arc<Frame>>,
     buffer: StreamBuffer,
     subscribers: HashMap<uuid::Uuid, SubscriberState>,
     /// 上游绑定:upstream_stream_id → binding。
     upstreams: HashMap<String, UpstreamBinding>,
 }
+
+/// 单流快照缓存总量硬上限:设备换 UUID 重桥会累积旧设备快照,超过上限时
+/// 淘汰最旧快照;淘汰产生空洞时 full_replay 落空,由 anchored_replay 兜底。
+const SNAPSHOT_CACHE_MAX: usize = 16;
 
 impl DStream {
     fn new(key: DKey) -> Self {
@@ -106,34 +113,90 @@ impl DStream {
         }
     }
 
-    /// 最新缓存 snapshot 的 sequence(重放锚点)。
+    /// 缓存该设备的最新快照(替换同设备旧快照;列表聚合按设备维护,一台设备
+    /// 的新快照不充当其他设备事件的覆盖锚)。总量超过 `SNAPSHOT_CACHE_MAX`
+    /// 时淘汰最旧快照,缓存有界(§17.6)。
+    fn cache_snapshot(&mut self, frame: Arc<Frame>) {
+        self.snapshots
+            .retain(|s| s.env.device_id != frame.env.device_id);
+        self.snapshots.push_back(frame);
+        while self.snapshots.len() > SNAPSHOT_CACHE_MAX {
+            self.snapshots.pop_front();
+        }
+    }
+
     fn latest_snapshot_seq(&self) -> Option<u64> {
         self.snapshots.back().map(|f| f.env.sequence)
     }
 
-    /// 可重放的连续事件窗口:缓冲中位于最新 snapshot 之后的事件必须恰好
-    /// 连续覆盖 `base+1 .. next_seq-1`。窗口发生过合并/淘汰(压缩)时返回
-    /// None,调用方必须改为向上游重取快照,不能把压缩窗口当作同一 epoch
-    /// 的连续事件直接续播(否则客户端会判定缺口,形成 Resync 风暴)。
-    fn replay_window(&self) -> Option<Vec<Arc<Frame>>> {
-        let base = self.latest_snapshot_seq()?;
-        let expected_start = base.checked_add(1)?;
-        let window: Vec<Arc<Frame>> = self
-            .buffer
-            .items
-            .iter()
-            .filter(|f| f.env.sequence > base)
-            .cloned()
-            .collect();
-        if window.len() as u64 != self.next_seq.checked_sub(expected_start)? {
+    /// 存活帧全集(各设备最新快照 + 缓冲事件帧),按下游序号升序。
+    fn surviving_frames(&self) -> Vec<Arc<Frame>> {
+        let mut frames: Vec<Arc<Frame>> = self.snapshots.iter().cloned().collect();
+        frames.extend(self.buffer.items.iter().cloned());
+        frames.sort_by_key(|f| f.env.sequence);
+        frames
+    }
+
+    /// 重放窗口首帧的 Subscribed.base(§17.4 步骤 5):窗口以快照帧开头时,
+    /// 快照即已应用水位,base = 快照帧序号(快照占据 base,其后事件从
+    /// base+1 连续);以事件帧开头(如列表流他设备未覆盖帧在前)时,
+    /// base = 首帧序号-1,首帧事件从 base+1 连续。
+    fn replay_base(&self, first: &Arc<Frame>) -> u64 {
+        let lo = first.env.sequence;
+        if self.snapshots.iter().any(|s| Arc::ptr_eq(s, first)) {
+            lo
+        } else {
+            lo.saturating_sub(1)
+        }
+    }
+
+    /// 完整恢复重放:存活帧序号必须连续覆盖 `lo..next_seq-1`(lo 为首帧
+    /// 序号),返回 `(base, frames)`,base 语义见 `replay_base`。覆盖删除、
+    /// 合并或淘汰产生过空洞时返回 None,调用方改用锚定重放,不能把不连续
+    /// 窗口交给客户端。
+    fn full_replay(&self) -> Option<(u64, Vec<Arc<Frame>>)> {
+        let frames = self.surviving_frames();
+        let first = frames.first()?;
+        let lo = first.env.sequence;
+        if frames.len() as u64 != self.next_seq.checked_sub(lo)? {
             return None;
         }
-        for (i, f) in window.iter().enumerate() {
-            if f.env.sequence != expected_start + i as u64 {
+        for (i, f) in frames.iter().enumerate() {
+            if f.env.sequence != lo + i as u64 {
                 return None;
             }
         }
-        Some(window)
+        let base = self.replay_base(first);
+        Some((base, frames))
+    }
+
+    /// 锚定最新快照的保底重放:frames = 快照 + 缓冲中位于快照之后且仍连续
+    /// 的帧。缓冲段不连续(合并/淘汰只作用于可由快照恢复的类别)时整段
+    /// 丢弃,恢复者从快照重建。恒可用,保证恢复路径始终有序收尾。
+    /// base 由窗口首帧推导(`replay_base`;缓冲尾帧序号恒大于各快照,
+    /// 窗口非空时必以快照帧开头)。
+    fn anchored_replay(&self) -> (u64, Vec<Arc<Frame>>) {
+        let anchor = self.latest_snapshot_seq().unwrap_or(0);
+        let mut frames: Vec<Arc<Frame>> = self.snapshots.iter().cloned().collect();
+        let tail: Vec<Arc<Frame>> = self
+            .buffer
+            .items
+            .iter()
+            .filter(|f| f.env.sequence > anchor)
+            .cloned()
+            .collect();
+        let expected_tail_len = self.next_seq.checked_sub(anchor + 1).unwrap_or(0);
+        let contiguous = tail.len() as u64 == expected_tail_len
+            && tail
+                .iter()
+                .enumerate()
+                .all(|(i, f)| f.env.sequence == anchor + 1 + i as u64);
+        if contiguous {
+            frames.extend(tail);
+        }
+        frames.sort_by_key(|f| f.env.sequence);
+        let base = frames.first().map(|f| self.replay_base(f)).unwrap_or(0);
+        (base, frames)
     }
 
     /// 该流的全部上游绑定重取快照(已有 fresh snapshot 在途的绑定不重复订阅,
@@ -154,6 +217,7 @@ impl DStream {
                 }
                 binding.epoch = 0;
                 binding.last_seq = 0;
+                binding.snapshot_covers = 0;
                 binding.snapshot_received = false;
                 Some((
                     binding.device,
@@ -276,6 +340,29 @@ fn subscribed_env(stream_id: &str, epoch: u64, base_sequence: u64) -> Envelope {
             base_sequence,
         }),
     )
+}
+
+/// 慢 consumer / 快照回放入队失败的统一收尾(§17.6):尽力送达 ResyncRequired、
+/// 以稳定 reason 断开并摘除订阅。实时帧慢 consumer 与快照/回放 push 失败
+/// 复用同一策略,绝不"let _ 之后宣称恢复完成"。
+fn detach_failed_subscriber(
+    streams: &mut HashMap<DKey, DStream>,
+    browsers: &mut HashMap<uuid::Uuid, BrowserConn>,
+    browser_streams: &mut HashMap<uuid::Uuid, HashSet<DKey>>,
+    key: &DKey,
+    conn_id: uuid::Uuid,
+) {
+    if let Some(ds) = streams.get_mut(key) {
+        ds.subscribers.remove(&conn_id);
+        if let Some(bc) = browsers.get(&conn_id) {
+            let env = resync_required_env(&ds.stream_id);
+            bc.outbox.push_direct(encode_direct(&env));
+            bc.outbox.close("RESYNC_REQUIRED");
+        }
+    }
+    if let Some(set) = browser_streams.get_mut(&conn_id) {
+        set.remove(key);
+    }
 }
 
 impl Hub {
@@ -602,6 +689,7 @@ impl Hub {
                             device,
                             epoch: 0,
                             last_seq: 0,
+                            snapshot_covers: 0,
                             snapshot_received: false,
                         },
                     );
@@ -648,6 +736,7 @@ impl Hub {
                             device,
                             epoch: 0,
                             last_seq: 0,
+                            snapshot_covers: 0,
                             snapshot_received: false,
                         },
                     );
@@ -664,6 +753,7 @@ impl Hub {
                     if let Some(binding) = ds.upstreams.get_mut(&uid) {
                         binding.epoch = 0;
                         binding.last_seq = 0;
+                        binding.snapshot_covers = 0;
                         binding.snapshot_received = false;
                     }
                     ds.snapshots.clear();
@@ -680,7 +770,6 @@ impl Hub {
         }
         drop(g1);
         // 挂接 subscriber(§17.4 步骤 2):有 snapshot 则立刻按顺序回放。
-        let mut refreshes: Vec<(uuid::Uuid, Envelope)> = Vec::new();
         {
             let mut g = self.inner.lock().unwrap();
             if !g.browsers.contains_key(&conn_id) {
@@ -705,36 +794,37 @@ impl Hub {
                 });
                 sub.awaiting_snapshot = !has_snapshot;
             }
-            browser_streams.entry(conn_id).or_default().insert(key);
+            browser_streams.entry(conn_id).or_default().insert(key.clone());
 
             if has_snapshot {
-                if let Some(window) = ds.replay_window() {
-                    // 窗口可证明连续:Subscribed 锚定最新快照 → 全部缓存快照
-                    // (覆盖列表流的各设备)→ 连续事件窗口(§17.4 步骤 5)。
-                    let epoch = ds.epoch;
-                    let base = ds.latest_snapshot_seq().unwrap_or(0);
-                    outbox.push_direct(encode_direct(&subscribed_env(
-                        &ds.stream_id,
-                        epoch,
-                        base,
-                    )));
-                    for snap in &ds.snapshots {
-                        let _ = outbox.push_frame(snap.clone());
+                // 恢复重放:优先完整存活窗口;存在空洞(覆盖删除/合并/淘汰)
+                // 时锚定最新快照。序号即全局序号,不为单个订阅者改写坐标;
+                // 全部入队成功才转入活跃,失败复用重同步/断开收尾(R2-AC01)。
+                let (base, frames) = match ds.full_replay() {
+                    Some(replay) => replay,
+                    None => ds.anchored_replay(),
+                };
+                let (epoch, stream_id) = (ds.epoch, ds.stream_id.clone());
+                let subscribed = encode_direct(&subscribed_env(&stream_id, epoch, base));
+                let mut ok = outbox.push_direct(subscribed);
+                if ok {
+                    for frame in &frames {
+                        if outbox.push_frame(frame.clone()).is_err() {
+                            ok = false;
+                            break;
+                        }
                     }
-                    for frame in &window {
-                        let _ = outbox.push_frame(frame.clone());
+                }
+                if ok {
+                    if let Some(sub) = ds.subscribers.get_mut(&conn_id) {
+                        sub.awaiting_snapshot = false;
                     }
                 } else {
-                    // 窗口被合并/淘汰过,无法证明连续:重取上游权威快照,
-                    // 不给单个订阅者临时编号后再接回全局序号(避免 resync 风暴)。
-                    refreshes = ds.refresh_snapshot_envs();
+                    detach_failed_subscriber(streams, browsers, browser_streams, &key, conn_id);
                 }
             }
             // 尚无 snapshot 时不预发 Subscribed:到达后由 flush 统一按
             // Subscribed → snapshot → 缓冲事件发送(§17.4 顺序唯一)。
-        }
-        for (device, env) in refreshes {
-            self.send_to_bridge(device, env);
         }
     }
 
@@ -755,10 +845,10 @@ impl Hub {
         }
     }
 
-    /// Browser ResyncRequest(§17.5):列表流在窗口可证明连续时原样重放
-    /// (最新快照 + 连续事件);窗口被合并/淘汰过或尚无快照时,向上游重取
-    /// 权威快照。单会话详情始终向 Bridge 重取完整 RuntimeSnapshot,避免
-    /// 合并窗口的序号空洞反复触发 resync。
+    /// Browser ResyncRequest(§17.5):列表流按全局序号重放存活帧(优先完整
+    /// 窗口,空洞时锚定最新快照),不为单个订阅者改写坐标;单会话详情始终
+    /// 向 Bridge 重取完整 RuntimeSnapshot,避免合并窗口的序号空洞反复触发
+    /// resync。回放入队失败复用重同步/断开收尾。
     pub fn browser_resync(&self, conn_id: uuid::Uuid, stream_id: &str) {
         let mut g = self.inner.lock().unwrap();
         let Some(key) = g
@@ -774,6 +864,7 @@ impl Hub {
             let HubInner {
                 streams,
                 browsers,
+                browser_streams,
                 ..
             } = &mut *g;
             let Some(ds) = streams.get_mut(&key) else {
@@ -782,37 +873,40 @@ impl Hub {
             if !ds.subscribers.contains_key(&conn_id) {
                 return;
             }
-            if matches!(key.1, TargetTag::Session { .. }) {
+            if matches!(key.1, TargetTag::Session { .. }) || ds.snapshots.is_empty() {
                 // 详情流:权威快照重取(全部订阅者回到 awaiting)。
+                // 列表流尚无快照(如内存压力清理后)同样重取上游权威快照。
                 ds.refresh_snapshot_envs()
             } else {
-                match ds.replay_window() {
-                    Some(window) => {
-                        if let Some(sub) = ds.subscribers.get_mut(&conn_id) {
-                            sub.awaiting_snapshot = false;
+                // 列表流恢复:优先完整存活窗口;空洞时锚定最新快照。序号即
+                // 全局序号,不为单个订阅者改写坐标;全部入队成功才宣告恢复
+                // 完成,失败复用重同步/断开收尾(R2-AC01)。
+                let (base, frames) = match ds.full_replay() {
+                    Some(replay) => replay,
+                    None => ds.anchored_replay(),
+                };
+                let (epoch, stream_id) = (ds.epoch, ds.stream_id.clone());
+                let Some(outbox) = browsers.get(&conn_id).map(|b| b.outbox.clone()) else {
+                    return;
+                };
+                let subscribed = encode_direct(&subscribed_env(&stream_id, epoch, base));
+                let mut ok = outbox.push_direct(subscribed);
+                if ok {
+                    for frame in &frames {
+                        if outbox.push_frame(frame.clone()).is_err() {
+                            ok = false;
+                            break;
                         }
-                        let Some(outbox) =
-                            browsers.get(&conn_id).map(|b| b.outbox.clone())
-                        else {
-                            return;
-                        };
-                        let (epoch, stream_id) = (ds.epoch, ds.stream_id.clone());
-                        let base = ds.latest_snapshot_seq().unwrap_or(0);
-                        outbox.push_direct(encode_direct(&subscribed_env(
-                            &stream_id, epoch, base,
-                        )));
-                        // 快照覆盖列表订阅的各设备:全部缓存快照按序重发,
-                        // 单台设备的局部快照不会清空其余设备。
-                        for snap in &ds.snapshots {
-                            let _ = outbox.push_frame(snap.clone());
-                        }
-                        for frame in &window {
-                            let _ = outbox.push_frame(frame.clone());
-                        }
-                        Vec::new()
                     }
-                    None => ds.refresh_snapshot_envs(),
                 }
+                if ok {
+                    if let Some(sub) = ds.subscribers.get_mut(&conn_id) {
+                        sub.awaiting_snapshot = false;
+                    }
+                } else {
+                    detach_failed_subscriber(streams, browsers, browser_streams, &key, conn_id);
+                }
+                Vec::new()
             }
         };
         for (device, env) in refreshes {
@@ -878,6 +972,9 @@ impl Hub {
                 let c = binding.snapshot_received && binding.epoch != sub.stream_epoch;
                 binding.epoch = sub.stream_epoch;
                 binding.last_seq = sub.base_sequence.saturating_sub(1);
+                // 快照覆盖水位(§17.4 步骤 3):快照内容锚定该 base_sequence,
+                // 之后据此只清除确实被覆盖的缓冲事件。
+                binding.snapshot_covers = sub.base_sequence;
                 binding.snapshot_received = false;
                 c
             };
@@ -926,6 +1023,7 @@ impl Hub {
                     b.snapshot_received = false;
                     b.epoch = 0;
                     b.last_seq = 0;
+                    b.snapshot_covers = 0;
                 }
             }
             sub_envs.push((device, Self::upstream_subscribe_env(device, &tag)));
@@ -936,20 +1034,35 @@ impl Hub {
     }
 
     /// 上游 snapshot(RuntimeSnapshot 或 snapshot=true 的 SessionSummaryBatch)。
+    ///
+    /// 覆盖语义(R2-AC01):快照锚定上游 `Subscribed.base_sequence` 水位,
+    /// 只清除该设备确实被覆盖的缓冲事件——内容已在快照中,不再以新序号
+    /// 重新应用,内容层绝不把新状态改回旧状态;其他设备与水位之后的事件
+    /// 保持原下游序号,一台设备的新快照不覆盖、不重编号他人事件。快照帧
+    /// 占用下一个全局序号(即活跃订阅者的下一期待帧),活跃坐标不被扰动;
+    /// 恢复订阅者按存活帧重放(完整窗口,空洞时锚定最新快照),与活跃订阅
+    /// 者交付同一序号含义。
     fn handle_upstream_snapshot(g: &mut HubInner, upstream_id: &str, env: &Envelope) {
         let Some(key) = g.upstream_index.get(upstream_id).cloned() else {
             return;
         };
         let HubInner {
-            streams, browsers, ..
+            streams,
+            browsers,
+            browser_streams,
+            ..
         } = &mut *g;
         let Some(ds) = streams.get_mut(&key) else {
             return;
         };
-        if let Some(binding) = ds.upstreams.get_mut(upstream_id) {
-            binding.snapshot_received = true;
-        }
-        // 下游 snapshot 帧:重新编号并缓存。
+        let Some(binding) = ds.upstreams.get_mut(upstream_id) else {
+            return;
+        };
+        binding.snapshot_received = true;
+        let covered = binding.snapshot_covers;
+        let device = env.device_id.clone();
+        ds.buffer.retain_uncovered(&device, covered);
+        // 下游 snapshot 帧:占用下一个全局序号,按设备替换缓存快照。
         let seq = ds.next_seq;
         ds.next_seq += 1;
         let mut frame_env = env.clone();
@@ -957,55 +1070,54 @@ impl Hub {
         frame_env.stream_epoch = ds.epoch;
         frame_env.sequence = seq;
         let frame = Frame::new(frame_env, FrameKind::Critical, None);
-        ds.snapshots.push_back(frame.clone());
-        while ds.snapshots.len() > 16 {
-            ds.snapshots.pop_front();
-        }
-        // flush(§17.4 步骤 5):等待 snapshot 的订阅者按 Subscribed → snapshot → 缓冲;
-        // 已活跃订阅者把 snapshot 当普通帧应用。
-        let (anchor, stream_id, epoch) = (seq, ds.stream_id.clone(), ds.epoch);
-        let buffered: Vec<Arc<Frame>> = ds
-            .buffer
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, f)| f.renumbered(epoch, anchor + 1 + i as u64))
-            .collect();
-        // 缓冲帧会从 anchor+1 连续重编号；推进全局 next_seq，避免下一条
-        // 实时帧复用回放序号并让客户端立刻再次判定 gap。
-        ds.next_seq = ds.next_seq.max(
-            anchor
-                .saturating_add(1)
-                .saturating_add(buffered.len() as u64),
-        );
+        ds.cache_snapshot(frame.clone());
+        // flush(§17.4 步骤 5):等待 snapshot 的订阅者按 Subscribed → 存活帧
+        // 序列恢复;已活跃订阅者把 snapshot 当普通帧(恰为其下一期待序号)。
+        let (stream_id, epoch) = (ds.stream_id.clone(), ds.epoch);
+        let (base, replay_frames) = match ds.full_replay() {
+            Some(replay) => replay,
+            None => ds.anchored_replay(),
+        };
         let conn_ids: Vec<uuid::Uuid> = ds.subscribers.keys().cloned().collect();
+        let mut to_detach: Vec<uuid::Uuid> = Vec::new();
         for conn_id in conn_ids {
-            let awaiting = ds
-                .subscribers
-                .get_mut(&conn_id)
-                .map(|s| s.awaiting_snapshot);
-            let outbox = browsers.get(&conn_id).map(|b| b.outbox.clone());
-            let (Some(awaiting), Some(outbox)) = (awaiting, outbox) else {
+            let awaiting = ds.subscribers.get(&conn_id).map(|s| s.awaiting_snapshot);
+            let Some(outbox) = browsers.get(&conn_id).map(|b| b.outbox.clone()) else {
                 continue;
             };
-            if awaiting {
-                outbox.push_direct(encode_direct(&subscribed_env(&stream_id, epoch, anchor)));
-                let _ = outbox.push_frame(frame.clone());
-                // 缓冲事件在 snapshot 之后投递:为该订阅者重新编号,保证同
-                // stream+epoch 内 sequence 单调(§17.5)。
-                for f in &buffered {
-                    let _ = outbox.push_frame(f.clone());
+            match awaiting {
+                Some(true) => {
+                    let subscribed = encode_direct(&subscribed_env(&stream_id, epoch, base));
+                    let mut ok = outbox.push_direct(subscribed);
+                    if ok {
+                        for f in &replay_frames {
+                            if outbox.push_frame(f.clone()).is_err() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        // 快照与回放全部成功入队后才恢复接收后续事件;
+                        // 失败复用重同步/断开收尾,不宣称恢复完成。
+                        if let Some(s) = ds.subscribers.get_mut(&conn_id) {
+                            s.awaiting_snapshot = false;
+                        }
+                    } else {
+                        to_detach.push(conn_id);
+                    }
                 }
-                ds.subscribers.get_mut(&conn_id).unwrap().awaiting_snapshot = false;
-            } else {
-                let _ = outbox.push_frame(frame.clone());
+                Some(false) => {
+                    if outbox.push_frame(frame.clone()).is_err() {
+                        to_detach.push(conn_id);
+                    }
+                }
+                None => {}
             }
         }
-        // 缓冲窗口原位改写为 snapshot 之后的连续区间(与新快照同 epoch 的
-        // 连续坐标),后续回放可证明连续;原快照覆盖的旧事件不再以旧坐标
-        // 重放,无法证明连续时由调用方重取快照。
-        for (i, f) in ds.buffer.items.iter_mut().enumerate() {
-            *f = f.renumbered(epoch, anchor + 1 + i as u64);
+        // 入队失败收尾(借用结束后统一执行):ResyncRequired + 稳定断开。
+        for conn_id in to_detach {
+            detach_failed_subscriber(streams, browsers, browser_streams, &key, conn_id);
         }
     }
 
@@ -1111,7 +1223,14 @@ impl Hub {
             frame_env.stream_id = ds.stream_id.clone();
             frame_env.stream_epoch = ds.epoch;
             frame_env.sequence = seq;
-            let frame = Frame::new(frame_env, kind, merge);
+            // 记录上游批号:快照覆盖判定只清除确实被覆盖的事件(R2-AC01);
+            // 上游未提供批号(0)时视为未知,任何快照都不得删除该帧。
+            let upstream_seq = if env.sequence == 0 {
+                None
+            } else {
+                Some(env.sequence)
+            };
+            let frame = Frame::with_upstream_seq(frame_env, kind, merge, upstream_seq);
 
             // 入缓冲(三重上限 + 优先级;OverflowReset 时广播 ResyncRequired,§17.6)。
             let outcome = ds.buffer.insert(frame.clone());
@@ -1141,19 +1260,8 @@ impl Hub {
         }
         // 慢 consumer 处理(事件循环结束后统一执行,不阻塞上游)。
         if !slow_all.is_empty() {
-            if let Some(ds) = streams.get_mut(&key) {
-                let stream_id = ds.stream_id.clone();
-                for conn_id in &slow_all {
-                    if let Some(bc) = browsers.get(conn_id) {
-                        bc.outbox
-                            .push_direct(encode_direct(&resync_required_env(&stream_id)));
-                        bc.outbox.close("RESYNC_REQUIRED");
-                    }
-                    ds.subscribers.remove(conn_id);
-                    if let Some(set) = browser_streams.get_mut(conn_id) {
-                        set.remove(&key);
-                    }
-                }
+            for conn_id in &slow_all {
+                detach_failed_subscriber(streams, browsers, browser_streams, &key, *conn_id);
             }
             tracing::debug!(target: "relay::realtime", "slow consumer resynced and detached");
         }
@@ -1190,6 +1298,15 @@ impl Hub {
             let Some(ds) = streams.get_mut(&key) else {
                 continue;
             };
+            // 首个快照尚未缓存且全部订阅者仍在等待快照时,本地 presence 帧
+            // 不入队:它只会落在首快照之前的回放窗口里,把首订阅重放变成
+            // "事件帧在前"(base=首帧-1),违反 §17.4 步骤 5 的握手顺序
+            //(快照占据 base,先于快照交付)。此状态下无人需要实时帧,直接
+            // 跳过且不消耗下游序号;已有活跃订阅者(如内存压力清理后)时
+            // 仍按原路径缓冲并直收。
+            if ds.snapshots.is_empty() && ds.subscribers.values().all(|s| s.awaiting_snapshot) {
+                continue;
+            }
             let seq = ds.next_seq;
             ds.next_seq += 1;
             let mut frame_env = base_envelope(
@@ -1220,15 +1337,7 @@ impl Hub {
                 }
             }
             for conn_id in slow {
-                if let Some(bc) = browsers.get(&conn_id) {
-                    bc.outbox
-                        .push_direct(encode_direct(&resync_required_env(&ds.stream_id)));
-                    bc.outbox.close("RESYNC_REQUIRED");
-                }
-                ds.subscribers.remove(&conn_id);
-                if let Some(set) = browser_streams.get_mut(&conn_id) {
-                    set.remove(&key);
-                }
+                detach_failed_subscriber(streams, browsers, browser_streams, &key, conn_id);
             }
         }
     }
@@ -1981,6 +2090,257 @@ impl Default for Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffer::{BROWSER_QUEUE_MAX_BYTES, OutItem};
+
+    fn test_browser(outbox: Arc<Outbox>) -> (uuid::Uuid, BrowserConn) {
+        let conn_id = uuid::Uuid::new_v4();
+        (
+            conn_id,
+            BrowserConn {
+                outbox,
+                ident: BrowserIdentity {
+                    auth_session_id: uuid::Uuid::new_v4(),
+                    owner_id: uuid::Uuid::new_v4(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                },
+            },
+        )
+    }
+
+    fn list_stream_fixture(device: uuid::Uuid) -> (DKey, String) {
+        let key = (uuid::Uuid::new_v4(), TargetTag::List);
+        let uid = upstream_stream_id(device, &TargetTag::List);
+        (key, uid)
+    }
+
+    /// 构造上游摘要事件(批 sequence 编码在 envelope 上,fan_out 据此记录
+    /// 帧的 upstream_seq)。
+    fn summary_events(device: uuid::Uuid, title: &str) -> Vec<domain_event::Event> {
+        vec![domain_event::Event::SessionSummaryChanged(
+            agent_console_protocol::v1::SessionSummary {
+                session_key: Some(agent_console_protocol::v1::SessionKey {
+                    device_id: device.to_string(),
+                    agent_kind: 1,
+                    native_session_id: "native-x".to_string(),
+                    relay_session_uuid: String::new(),
+                }),
+                title: title.to_string(),
+                ..Default::default()
+            },
+        )]
+    }
+
+    fn upstream_batch_env(device: uuid::Uuid, uid: &str, batch_seq: u64) -> Envelope {
+        let mut env = base_envelope(
+            &device.to_string(),
+            envelope::Payload::EventBatch(EventBatch {
+                stream_id: uid.to_string(),
+                events: vec![],
+            }),
+        );
+        env.stream_id = uid.to_string();
+        env.sequence = batch_seq;
+        env
+    }
+
+    fn snapshot_env(device: uuid::Uuid, uid: &str) -> Envelope {
+        let mut env = base_envelope(
+            &device.to_string(),
+            envelope::Payload::RuntimeSnapshot(
+                agent_console_protocol::v1::RuntimeSnapshot::default(),
+            ),
+        );
+        env.stream_id = uid.to_string();
+        env.sequence = 50;
+        env
+    }
+
+    /// R2-AC01 单元回归:
+    /// 1. 快照只删除确实覆盖(同设备、上游批号 ≤ Subscribed.base)的缓冲
+    ///    事件;未覆盖事件保持原下游序号,不重编号。
+    /// 2. awaiting 订阅者快照/回放全部成功入队后才转活跃。
+    /// 3. 入队失败(慢 consumer)复用重同步/断开收尾,不宣称恢复完成。
+    #[tokio::test]
+    async fn snapshot_flush_commits_active_state_and_detaches_on_push_failure() {
+        let device = uuid::Uuid::new_v4();
+        let (key, uid) = list_stream_fixture(device);
+        let mut g = HubInner::default();
+        g.upstream_index.insert(uid.clone(), key.clone());
+        {
+            let ds = g
+                .streams
+                .entry(key.clone())
+                .or_insert_with(|| DStream::new(key.clone()));
+            ds.upstreams.insert(
+                uid.clone(),
+                UpstreamBinding {
+                    device,
+                    epoch: 7,
+                    last_seq: 0,
+                    snapshot_covers: 10,
+                    snapshot_received: false,
+                },
+            );
+        }
+
+        let outbox_full = Arc::new(Outbox::new(1, BROWSER_QUEUE_MAX_BYTES));
+        let outbox_ok = Arc::new(Outbox::new(64, BROWSER_QUEUE_MAX_BYTES));
+        let (conn_full, conn) = test_browser(outbox_full.clone());
+        let (conn_ok, conn2) = test_browser(outbox_ok.clone());
+        g.browsers.insert(conn_full, conn);
+        g.browsers.insert(conn_ok, conn2);
+        let ds = g.streams.get_mut(&key).unwrap();
+        ds.subscribers
+            .insert(conn_full, SubscriberState { awaiting_snapshot: true, acked: 0 });
+        ds.subscribers
+            .insert(conn_ok, SubscriberState { awaiting_snapshot: true, acked: 0 });
+
+        // 快照前缓冲两个事件:批 5(被 covers=10 覆盖)、批 15(未覆盖)。
+        // awaiting 订阅者只入缓冲不直收(§17.4 步骤 4)。
+        let env5 = upstream_batch_env(device, &uid, 5);
+        Hub::fan_out_events(&mut g, &uid, &env5, summary_events(device, "covered"));
+        let env15 = upstream_batch_env(device, &uid, 15);
+        Hub::fan_out_events(&mut g, &uid, &env15, summary_events(device, "uncovered"));
+
+        // 填满慢订阅者队列:快照回放入队必然 SlowConsumer。
+        let filler = Frame::new(
+            upstream_batch_env(device, &uid, 999),
+            FrameKind::Recoverable,
+            None,
+        );
+        outbox_full.push_frame(filler).unwrap();
+
+        Hub::handle_upstream_snapshot(&mut g, &uid, &snapshot_env(device, &uid));
+
+        // 覆盖删除:仅批 5 的帧被删;批 15 保留原序号(seq2),不重编号。
+        {
+            let ds = g.streams.get(&key).unwrap();
+            assert_eq!(ds.buffer.len(), 1);
+            assert_eq!(ds.buffer.items[0].env.sequence, 2);
+            assert_eq!(ds.buffer.items[0].upstream_seq, Some(15));
+            assert_eq!(ds.next_seq, 4, "snapshot occupies seq3, no renumbering");
+        }
+        // 慢订阅者:收尾 = ResyncRequired + 稳定断开 + 订阅摘除。
+        assert!(
+            !g.streams[&key].subscribers.contains_key(&conn_full),
+            "failed flush must not keep the subscriber"
+        );
+        assert!(outbox_full.is_closed());
+        let mut saw_resync = false;
+        loop {
+            match outbox_full.recv().await {
+                Some(OutItem::Direct(bytes)) => {
+                    let env = agent_console_protocol::codec::decode_envelope(&bytes)
+                        .expect("decode direct");
+                    match env.payload {
+                        Some(envelope::Payload::ResyncRequired(_)) => saw_resync = true,
+                        Some(envelope::Payload::Subscribed(_)) => {}
+                        other => panic!("unexpected direct frame: {other:?}"),
+                    }
+                }
+                Some(OutItem::Close(reason)) => {
+                    assert_eq!(reason, "RESYNC_REQUIRED");
+                    break;
+                }
+                Some(OutItem::Frame(_)) => panic!("unexpected stream frame"),
+                None => break,
+            }
+        }
+        assert!(saw_resync, "resync hint must be delivered on flush failure");
+
+        // 正常订阅者:快照+回放成功入队后转活跃,重放按全局序号连续。
+        {
+            let ds = g.streams.get(&key).unwrap();
+            let sub = ds.subscribers.get(&conn_ok).unwrap();
+            assert!(!sub.awaiting_snapshot, "successful flush must go live");
+        }
+        let mut seqs = Vec::new();
+        let mut saw_subscribed = false;
+        for _ in 0..3 {
+            match outbox_ok.recv().await {
+                Some(OutItem::Direct(bytes)) => {
+                    let env = agent_console_protocol::codec::decode_envelope(&bytes)
+                        .expect("decode direct");
+                    assert!(matches!(
+                        env.payload,
+                        Some(envelope::Payload::Subscribed(ref s)) if s.base_sequence == 1
+                    ));
+                    saw_subscribed = true;
+                }
+                Some(OutItem::Frame(f)) => seqs.push(f.env.sequence),
+                _ => panic!("unexpected outbox item"),
+            }
+        }
+        assert!(saw_subscribed);
+        assert_eq!(
+            seqs,
+            vec![2, 3],
+            "replay = uncovered event(seq2) + snapshot(seq3), base=1"
+        );
+    }
+
+    /// R2-AC01 e2e 回归锁定(e2e_no_ui 场景 4,§17.4 步骤 5):重放窗口以
+    /// 快照帧开头时(首次订阅的 fresh 流、清空重取后的详情流),Subscribed.
+    /// base_sequence 必须等于快照帧的下游序号——快照占据 base,其后事件从
+    /// base+1 连续;不得退化为"首帧序号-1"。
+    #[tokio::test]
+    async fn snapshot_first_window_anchors_base_at_snapshot_sequence() {
+        let device = uuid::Uuid::new_v4();
+        let (key, uid) = list_stream_fixture(device);
+        let mut g = HubInner::default();
+        g.upstream_index.insert(uid.clone(), key.clone());
+        {
+            let ds = g
+                .streams
+                .entry(key.clone())
+                .or_insert_with(|| DStream::new(key.clone()));
+            ds.upstreams.insert(
+                uid.clone(),
+                UpstreamBinding {
+                    device,
+                    epoch: 7,
+                    last_seq: 0,
+                    snapshot_covers: 0,
+                    snapshot_received: false,
+                },
+            );
+        }
+        let outbox = Arc::new(Outbox::new(64, BROWSER_QUEUE_MAX_BYTES));
+        let (conn, browser) = test_browser(outbox.clone());
+        g.browsers.insert(conn, browser);
+        g.streams.get_mut(&key).unwrap().subscribers.insert(
+            conn,
+            SubscriberState {
+                awaiting_snapshot: true,
+                acked: 0,
+            },
+        );
+
+        Hub::handle_upstream_snapshot(&mut g, &uid, &snapshot_env(device, &uid));
+
+        // fresh 流:快照帧占用下游序号 1;订阅者按 Subscribed → 快照收到。
+        let mut base: Option<u64> = None;
+        let mut snap_seq: Option<u64> = None;
+        for _ in 0..2 {
+            match outbox.recv().await {
+                Some(OutItem::Direct(bytes)) => {
+                    let env = agent_console_protocol::codec::decode_envelope(&bytes)
+                        .expect("decode direct");
+                    match env.payload {
+                        Some(envelope::Payload::Subscribed(s)) => base = Some(s.base_sequence),
+                        other => panic!("expected Subscribed, got {other:?}"),
+                    }
+                }
+                Some(OutItem::Frame(f)) => snap_seq = Some(f.env.sequence),
+                _ => panic!("unexpected outbox item"),
+            }
+        }
+        assert_eq!(snap_seq, Some(1), "fresh 流首帧快照占用序号 1");
+        assert_eq!(
+            base, snap_seq,
+            "快照 sequence 必须等于 Subscribed.base_sequence(§17.4 步骤 5)"
+        );
+    }
 
     /// ZC-02:同机双 Agent 同 nativeSessionId 时,上游流键与发给 Bridge 的
     /// 订阅目标必须按 agent_kind 区分,详情流/事件/命令路由互不串线。
@@ -2035,5 +2395,54 @@ mod tests {
             native_session_id: "dup-1".to_string(),
         };
         assert_ne!(upstream_stream_id(device, &codex), upstream_stream_id(device, &unknown));
+    }
+
+    /// 快照缓存总量硬上限:缓存超过 SNAPSHOT_CACHE_MAX 台设备的快照后,
+    /// 最旧快照被淘汰、长度有界;淘汰路径不 panic,锚定重放兜底仍可用。
+    #[test]
+    fn snapshot_cache_evicts_oldest_beyond_hard_cap_and_anchored_replay_survives() {
+        let mut ds = DStream::new((uuid::Uuid::new_v4(), TargetTag::List));
+        let devices: Vec<uuid::Uuid> = (0..17).map(|_| uuid::Uuid::new_v4()).collect();
+        for device in &devices {
+            let mut env = base_envelope(
+                &device.to_string(),
+                envelope::Payload::RuntimeSnapshot(
+                    agent_console_protocol::v1::RuntimeSnapshot::default(),
+                ),
+            );
+            env.stream_id = ds.stream_id.clone();
+            env.stream_epoch = ds.epoch;
+            env.sequence = ds.next_seq;
+            ds.next_seq += 1;
+            ds.cache_snapshot(Frame::new(env, FrameKind::Critical, None));
+        }
+        assert_eq!(
+            ds.snapshots.len(),
+            SNAPSHOT_CACHE_MAX,
+            "cache must stay bounded at the hard cap"
+        );
+        assert_eq!(
+            ds.snapshots.front().unwrap().env.device_id,
+            devices[1].to_string(),
+            "oldest device snapshot evicted first"
+        );
+        assert_eq!(
+            ds.snapshots.back().unwrap().env.device_id,
+            devices[16].to_string(),
+            "newest device snapshot retained"
+        );
+        // 锚定重放兜底:窗口非空、以缓存的快照帧开头,base 与首帧一致。
+        let (base, frames) = ds.anchored_replay();
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.env.device_id == devices[16].to_string()),
+            "latest snapshot must be replayable"
+        );
+        assert_eq!(
+            base,
+            frames.first().unwrap().env.sequence,
+            "window anchored at its first frame"
+        );
     }
 }

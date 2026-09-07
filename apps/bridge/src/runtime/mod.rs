@@ -1330,13 +1330,29 @@ impl BridgeRuntime {
                     }),
                 );
                 match resolved {
-                    Some(Ok(_)) => {
-                        self.send_command_result(
-                            &correlation,
-                            &request.request_id,
-                            pb::CommandReceiptStatus::ReceiptCompleted,
-                            None,
-                        );
+                    Some(Ok((invoke_id, _reply))) => {
+                        // R2-ZC01:oneshot 成功只表示 Bridge 接受了决定。
+                        // ReceiptCompleted 在该路径只表示「已确认输出原生协议
+                        // 结果」(helper stdout / MCP JSON-RPC 实际写出后的
+                        // 交付确认);写回失败、确认缺失或超时一律
+                        // OUTCOME_UNKNOWN —— 不报成功、不自动重新投递。
+                        let status = match zcode.registry().take_delivery(&invoke_id) {
+                            Some(mut delivery) => {
+                                // 有限等待:略大于 socket 侧 ack 等待窗口。
+                                let wait = std::time::Duration::from_millis(
+                                    crate::zcode::contract::DELIVERY_ACK_WAIT_MS + 2_000,
+                                );
+                                match tokio::time::timeout(wait, &mut delivery).await {
+                                    Ok(Ok(crate::zcode::pending::DeliveryOutcome::Delivered)) => {
+                                        pb::CommandReceiptStatus::ReceiptCompleted
+                                    }
+                                    _ => pb::CommandReceiptStatus::ReceiptOutcomeUnknown,
+                                }
+                            }
+                            // 记录已不在/通道已取走:结果未知。
+                            None => pb::CommandReceiptStatus::ReceiptOutcomeUnknown,
+                        };
+                        self.send_command_result(&correlation, &request.request_id, status, None);
                     }
                     Some(Err(err)) => {
                         self.send_command_result(
@@ -1402,14 +1418,10 @@ impl BridgeRuntime {
             return;
         }
         let request_id = domain_request.request_id;
-        // §15.3 队列替换:gateway 的 QueueNextTurn 是 set(replace=false);
-        // REPLACE 先清除既有条目再排队(两次本地 SQLite 操作,非原子)。
-        if matches!(
-            request.payload,
-            Some(pb::command_request::Payload::QueueReplace(_))
-        ) {
-            let _ = self.queue().cancel(&domain_request.session_key).await;
-        }
+        // §15.3 队列替换:set/replace 语义已随 payload 进入 gateway——先
+        // requestId 去重与快照校验,确认可替换后再单行事务更新同一条队列
+        // 记录;校验不过或写失败时旧队列保留。此处绝不预取消(旧链路的
+        // "先删再排队"会在新请求被拒时丢掉仍有价值的旧队列)。
         match self.inner.gateway.submit(domain_request).await {
             Ok(Submission::Accepted {
                 accepted_at,

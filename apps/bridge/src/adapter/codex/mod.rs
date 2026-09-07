@@ -721,7 +721,6 @@ impl CodexAdapter {
                 free_text,
             } => {
                 gate(&Operation::AnswerQuestion)?;
-                receipt!(ReceiptState::DispatchedToCodex);
                 // 0.153.4 回答路由与 payload 形状(asar V9t/
                 // replyWithUserInputResponse 链,2026-09-05 复核):外层
                 // request.id 与题目自身 id 是两个身份——
@@ -734,6 +733,10 @@ impl CodexAdapter {
                 // answers 元素与 option_id 的精确原生类型待 N01 真机采样
                 // 校正;free_text 以字符串元素追加(原生 isOther 输入的
                 // 接受形态未验证)。
+                //
+                // 组装在 Dispatched/原生写之前:多题请求在此被拒绝
+                // (CapabilityUnsupported),零回执、零原生写,原生 pending
+                // 保持(R2-CX01;服务端拦截,旧页面/直接请求无法绕过)。
                 let request_questions = {
                     let sessions = self.inner.sessions.lock();
                     sessions
@@ -746,7 +749,8 @@ impl CodexAdapter {
                     question_id.as_str(),
                     option_ids,
                     free_text.as_ref().map(|text| text.as_str()),
-                );
+                )?;
+                receipt!(ReceiptState::DispatchedToCodex);
                 generic_write(
                     &ipc,
                     &owner,
@@ -998,21 +1002,32 @@ impl SessionRuntime {
 /// `pendingQuestions` 路径:题目身份即路由 ID,不在 requests[] 中)→ 单键
 /// 回退,question_id 同时作 requestId 与 answers 内层键,行为与该投影约定
 /// 一致(fake owner / e2e 依赖)。
+///
+/// 多题请求(R2-CX01):在发送任何原生响应之前用现有 unsupported 语义拒绝
+/// 不完整回答——单卡命令只能回答第一题,其余题目会被自动空答。Err 返回时
+/// 调用方不得发送任何原生写,原生 pending 保持,提示回 Desktop 处理。
 fn answer_response_for(
     request_questions: &[projection::RequestsQuestion],
     question_id: &str,
     answered_labels: &[String],
     free_text: Option<&str>,
-) -> (String, serde_json::Value) {
+) -> Result<(String, serde_json::Value), AdapterError> {
     match request_questions
         .iter()
         .find(|request| request.request_id == question_id)
     {
-        Some(request) => (
-            request.request_id.clone(),
-            projection::build_request_answer_response(request, answered_labels, free_text),
-        ),
-        None => (
+        Some(request) => {
+            let response = projection::build_request_answer_response(
+                request,
+                answered_labels,
+                free_text,
+            )
+            .map_err(|message| {
+                AdapterError::stable(StableErrorCode::CapabilityUnsupported, message)
+            })?;
+            Ok((request.request_id.clone(), response))
+        }
+        None => Ok((
             question_id.to_string(),
             serde_json::json!({
                 "answers": {
@@ -1021,7 +1036,7 @@ fn answer_response_for(
                     },
                 },
             }),
-        ),
+        )),
     }
 }
 
@@ -1282,30 +1297,46 @@ async fn try_attach(inner: &Inner) -> Result<(), IpcError> {
         + 1;
 
     // ---- 能力重估(§5):重新发现实际运行时版本 ----
-    // version_binary 未配置:冻结启动时信任基础(调用方自行负责版本发现);
-    // 已配置:重新探测,版本与启动基准不一致 → 写矩阵全部失效(NotProbed),
-    // 只恢复可证明的读取能力,不凭"以前版本验证过"自动开放新版本写。
-    let fresh_version = ipc::discovery::probe_version(inner.version_binary.clone())
-        .await
-        .ok();
-    let version_unchanged = match (&fresh_version, &inner.version_report) {
-        (Some(fresh), Some(configured)) => {
-            ipc::discovery::normalized_version(fresh)
-                == ipc::discovery::normalized_version(configured)
-        }
-        _ => true,
-    };
-    let (version_report, write_probes) = if version_unchanged {
-        (
-            fresh_version.or_else(|| inner.version_report.clone()),
-            inner.write_method_probes,
-        )
-    } else {
-        tracing::warn!(
-            fresh = fresh_version.as_deref().unwrap_or("unknown"),
-            "codex version changed since startup; write capabilities stay closed"
-        );
-        (fresh_version, WriteMethodProbes::default())
+    // 两种模式(R2-AC03:探测失败不得冒充"已确认还是旧版本"):
+    // - version_binary=None:测试注入的明确冻结版本模式(seam 保留)——不重新
+    //   探测,版本与写矩阵按启动配置冻结(调用方自行负责版本发现确定性)。
+    // - version_binary=Some(生产):重新探测,探测结果决定写信任基础:
+    //   · 成功且与启动基准一致 → 同一已验证版本正常重连,恢复启动写矩阵;
+    //   · 成功但版本不同 → 版本已变化,写矩阵全部失效(NotProbed),只恢复
+    //     可证明的读取;
+    //   · 失败(超时/二进制失效/空输出)→ 无可信版本:保留连接与读取,
+    //     写能力关闭(DEGRADED + READ_ONLY,§5/§10.3),不沿用启动白名单。
+    let (version_report, write_probes) = match inner.version_binary.clone() {
+        None => (inner.version_report.clone(), inner.write_method_probes),
+        Some(binary) => match ipc::discovery::probe_version(Some(binary)).await {
+            Ok(fresh) => {
+                let unchanged = match inner.version_report.as_deref() {
+                    Some(configured) => {
+                        ipc::discovery::normalized_version(&fresh)
+                            == ipc::discovery::normalized_version(configured)
+                    }
+                    // 启动无版本基准时,新读到的可信版本即当前基准。
+                    None => true,
+                };
+                if unchanged {
+                    (Some(fresh), inner.write_method_probes)
+                } else {
+                    tracing::warn!(
+                        fresh = %fresh,
+                        "codex version changed since startup; write capabilities stay closed"
+                    );
+                    (Some(fresh), WriteMethodProbes::default())
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "codex version probe failed on attach; no trusted version, \
+                     write capabilities stay closed (degraded read-only)"
+                );
+                (None, WriteMethodProbes::default())
+            }
+        },
     };
     let input = capability_probe_input(
         version_report.as_deref(),
@@ -1434,8 +1465,13 @@ mod tests {
     #[test]
     fn answer_response_routes_by_request_id_and_keys_answers_by_question_id() {
         let detail = vec![request_fixture(&["q1"])];
-        let (request_id, response) =
-            answer_response_for(&detail, "req-q-1", &["Option A".to_string()], None);
+        let (request_id, response) = answer_response_for(
+            &detail,
+            "req-q-1",
+            &["Option A".to_string()],
+            None,
+        )
+        .expect("single-question request must assemble");
         assert_eq!(request_id, "req-q-1");
         let answers = answers_of(&response);
         assert!(
@@ -1449,33 +1485,45 @@ mod tests {
         assert_eq!(answers.get("q1"), Some(&json!({"answers": ["Option A"]})));
     }
 
-    // P2-10 回归②:多题 → 每题都进 payload;命令是单卡回答,所选选项与
-    // 自由文本归属第一题(与展示卡一致),其余题目显式空 answers。
+    // R2-CX01:多题请求在发送任何原生响应之前被拒绝(现有 unsupported 语义),
+    // 不产出"第一题有答案、其余自动空答"的不完整 payload;错误可理解并
+    // 提示回 Desktop 处理。原生 pending 保持(零原生写由调用路径保证:
+    // Err 在 generic_write 之前返回)。
     #[test]
-    fn answer_response_includes_every_question_of_multi_question_request() {
+    fn multi_question_request_is_rejected_without_partial_answers() {
         let detail = vec![request_fixture(&["q1", "q2"])];
-        let (request_id, response) = answer_response_for(
+        let err = answer_response_for(
             &detail,
             "req-q-1",
             &["Option A".to_string()],
             Some("custom"),
+        )
+        .expect_err("multi-question request must be rejected");
+        assert_eq!(err.code(), StableErrorCode::CapabilityUnsupported);
+        let AdapterError::Stable { message, .. } = err else {
+            panic!("expected stable error");
+        };
+        assert!(
+            message.contains("2 questions"),
+            "rejection must state the question count: {message}"
         );
-        assert_eq!(request_id, "req-q-1");
-        let answers = answers_of(&response);
-        assert_eq!(answers.len(), 2, "all questions must be assembled");
-        assert_eq!(
-            answers.get("q1"),
-            Some(&json!({"answers": ["Option A", "custom"]}))
+        assert!(
+            message.to_lowercase().contains("desktop"),
+            "rejection must point the user back to Desktop: {message}"
         );
-        assert_eq!(answers.get("q2"), Some(&json!({"answers": []})));
     }
 
     // P2-10 回归③:legacy `pendingQuestions` 路径(题目身份即路由 ID)在
     // 详情未命中时单键回退,行为不变(fake owner / e2e 回归)。
     #[test]
     fn answer_response_legacy_path_keeps_single_key_fallback() {
-        let (request_id, response) =
-            answer_response_for(&[], "legacy-q", &["yes".to_string()], None);
+        let (request_id, response) = answer_response_for(
+            &[],
+            "legacy-q",
+            &["yes".to_string()],
+            None,
+        )
+        .expect("legacy fallback is single-question by contract");
         assert_eq!(request_id, "legacy-q");
         let answers = answers_of(&response);
         assert_eq!(answers.get("legacy-q"), Some(&json!({"answers": ["yes"]})));

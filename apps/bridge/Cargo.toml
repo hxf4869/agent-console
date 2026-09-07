@@ -54,3 +54,5 @@ uuid = { workspace = true }
 # 集成测试:临时数据目录与本地 axum WS 测试服务器(仅 dev,不进生产依赖)。
 tempfile = "3"
 axum = { workspace = true }
+# 队列写失败测试:独立 SQLite 连接持有写锁(仅 dev,不进生产依赖)。
+sqlx = { workspace = true }

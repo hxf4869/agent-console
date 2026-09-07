@@ -87,6 +87,10 @@ pub struct Frame {
     pub env: Envelope,
     pub kind: FrameKind,
     pub merge: Option<MergeInfo>,
+    /// 产生该帧的上游事件批 sequence(§17.5 批级水位)。`None` 表示帧并非
+    /// 来自上游事件(快照帧、Relay 本地 presence)或上游未提供批号;快照
+    /// 覆盖判定(R2-AC01)只对 `Some` 帧生效,绝不误删本地事件。
+    pub upstream_seq: Option<u64>,
     pub ts: Instant,
     pub bytes_len: usize,
     encoded: OnceLock<Option<WireBytes>>,
@@ -94,11 +98,21 @@ pub struct Frame {
 
 impl Frame {
     pub fn new(env: Envelope, kind: FrameKind, merge: Option<MergeInfo>) -> Arc<Frame> {
+        Self::with_upstream_seq(env, kind, merge, None)
+    }
+
+    pub fn with_upstream_seq(
+        env: Envelope,
+        kind: FrameKind,
+        merge: Option<MergeInfo>,
+        upstream_seq: Option<u64>,
+    ) -> Arc<Frame> {
         let bytes_len = env.encoded_len();
         Arc::new(Frame {
             env,
             kind,
             merge,
+            upstream_seq,
             ts: Instant::now(),
             bytes_len,
             encoded: OnceLock::new(),
@@ -111,14 +125,6 @@ impl Frame {
         self.encoded
             .get_or_init(|| encode_envelope(&self.env).ok().map(Into::into))
             .clone()
-    }
-
-    /// 重编号(epoch/sequence 变化)后的新帧(合并缓存)。
-    pub fn renumbered(&self, epoch: u64, sequence: u64) -> Arc<Frame> {
-        let mut env = self.env.clone();
-        env.stream_epoch = epoch;
-        env.sequence = sequence;
-        Frame::new(env, self.kind, self.merge.clone())
     }
 }
 
@@ -251,7 +257,13 @@ fn merge_pair(a: &Frame, b: &Frame) -> Option<Arc<Frame>> {
     if env.encoded_len() > MAX_FRAME_BYTES {
         return None;
     }
-    Some(Frame::new(
+    // 合并帧的上游批号取保守值:任一侧未知(快照覆盖判定不得生效)或取更小
+    // 一侧,保证覆盖删除只会更保守、绝不多删。
+    let upstream_seq = match (a.upstream_seq, b.upstream_seq) {
+        (Some(sa), Some(sb)) => Some(sa.min(sb)),
+        _ => None,
+    };
+    Some(Frame::with_upstream_seq(
         env,
         a.kind,
         Some(MergeInfo::OutputAppend {
@@ -259,6 +271,7 @@ fn merge_pair(a: &Frame, b: &Frame) -> Option<Arc<Frame>> {
             offset: *oa,
             len: la + lb,
         }),
+        upstream_seq,
     ))
 }
 
@@ -439,6 +452,22 @@ impl StreamBuffer {
             .filter(|f| f.env.sequence >= from_sequence)
             .cloned()
             .collect()
+    }
+
+    /// 删除已被上游快照覆盖的事件帧(R2-AC01):同设备且上游批 sequence ≤
+    /// 覆盖水位。只回放确实在快照覆盖范围之后的事件,旧摘要事件不会以新
+    /// 序号重新应用、把新状态改回旧状态。返回删除帧数。
+    pub fn retain_uncovered(&mut self, device: &str, covered_upstream_seq: u64) -> usize {
+        let before = self.items.len();
+        self.items.retain(|f| {
+            !(f.env.device_id == device
+                && f.upstream_seq.is_some_and(|s| s <= covered_upstream_seq))
+        });
+        let removed = before - self.items.len();
+        if removed > 0 {
+            self.bytes = self.items.iter().map(|f| f.bytes_len).sum();
+        }
+        removed
     }
 
     pub fn clear(&mut self) {

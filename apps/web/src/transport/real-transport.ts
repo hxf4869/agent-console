@@ -634,13 +634,26 @@ export class RealConsoleTransport implements ConsoleTransport {
         onHello()
         return
       case 'subscribed': {
+        // 已知流先重绑定(服务端重发 Subscribed / 合法切换 stream epoch):
+        // 接受新 epoch 并以 baseSequence(已应用水位)重建坐标:服务端有两种
+        // 合法窗口形态——快照帧开头时首帧 seq=base(#acceptSnapshot 无门控,
+        // 直接生效),事件帧开头时首帧 seq=base+1(#sequencedStream 门控恰好
+        // 放行),两种形态均自洽;不依赖新 TCP 连接(R2-AC01)。
+        const existing = this.#streamStates.get(payload.value.streamId)
+        if (existing) {
+          existing.epoch = payload.value.streamEpoch
+          existing.lastSequence = payload.value.baseSequence
+          return
+        }
+        // 仅新流才依赖待建立订阅信息;未知或无法关联的响应不绑定到
+        // 当前另一个会话。
         const target = this.#pendingSubscription
         if (!target) return
         this.#pendingSubscriptionStream = payload.value.streamId
         this.#streamStates.set(payload.value.streamId, {
           target,
           epoch: payload.value.streamEpoch,
-          lastSequence: payload.value.baseSequence - 1n,
+          lastSequence: payload.value.baseSequence,
         })
         return
       }
@@ -654,11 +667,12 @@ export class RealConsoleTransport implements ConsoleTransport {
           this.#rememberSessions(sessions)
           this.#listener?.({ type: 'sessions', sessions, snapshot: payload.value.snapshot })
         } catch {
-          // 应用失败不得把未应用数据记为成功:走受控恢复。
+          // 应用失败不得把未应用数据记为成功:不提交序号,走受控恢复。
           this.#requestStreamResync(envelope.streamId)
           return
         }
-        if (!payload.value.snapshot) stream.lastSequence = envelope.sequence
+        // 应用成功后才提交已应用水位并 ACK(§17.4 步骤 6)。
+        stream.lastSequence = envelope.sequence
         if (sessions.some((session) => !isUuid(session.id))) this.#refreshCanonicalSessions()
         this.#ack(envelope)
         this.#completeSubscription(envelope.streamId)
@@ -667,8 +681,15 @@ export class RealConsoleTransport implements ConsoleTransport {
       case 'runtimeSnapshot': {
         const stream = this.#acceptSnapshot(envelope)
         if (!stream || stream.target.kind !== 'session') return
-        const runtime = mapRuntimeSnapshotProto(stream.target.sessionId, payload.value)
-        this.#listener?.({ type: 'runtime-snapshot', sessionId: stream.target.sessionId, runtime })
+        try {
+          const runtime = mapRuntimeSnapshotProto(stream.target.sessionId, payload.value)
+          this.#listener?.({ type: 'runtime-snapshot', sessionId: stream.target.sessionId, runtime })
+        } catch {
+          // 应用失败不得提交序号:保留恢复状态,走受控恢复。
+          this.#requestStreamResync(envelope.streamId)
+          return
+        }
+        stream.lastSequence = envelope.sequence
         this.#ack(envelope)
         this.#completeSubscription(envelope.streamId)
         return
@@ -921,11 +942,14 @@ export class RealConsoleTransport implements ConsoleTransport {
     }
   }
 
+  /**
+   * 快照接受校验(不提交水位):同 stream+epoch 才接受,成功快照重建坐标、
+   * 解除该流的恢复在途标记;序号由调用方在应用成功后提交并 ACK,
+   * 应用失败保留恢复状态走受控恢复(R2-AC01)。
+   */
   #acceptSnapshot(envelope: Envelope): StreamState | undefined {
     const stream = this.#streamStates.get(envelope.streamId)
     if (!stream || stream.epoch !== envelope.streamEpoch) return undefined
-    stream.lastSequence = envelope.sequence
-    // 成功快照重建坐标:解除该流的恢复在途标记。
     this.#clearResyncInFlight(envelope.streamId)
     return stream
   }

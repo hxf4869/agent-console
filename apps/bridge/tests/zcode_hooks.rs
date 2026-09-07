@@ -78,6 +78,28 @@ impl Outbox {
         }
         out
     }
+
+    /// 持续收集直到出现第一条 CommandResult 回执(R2-ZC01:回执在
+    /// Accepted/事件之后到达,collect_until 可能被事件先填满)。返回沿途
+    /// 全部信封(含回执),便于同时断言事件与回执。
+    async fn collect_through_receipt(&mut self, timeout: Duration) -> Vec<pb::Envelope> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, self.rx.recv()).await {
+                Ok(Some(env)) => {
+                    let is_result =
+                        matches!(env.payload, Some(envelope::Payload::CommandResult(_)));
+                    out.push(env);
+                    if is_result {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +262,14 @@ async fn read_reply(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> 
     serde_json::from_str(line.trim()).unwrap()
 }
 
+/// 模拟新 helper 合同(R2-ZC01):收到决定并完成原生输出后回发交付确认行。
+async fn send_delivery_ack(writer: &mut tokio::net::unix::OwnedWriteHalf, invoke_id: &str) {
+    let mut line = contract::delivery_ack_json(invoke_id);
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+}
+
 fn inbound_envelope(payload: pb::envelope::Payload, correlation: &str) -> pb::Envelope {
     pb::Envelope {
         protocol_version: PROTOCOL_VERSION,
@@ -368,7 +398,7 @@ async fn browser_allow_command_resolves_pending_and_publishes_events() {
 
     // helper 发起 PermissionRequest。
     let invoke = permission_invoke("e2e-allow-1");
-    let (_guard, mut reader) = send_invoke(&zcode_socket, &invoke).await;
+    let (mut guard, mut reader) = send_invoke(&zcode_socket, &invoke).await;
     wait_registered(&hooks, "e2e-allow-1").await;
 
     // 卡片事件已发(PendingAttentionAdded;摘要不隐去工具名与输入摘要)。
@@ -389,12 +419,21 @@ async fn browser_allow_command_resolves_pending_and_publishes_events() {
         envelopes.iter().map(payload_kind).collect::<Vec<_>>()
     );
 
-    // 浏览器命令 allow。
-    runtime.handle_envelope(approval_command("e2e-allow-1", "allow")).await;
+    // 浏览器命令 allow:命令面在确认交付期间阻塞,helper 侧并发读应答并
+    // 在完成原生输出后回发交付确认(与真实时序一致)。
+    let runtime_for_cmd = runtime.clone();
+    let command = tokio::spawn(async move {
+        runtime_for_cmd
+            .handle_envelope(approval_command("e2e-allow-1", "allow"))
+            .await
+    });
     let reply = tokio::time::timeout(Duration::from_secs(3), read_reply(&mut reader))
         .await
         .expect("helper reply in time");
     assert_eq!(reply.status, contract::STATUS_ALLOWED);
+    // 新 helper 合同:完成原生输出后回发交付确认,COMPLETED 才允许上报。
+    send_delivery_ack(&mut guard, "e2e-allow-1").await;
+    let _ = command.await;
 
     // 回执:CommandAccepted → CommandResult COMPLETED。
     let envelopes = outbox.collect_until(4, Duration::from_secs(3)).await;
@@ -643,6 +682,20 @@ async fn real_helper_process_keeps_pending_alive_until_decided() {
         line.trim(),
         r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
     );
+    // R2-ZC01:真实 helper 在完成 stdout 输出后回发交付确认 → 注册表进入
+    // ReturnedToRuntime(确认 = 原生协议结果已确认输出)。
+    for _ in 0..100 {
+        if hooks.registry().get(&invoke_id).map(|s| s.state) == Some(PendingState::ReturnedToRuntime)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        hooks.registry().get(&invoke_id).map(|s| s.state),
+        Some(PendingState::ReturnedToRuntime),
+        "真实 helper 完成原生输出后必须回发交付确认"
+    );
 
     server_task.abort();
     let _ = helper.wait().await;
@@ -669,7 +722,7 @@ async fn zcode_dispatch_requires_matching_session_binding() {
     .await
     .unwrap();
 
-    let (_guard, mut reader) = send_invoke(&zcode_socket, &permission_invoke("x-1")).await;
+    let (_guard, _reader) = send_invoke(&zcode_socket, &permission_invoke("x-1")).await;
     wait_registered(&hooks, "x-1").await;
 
     /// 自定义目标(设备/agentKind/native)的 AnswerApproval 信封。
@@ -792,20 +845,28 @@ async fn zcode_dispatch_requires_matching_session_binding() {
     )
     .await;
 
-    // ⑤ 正确目标:绑定完全一致仍能决定,helper 收到 allowed。
-    runtime
-        .handle_envelope(approval_to(
-            DEVICE,
-            pb::AgentKind::ZcodeDesktop,
-            "sess-z1",
-            "x-1",
-            "allow",
-        ))
-        .await;
+    // ⑤ 正确目标:绑定完全一致仍能决定,helper 收到 allowed;回发交付
+    // 确认后 COMPLETED(未确认不报成功)。命令与 helper 应答并发(真实时序)。
+    let (mut guard, mut reader) = send_invoke(&zcode_socket, &permission_invoke("x-ok")).await;
+    wait_registered(&hooks, "x-ok").await;
+    let runtime_for_cmd = runtime.clone();
+    let command = tokio::spawn(async move {
+        runtime_for_cmd
+            .handle_envelope(approval_to(
+                DEVICE,
+                pb::AgentKind::ZcodeDesktop,
+                "sess-z1",
+                "x-ok",
+                "allow",
+            ))
+            .await
+    });
     let reply = tokio::time::timeout(Duration::from_secs(3), read_reply(&mut reader))
         .await
         .expect("helper reply in time");
     assert_eq!(reply.status, contract::STATUS_ALLOWED);
+    send_delivery_ack(&mut guard, "x-ok").await;
+    let _ = command.await;
     let envelopes = outbox.collect_until(4, Duration::from_secs(3)).await;
     assert!(
         envelopes.iter().any(|env| matches!(
@@ -1164,6 +1225,465 @@ async fn ask_session_listed_only_after_actual_ask() {
         .expect("helper reply in time");
     assert_eq!(reply.status, contract::STATUS_ANSWERED);
 
+    server_task.abort();
+}
+
+/// R2-ZC01 验收:决定已写回但 helper 无交付确认(旧 helper 行为)→
+/// 命令面收到 OUTCOME_UNKNOWN(不得报 COMPLETED),注册表按未确认收尾,
+/// 卡片摘除,迟到决定被拒(不自动重新投递允许决定)。
+#[tokio::test]
+async fn missing_ack_reports_outcome_unknown_never_completed() {
+    let (runtime, mut outbox, _data_dir) = setup("no-ack").await;
+    let zcode_socket = short_socket_dir("no-ack-hook");
+    let hooks = Arc::new(ZcodeHooks::new(DEVICE, zcode_socket.clone()));
+    hooks.set_runtime(&runtime);
+    runtime.attach_zcode_hooks(hooks.clone());
+    let server_task = server::serve(
+        server::HookServerConfig {
+            socket_path: zcode_socket.clone(),
+        },
+        hooks.clone(),
+    )
+    .await
+    .unwrap();
+    runtime.handle_envelope(subscribe_session("sess-z1")).await;
+    let _ = outbox.collect_until(2, Duration::from_secs(3)).await;
+
+    let (_guard, mut reader) = send_invoke(&zcode_socket, &permission_invoke("e2e-noack-1")).await;
+    wait_registered(&hooks, "e2e-noack-1").await;
+    // 决定送达(能读到 allowed),但 helper 不回 ack —— 模拟旧 helper/输出卡死。
+    runtime
+        .handle_envelope(approval_command("e2e-noack-1", "allow"))
+        .await;
+    let reply = tokio::time::timeout(Duration::from_secs(3), read_reply(&mut reader))
+        .await
+        .expect("helper reply in time");
+    assert_eq!(reply.status, contract::STATUS_ALLOWED);
+
+    // 回执:有限等待确认超时 → OUTCOME_UNKNOWN(不报 COMPLETED);
+    // 卡片摘除(事件通道)与回执同批收集。
+    let envelopes = outbox.collect_through_receipt(Duration::from_secs(8)).await;
+    let receipts: Vec<(i32, i32)> = envelopes
+        .iter()
+        .filter_map(|env| match &env.payload {
+            Some(envelope::Payload::CommandResult(r)) => Some((r.status, r.error_code)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        receipts
+            .iter()
+            .any(|(status, _)| *status == pb::CommandReceiptStatus::ReceiptOutcomeUnknown as i32),
+        "确认缺失必须回报 OUTCOME_UNKNOWN: {receipts:?}"
+    );
+    assert!(
+        !receipts
+            .iter()
+            .any(|(status, _)| *status == pb::CommandReceiptStatus::ReceiptCompleted as i32),
+        "确认缺失不得报 COMPLETED"
+    );
+    assert!(
+        envelopes.iter().any(|env| matches!(
+            env.payload,
+            Some(envelope::Payload::EventBatch(ref b))
+                if b.events.iter().any(|e| matches!(
+                    e.event,
+                    Some(pb::domain_event::Event::PendingAttentionRemoved(_))
+                ))
+        )),
+        "未确认收尾仍必须摘除卡片: {:?}",
+        envelopes.iter().map(payload_kind).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        hooks.registry().get("e2e-noack-1").map(|s| s.state),
+        Some(PendingState::HandledLocally),
+        "未确认不得冒充 ReturnedToRuntime"
+    );
+    // 不自动重新投递:迟到决定一律拒绝。
+    runtime
+        .handle_envelope(approval_command("e2e-noack-1", "allow"))
+        .await;
+    let envelopes = outbox.collect_until(4, Duration::from_secs(3)).await;
+    assert!(
+        envelopes.iter().any(|env| matches!(
+            env.payload,
+            Some(envelope::Payload::CommandResult(ref r))
+                if r.status == pb::CommandReceiptStatus::ReceiptRejected as i32
+                    && r.error_code == pb::StableErrorCode::ApprovalExpired as i32
+        )),
+        "未确认后迟到决定必须被拒(不得二次批准)"
+    );
+    server_task.abort();
+}
+
+/// R2-ZC01 验收:helper 在决定送达前退出(决定前 EOF)→ 撤销/收尾路径,
+/// 任何情况下不得报 COMPLETED;registry 记录终态(卡片、registry 一致)。
+#[tokio::test]
+async fn helper_exit_before_delivery_never_reports_completed() {
+    let (runtime, mut outbox, _data_dir) = setup("helper-gone").await;
+    let zcode_socket = short_socket_dir("helper-gone-hook");
+    let hooks = Arc::new(ZcodeHooks::new(DEVICE, zcode_socket.clone()));
+    hooks.set_runtime(&runtime);
+    runtime.attach_zcode_hooks(hooks.clone());
+    let server_task = server::serve(
+        server::HookServerConfig {
+            socket_path: zcode_socket.clone(),
+        },
+        hooks.clone(),
+    )
+    .await
+    .unwrap();
+    runtime.handle_envelope(subscribe_session("sess-z1")).await;
+    let _ = outbox.collect_until(2, Duration::from_secs(3)).await;
+
+    let (guard, reader) = send_invoke(&zcode_socket, &permission_invoke("e2e-gone-1")).await;
+    wait_registered(&hooks, "e2e-gone-1").await;
+    // helper 消失:整条连接关闭。
+    drop(guard);
+    drop(reader);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // 用户此刻点击:select 已按 Gone 收尾 → resolve 被拒;若与 EOF 竞态
+    // 命中 Decided 分支,写回必然失败 → OUTCOME_UNKNOWN。两者都不得成功。
+    runtime
+        .handle_envelope(approval_command("e2e-gone-1", "allow"))
+        .await;
+    let envelopes = outbox.collect_through_receipt(Duration::from_secs(6)).await;
+    let receipts: Vec<(i32, i32)> = envelopes
+        .iter()
+        .filter_map(|env| match &env.payload {
+            Some(envelope::Payload::CommandResult(r)) => Some((r.status, r.error_code)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !receipts
+            .iter()
+            .any(|(status, _)| *status == pb::CommandReceiptStatus::ReceiptCompleted as i32),
+        "helper 已消失不得报 COMPLETED: {receipts:?}"
+    );
+    assert!(
+        receipts.iter().any(|(status, code)| (*status
+            == pb::CommandReceiptStatus::ReceiptRejected as i32
+            && *code == pb::StableErrorCode::ApprovalExpired as i32)
+            || *status == pb::CommandReceiptStatus::ReceiptOutcomeUnknown as i32),
+        "决定必须被拒(APPROVAL_EXPIRED)或按未知处理: {receipts:?}"
+    );
+    assert_eq!(
+        hooks.registry().get("e2e-gone-1").map(|s| s.state),
+        Some(PendingState::HandledLocally),
+        "helper 消失必须收尾为 HandledLocally(卡片、registry 一致)"
+    );
+    server_task.abort();
+}
+
+/// R2-ZC01 回归:`resolve` 恰在 deadline 之后到达(先把记录置为 Expired 并
+/// 返回 Err(Expired)),随后 server 超时分支收尾 —— 卡片移除与 waiting 标记
+/// 清理必须恰好执行一次(修复前:expire 二次调用失败 → 既不摘卡也不清
+/// awaiting 标记,浏览器卡片残留)。确定性驱动:不经 socket select,直接
+/// 调用与 Timeout 分支共用的 `settle_without_decision`。
+#[tokio::test]
+async fn resolve_after_deadline_then_timeout_still_cleans_card_once() {
+    let (runtime, mut outbox, _data_dir) = setup("deadline-race").await;
+    let zcode_socket = short_socket_dir("deadline-race-hook");
+    let hooks = Arc::new(ZcodeHooks::new(DEVICE, zcode_socket.clone()));
+    hooks.set_runtime(&runtime);
+    runtime.attach_zcode_hooks(hooks.clone());
+    let server_task = server::serve(
+        server::HookServerConfig {
+            socket_path: zcode_socket.clone(),
+        },
+        hooks.clone(),
+    )
+    .await
+    .unwrap();
+    runtime.handle_envelope(subscribe_session("sess-z1")).await;
+    let _ = outbox.collect_until(2, Duration::from_secs(3)).await;
+    // 让会话进入观察镜像,awaiting 标记可被设置/清除。
+    let status = server::status_invoke_from_line(
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"sess-z1","prompt":"..."}"#,
+    )
+    .unwrap();
+    hooks.note_status(&status);
+
+    let invoke = {
+        let mut invoke = permission_invoke("e2e-deadline-1");
+        invoke.requested_wait_ms = contract::MIN_REMOTE_WAIT_MS;
+        invoke
+    };
+    hooks
+        .registry()
+        .register(
+            "e2e-deadline-1",
+            InvokeKind::PermissionRequest,
+            Some("sess-z1".into()),
+            Some("Bash".into()),
+            None,
+            None,
+            None,
+            contract::clamp_wait_ms(invoke.requested_wait_ms),
+        )
+        .expect("登记必须成功");
+    // 等待标记与卡片已建立(真实登记路径由 server 置位;此处等价模拟)。
+    hooks.mark_awaiting_approval(Some("sess-z1"), true);
+    assert!(hooks.observed_session("sess-z1").unwrap().awaiting_approval);
+    let _ = outbox.collect_until(2, Duration::from_secs(3)).await;
+
+    // 用户点击恰在 deadline 之后:resolve 先把记录置为 Expired 并拒绝。
+    tokio::time::sleep(contract::clamp_wait_ms(invoke.requested_wait_ms)
+        + Duration::from_millis(150))
+    .await;
+    assert_eq!(
+        hooks
+            .registry()
+            .resolve("e2e-deadline-1", HookReply::allowed())
+            .unwrap_err(),
+        bridge::zcode::pending::PendingError::Expired
+    );
+    // server Timeout 分支收尾(与真实路径同一实现)。
+    server::settle_without_decision(&hooks, &invoke, InvokeKind::PermissionRequest, true).await;
+
+    // ① 卡片移除事件发布(修复前缺失,卡片残留)。
+    let envelopes = outbox.collect_until(4, Duration::from_secs(3)).await;
+    assert!(
+        envelopes.iter().any(|env| matches!(
+            env.payload,
+            Some(envelope::Payload::EventBatch(ref b))
+                if b.events.iter().any(|e| matches!(
+                    e.event,
+                    Some(pb::domain_event::Event::PendingAttentionRemoved(ref r))
+                        if r.native_id == "e2e-deadline-1"
+                ))
+        )),
+        "过期后必须摘除卡片(修复前 resolve 已置 Expired 时会跳过): {:?}",
+        envelopes.iter().map(payload_kind).collect::<Vec<_>>()
+    );
+    // ② waiting 标记清理。
+    assert!(
+        !hooks.observed_session("sess-z1").unwrap().awaiting_approval,
+        "过期收尾必须清除 awaiting 标记"
+    );
+    // ③ registry 记录 Expired 终态(卡片、registry、迟到回执一致)。
+    assert_eq!(
+        hooks.registry().get("e2e-deadline-1").map(|s| s.state),
+        Some(PendingState::Expired)
+    );
+    // ④ 同一 requestId 再查询/重放:不得重新决定、不得伪造完成。
+    runtime
+        .handle_envelope(approval_command("e2e-deadline-1", "allow"))
+        .await;
+    let envelopes = outbox.collect_until(4, Duration::from_secs(3)).await;
+    assert!(
+        envelopes.iter().any(|env| matches!(
+            env.payload,
+            Some(envelope::Payload::CommandResult(ref r))
+                if r.status == pb::CommandReceiptStatus::ReceiptRejected as i32
+                    && r.error_code == pb::StableErrorCode::ApprovalExpired as i32
+        )),
+        "过期后重放同请求必须 APPROVAL_EXPIRED"
+    );
+    assert!(
+        !envelopes.iter().any(|env| matches!(
+            env.payload,
+            Some(envelope::Payload::CommandResult(ref r))
+                if r.status == pb::CommandReceiptStatus::ReceiptCompleted as i32
+        )),
+        "过期重放不得伪造完成"
+    );
+    server_task.abort();
+}
+
+/// 同缺陷的确定性变体(免真实 sleep、免并发):记录已被置为 Expired ——
+/// `resolve` 恰在 deadline 之后到达的终态(返回 Err(Expired),决定被拒、
+/// 该路径不摘卡)—— 随后超时分支 `settle_without_decision(timed_out=true)`
+/// 仍必须摘卡一次、清理等待标记。直接构造 Expired 终态(expire 与
+/// resolve-after-deadline 终态等价:同一记录、Expired、responder 未取走),
+/// 不经真实等待。
+#[tokio::test]
+async fn already_expired_still_cleans_card_once_on_timeout_settle() {
+    let (runtime, mut outbox, _data_dir) = setup("expired-settle").await;
+    let zcode_socket = short_socket_dir("expired-settle-hook");
+    let hooks = Arc::new(ZcodeHooks::new(DEVICE, zcode_socket.clone()));
+    hooks.set_runtime(&runtime);
+    runtime.attach_zcode_hooks(hooks.clone());
+    let server_task = server::serve(
+        server::HookServerConfig {
+            socket_path: zcode_socket.clone(),
+        },
+        hooks.clone(),
+    )
+    .await
+    .unwrap();
+    runtime.handle_envelope(subscribe_session("sess-z1")).await;
+    let _ = outbox.collect_until(2, Duration::from_secs(3)).await;
+    // 让会话进入观察镜像,awaiting 标记可被设置/清除。
+    let status = server::status_invoke_from_line(
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"sess-z1","prompt":"..."}"#,
+    )
+    .unwrap();
+    hooks.note_status(&status);
+
+    let invoke = permission_invoke("e2e-expired-1");
+    hooks
+        .registry()
+        .register(
+            "e2e-expired-1",
+            InvokeKind::PermissionRequest,
+            Some("sess-z1".into()),
+            Some("Bash".into()),
+            None,
+            None,
+            None,
+            Duration::from_secs(15),
+        )
+        .expect("登记必须成功");
+    // 等待标记与卡片已建立(真实登记路径由 server 置位;此处等价模拟)。
+    hooks.mark_awaiting_approval(Some("sess-z1"), true);
+    assert!(hooks.observed_session("sess-z1").unwrap().awaiting_approval);
+    let _ = outbox.collect_until(2, Duration::from_secs(3)).await;
+
+    // 构造「resolve 恰在 deadline 之后到达」的终态:先把记录置为 Expired,
+    // 随后迟到决定被拒(Err(Expired)),该路径不摘卡 —— 收尾责任落在
+    // 超时分支。
+    hooks.registry().expire("e2e-expired-1").unwrap();
+    assert_eq!(
+        hooks
+            .registry()
+            .resolve("e2e-expired-1", HookReply::allowed())
+            .unwrap_err(),
+        bridge::zcode::pending::PendingError::Expired
+    );
+
+    // server Timeout 分支收尾(与真实路径同一实现):记录已是 Expired,
+    // 仍必须摘卡一次、清等待标记。
+    server::settle_without_decision(&hooks, &invoke, InvokeKind::PermissionRequest, true).await;
+
+    // ① removed 事件发布(卡片摘除,指向同一 invoke)。
+    let envelopes = outbox.collect_until(4, Duration::from_secs(3)).await;
+    assert!(
+        envelopes.iter().any(|env| matches!(
+            env.payload,
+            Some(envelope::Payload::EventBatch(ref b))
+                if b.events.iter().any(|e| matches!(
+                    e.event,
+                    Some(pb::domain_event::Event::PendingAttentionRemoved(ref r))
+                        if r.native_id == "e2e-expired-1"
+                ))
+        )),
+        "记录已 Expired 时超时收尾仍必须摘卡: {:?}",
+        envelopes.iter().map(payload_kind).collect::<Vec<_>>()
+    );
+    // ② waiting 标记清理。
+    assert!(
+        !hooks.observed_session("sess-z1").unwrap().awaiting_approval,
+        "已 Expired 记录的超时收尾必须清除 awaiting 标记"
+    );
+    // ③ registry 保持 Expired 终态。
+    assert_eq!(
+        hooks.registry().get("e2e-expired-1").map(|s| s.state),
+        Some(PendingState::Expired)
+    );
+    server_task.abort();
+}
+
+/// R2-ZC01 验收:同一 requestId(或重复命令)对已交付决定的重放不得重新
+/// 决定 —— 只有一条 COMPLETED,重放得到 APPROVAL_EXPIRED 拒绝,helper 不会
+/// 收到第二个决定(不生成新 ID 自动重复批准)。
+#[tokio::test]
+async fn replay_same_request_id_does_not_redecide() {
+    let (runtime, mut outbox, _data_dir) = setup("replay").await;
+    let zcode_socket = short_socket_dir("replay-hook");
+    let hooks = Arc::new(ZcodeHooks::new(DEVICE, zcode_socket.clone()));
+    hooks.set_runtime(&runtime);
+    runtime.attach_zcode_hooks(hooks.clone());
+    let server_task = server::serve(
+        server::HookServerConfig {
+            socket_path: zcode_socket.clone(),
+        },
+        hooks.clone(),
+    )
+    .await
+    .unwrap();
+
+    let fixed_request_id = Uuid::new_v4().to_string();
+    let command_request_id = fixed_request_id.clone();
+    let command = std::sync::Arc::new(move || {
+        inbound_envelope(
+            envelope::Payload::CommandRequest(pb::CommandRequest {
+                request_id: command_request_id.clone(),
+                operation: pb::Operation::AnswerApproval as i32,
+                session_key: Some(pb::SessionKey {
+                    device_id: DEVICE.to_string(),
+                    agent_kind: pb::AgentKind::ZcodeDesktop as i32,
+                    native_session_id: "sess-z1".to_string(),
+                    relay_session_uuid: String::new(),
+                }),
+                expected_turn_id: None,
+                expected_runtime_revision: None,
+                payload_digest: String::new(),
+                payload: Some(command_request::Payload::AnswerApproval(
+                    pb::AnswerApprovalPayload {
+                        approval_id: "e2e-replay-1".to_string(),
+                        decision_id: "allow".to_string(),
+                    },
+                )),
+            }),
+            "corr-cmd",
+        )
+    });
+
+    let (mut guard, mut reader) =
+        send_invoke(&zcode_socket, &permission_invoke("e2e-replay-1")).await;
+    wait_registered(&hooks, "e2e-replay-1").await;
+    // 首次决定:命令与 helper 应答并发(真实时序)。
+    let runtime_for_cmd = runtime.clone();
+    let command_for_spawn = command.clone();
+    let first_command = tokio::spawn(async move {
+        runtime_for_cmd.handle_envelope(command_for_spawn()).await;
+    });
+    let reply = tokio::time::timeout(Duration::from_secs(3), read_reply(&mut reader))
+        .await
+        .expect("helper reply in time");
+    assert_eq!(reply.status, contract::STATUS_ALLOWED);
+    send_delivery_ack(&mut guard, "e2e-replay-1").await;
+    let _ = first_command.await;
+    let envelopes = outbox.collect_until(4, Duration::from_secs(3)).await;
+    assert_eq!(
+        envelopes
+            .iter()
+            .filter(|env| matches!(
+                env.payload,
+                Some(envelope::Payload::CommandResult(ref r))
+                    if r.status == pb::CommandReceiptStatus::ReceiptCompleted as i32
+            ))
+            .count(),
+        1,
+        "同一决定只允许一条 COMPLETED"
+    );
+    // 相同 requestId 重放:不得重新决定/再次批准。
+    runtime.handle_envelope(command()).await;
+    let envelopes = outbox.collect_until(4, Duration::from_secs(3)).await;
+    assert!(
+        envelopes.iter().any(|env| matches!(
+            env.payload,
+            Some(envelope::Payload::CommandResult(ref r))
+                if r.status == pb::CommandReceiptStatus::ReceiptRejected as i32
+                    && r.error_code == pb::StableErrorCode::ApprovalExpired as i32
+        )),
+        "已决定后重放必须拒绝"
+    );
+    assert!(
+        !envelopes.iter().any(|env| matches!(
+            env.payload,
+            Some(envelope::Payload::CommandResult(ref r))
+                if r.status == pb::CommandReceiptStatus::ReceiptCompleted as i32
+        )),
+        "重放不得产生第二条 COMPLETED"
+    );
+    assert_eq!(
+        hooks.registry().get("e2e-replay-1").map(|s| s.state),
+        Some(PendingState::ReturnedToRuntime),
+        "重放不得改变已确认交付的终态"
+    );
     server_task.abort();
 }
 

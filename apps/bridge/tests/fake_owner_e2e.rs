@@ -17,6 +17,7 @@ const DEVICE: &str = "device-e2e";
 const CONV_FAST: &str = "aaaaaaaa-1111-4111-8111-111111111111";
 const CONV_STEER: &str = "aaaaaaaa-2222-4222-8222-222222222222";
 const CONV_QUESTION: &str = "aaaaaaaa-3333-4333-8333-333333333333";
+const CONV_MULTI_QUESTION: &str = "aaaaaaaa-4444-4444-8444-444444444444";
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -28,7 +29,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn write_script(dir: &PathBuf) -> PathBuf {
+fn write_script() -> serde_json::Value {
     let script = json!({
         "sessions": [
             {
@@ -73,23 +74,27 @@ fn write_script(dir: &PathBuf) -> PathBuf {
             }
         ]
     });
-    let path = dir.join("script.json");
-    std::fs::write(&path, serde_json::to_string(&script).unwrap()).unwrap();
-    path
+    script
 }
 
 async fn spawn_fake(dir: &PathBuf) -> (PathBuf, std::process::Child) {
+    spawn_fake_with(dir, write_script()).await
+}
+
+/// spawn fake owner(自定义脚本;多题 requests fixture 等场景)。
+async fn spawn_fake_with(dir: &PathBuf, script: serde_json::Value) -> (PathBuf, std::process::Child) {
     // macOS sun_path 上限 104 字节:TMPDIR 太长,socket 用短路径。
     let socket = PathBuf::from(format!(
         "/tmp/ac-fake-{}-{}.sock",
         std::process::id(),
         &Uuid::new_v4().simple().to_string()[..8]
     ));
-    let script = write_script(dir);
+    let script_path = dir.join("script.json");
+    std::fs::write(&script_path, serde_json::to_string(&script).unwrap()).unwrap();
     let stderr_log = std::fs::File::create(dir.join("fake-owner.log")).expect("log file");
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fake-codex-owner"))
         .arg(socket.clone())
-        .arg(script)
+        .arg(script_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(stderr_log))
         .spawn()
@@ -600,6 +605,115 @@ async fn read_only_capability_gate_rejects_write() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), StableErrorCode::ControlReadOnly);
+}
+
+/// R2-CX01/FIXTURE:0.153.4 requests[] 多题 requestUserInput → Bridge 在
+/// 发送任何原生响应之前用现有 unsupported 语义拒绝不完整回答:零回执、
+/// 零原生写(fake owner 未收到 submit-user-input)、原生 pending 保持;
+/// 服务端 Bridge 层拦截,旧页面/直接请求无法绕过。单题路径
+/// (`scripted_question_lifecycle_end_to_end`)不受影响。
+#[tokio::test]
+async fn multi_question_request_is_rejected_without_partial_native_write() {
+    let dir = temp_dir("multi-question");
+    let script = json!({
+        "sessions": [{
+            "conversationId": CONV_MULTI_QUESTION,
+            "title": "fixture-multi-question",
+            "cwd": "/tmp/fixture-multi-question",
+            "branch": "fixture-branch",
+            "requests": [{
+                "id": "req-multi-1",
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "threadId": CONV_MULTI_QUESTION,
+                    "turnId": "turn-multi-1",
+                    "questions": [
+                        {
+                            "id": "q1",
+                            "header": "Plan",
+                            "question": "Which approach?",
+                            "isOther": false,
+                            "options": [
+                                {"label": "Option A", "description": null},
+                                {"label": "Option B", "description": null}
+                            ]
+                        },
+                        {
+                            "id": "q2",
+                            "header": "Scope",
+                            "question": "Include tests?",
+                            "isOther": false,
+                            "options": [
+                                {"label": "Yes", "description": null},
+                                {"label": "No", "description": null}
+                            ]
+                        }
+                    ]
+                },
+                "completed": false
+            }]
+        }]
+    });
+    let (socket, mut fake) = spawn_fake_with(&dir, script).await;
+    let _fake_guard = FakeGuard(&mut fake);
+    let adapter = CodexAdapter::connect(adapter_config(
+        socket,
+        vec![seed(CONV_MULTI_QUESTION, "fixture-multi-question")],
+    ))
+    .await
+    .unwrap();
+
+    // pending 出现(展示投影:question_id = 外层 request.id)。
+    let snapshot = adapter
+        .runtime_snapshot(&key(CONV_MULTI_QUESTION))
+        .await
+        .unwrap();
+    assert_eq!(snapshot.pending_questions.len(), 1);
+    assert_eq!(snapshot.pending_questions[0].question_id, "req-multi-1");
+
+    // 直接请求(不经页面按钮)回答多题卡 → unsupported 拒绝,零原生写。
+    let answer = CommandRequest {
+        request_id: Uuid::new_v4(),
+        operation: Operation::AnswerQuestion,
+        session_key: key(CONV_MULTI_QUESTION),
+        expected_turn_id: None,
+        expected_runtime_revision: None,
+        payload_digest: None,
+        payload: CommandPayload::AnswerQuestion {
+            question_id: "req-multi-1".to_string(),
+            option_ids: vec!["Option A".to_string()],
+            free_text: None,
+        },
+    };
+    let err = adapter
+        .execute_command(&key(CONV_MULTI_QUESTION), answer)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), StableErrorCode::CapabilityUnsupported);
+    let message = err.to_string();
+    assert!(
+        message.to_lowercase().contains("desktop"),
+        "拒绝消息必须提示回 Desktop 处理: {message}"
+    );
+
+    // 原生 pending 保持:请求未完成、问题卡仍在。
+    let snapshot = adapter
+        .runtime_snapshot(&key(CONV_MULTI_QUESTION))
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.pending_questions.len(),
+        1,
+        "多题拒绝后 pending 必须保持"
+    );
+    assert_eq!(snapshot.pending_questions[0].question_id, "req-multi-1");
+
+    // 零原生写:fake owner 日志不含任何到达 owner 的写方法。
+    let owner_log = std::fs::read_to_string(dir.join("fake-owner.log")).unwrap_or_default();
+    assert!(
+        !owner_log.contains("write method reached owner"),
+        "多题请求不得产生任何原生写: {owner_log}"
+    );
 }
 
 /// 测试结束时 kill fake 进程(避免后台残留)。

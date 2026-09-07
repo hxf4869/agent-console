@@ -43,8 +43,10 @@ where
     // `Value::to_string()`。在途表:关联键 → invoke_id;取消传播用。
     let mut in_flight: HashMap<String, String> = HashMap::new();
     let mut cancelled: std::collections::HashSet<String> = Default::default();
-    // (原始 rpc id Value, 工具结果):外层包装需要原样回传 id(保留类型)。
-    let (done_tx, mut done_rx) = mpsc::channel::<(serde_json::Value, serde_json::Value)>(16);
+    // (原始 rpc id Value, 工具结果, 交付确认句柄):外层包装需要原样回传
+    // id(保留类型);ack 仅在 JSON-RPC 结果实际写出后回发(R2-ZC01)。
+    let (done_tx, mut done_rx) =
+        mpsc::channel::<(serde_json::Value, serde_json::Value, Option<super::helper::ReplyAck>)>(16);
     let mut line = String::new();
     loop {
         tokio::select! {
@@ -103,8 +105,8 @@ where
                                 let writer = writer.clone();
                                 let config = config.clone();
                                 tokio::spawn(async move {
-                                    let result = await_ask(&config, &invoke).await;
-                                    let _ = done_tx.send((id, result)).await;
+                                    let (result, ack) = await_ask(&config, &invoke).await;
+                                    let _ = done_tx.send((id, result, ack)).await;
                                     let _ = writer; // 保持 writer 存活到任务结束。
                                 });
                             }
@@ -137,14 +139,22 @@ where
                     (_, false) => {}
                 }
             }
-            Some((rpc_id, response)) = done_rx.recv() => {
+            Some((rpc_id, response, ack)) = done_rx.recv() => {
                 in_flight.remove(&rpc_id_key(&rpc_id));
                 // 已取消的调用:按 JSON-RPC 取消语义不回响应。
                 if cancelled.remove(&rpc_id_key(&rpc_id)) {
                     continue;
                 }
                 // 完整 JSON-RPC 外层:宿主按原样 id 关联结果(jsonrpc/id/result)。
+                // 交付确认(R2-ZC01):仅在实际写出该响应之后回发 ack —— 写出
+                // 失败(`?` 提前返回)或被取消时不确认,Bridge 按未确定处理;
+                // ack 自身失败仅记录语义(由 Bridge 超时收尾),不阻塞主循环。
                 write_output(&writer, &rpc_result(rpc_id, response)).await?;
+                if let Some(ack) = ack {
+                    if let Err(err) = ack.acknowledge().await {
+                        tracing::warn!(error = %err, "mcp ask delivery ack failed");
+                    }
+                }
             }
         }
     }
@@ -253,33 +263,41 @@ fn build_ask_invoke(
     })
 }
 
-/// 等待 Bridge 决定并生成 MCP 工具结果。
-async fn await_ask(config: &HelperConfig, invoke: &HookInvoke) -> serde_json::Value {
-    match super::helper::invoke_once(
+/// 等待 Bridge 决定并生成 MCP 工具结果;随结果返回交付确认句柄
+/// (R2-ZC01:由调用方在 JSON-RPC 结果实际写出后确认)。
+async fn await_ask(
+    config: &HelperConfig,
+    invoke: &HookInvoke,
+) -> (serde_json::Value, Option<super::helper::ReplyAck>) {
+    match super::helper::invoke_once_with_ack(
         &config.socket_path,
         invoke,
         super::helper::helper_wait(config),
     )
     .await
     {
-        Ok(reply) => match reply.status.as_str() {
-            contract::STATUS_ANSWERED => tool_text(
-                &serde_json::json!({
-                    "status": "answered",
-                    "option": reply.option,
-                    "text": reply.text,
-                })
-                .to_string(),
-            ),
-            contract::STATUS_CANCELLED => {
-                tool_text(&serde_json::json!({ "status": "cancelled" }).to_string())
-            }
-            contract::STATUS_EXPIRED => {
-                tool_text(&serde_json::json!({ "status": "expired" }).to_string())
-            }
-            other => tool_error(&format!("ask failed: {other}")),
-        },
-        Err(err) => tool_error(&err), // Bridge 不可达:明确失败,不伪装已回答。
+        Ok((reply, ack)) => {
+            let value = match reply.status.as_str() {
+                contract::STATUS_ANSWERED => tool_text(
+                    &serde_json::json!({
+                        "status": "answered",
+                        "option": reply.option,
+                        "text": reply.text,
+                    })
+                    .to_string(),
+                ),
+                contract::STATUS_CANCELLED => {
+                    tool_text(&serde_json::json!({ "status": "cancelled" }).to_string())
+                }
+                contract::STATUS_EXPIRED => {
+                    tool_text(&serde_json::json!({ "status": "expired" }).to_string())
+                }
+                other => tool_error(&format!("ask failed: {other}")),
+            };
+            (value, Some(ack))
+        }
+        // Bridge 不可达:明确失败,不伪装已回答;无连接即无确认句柄。
+        Err(err) => (tool_error(&err), None),
     }
 }
 
@@ -399,6 +417,21 @@ mod tests {
         assert!(
             result["content"][0]["text"].to_string().contains("answered"),
             "text 应为 answered 结果: {result}"
+        );
+        // 交付确认(R2-ZC01):JSON-RPC 结果实际写出之后才回 ack —— 读到
+        // 响应后,Bridge 侧注册表应进入 ReturnedToRuntime。
+        for _ in 0..100 {
+            if hooks.registry().get(&invoke_id).map(|s| s.state)
+                == Some(crate::zcode::PendingState::ReturnedToRuntime)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            hooks.registry().get(&invoke_id).map(|s| s.state),
+            Some(crate::zcode::PendingState::ReturnedToRuntime),
+            "JSON-RPC 输出后必须确认交付"
         );
 
         // ② 字符串 id:保持字符串类型,不 to_string 变形。

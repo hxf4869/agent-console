@@ -3,7 +3,8 @@
 //! - stdin:ZCode 单行 JSON;stdout 仅输出协议 JSON(官方上限 32KiB),
 //!   诊断一律走 stderr。
 //! - PermissionRequest:连接 Bridge → 等决定 → allow/deny 输出官方
-//!   decision JSON;超时/不可达/过期 → 空输出回原生确认,不自动允许。
+//!   decision JSON;输出成功后回发交付确认(绑定 invoke_id),输出失败
+//!   不确认(R2-ZC01);超时/不可达/过期 → 空输出回原生确认,不自动允许。
 //! - 其他官方事件(SessionStart 等):转发为 status invoke 即时确认。
 //! - 退出码恒为 0(除致命本地错误):exit 2 = 阻断语义,绝不误用。
 
@@ -75,12 +76,13 @@ fn finish_line(buf: Vec<u8>) -> Result<String, super::contract::ParseError> {
     String::from_utf8(buf).map_err(|_| super::contract::ParseError::NotObject)
 }
 
-/// 写一行到 stdout(仅协议 JSON)。
-pub async fn write_stdout_line(line: &str) {
+/// 写一行到 stdout(仅协议 JSON;三次 write/flush 结果全部检查 ——
+/// R2-ZC01:输出失败必须可见,不得静默假定原生已收到)。
+pub async fn write_stdout_line(line: &str) -> std::io::Result<()> {
     let mut out = tokio::io::stdout();
-    let _ = out.write_all(line.as_bytes()).await;
-    let _ = out.write_all(b"\n").await;
-    let _ = out.flush().await;
+    out.write_all(line.as_bytes()).await?;
+    out.write_all(b"\n").await?;
+    out.flush().await
 }
 
 /// 写诊断到 stderr(永不进 stdout)。
@@ -108,6 +110,36 @@ pub fn permission_invoke(native: &NativeHookInput, config: &HelperConfig) -> Hoo
     }
 }
 
+/// 已收到 Bridge 决定但尚未确认交付的连接句柄(R2-ZC01)。
+///
+/// 调用方在完成**原生协议输出**(PermissionRequest stdout / MCP JSON-RPC
+/// 响应写出+flush)之后调用 [`ReplyAck::acknowledge`];Bridge 侧有限等待
+/// 该确认,缺失/失败按未确认处理(不报成功)。句柄丢弃(未确认)即连接
+/// 写半关闭,Bridge 按超时/EOF 收尾。
+pub struct ReplyAck {
+    writer: Option<tokio::net::unix::OwnedWriteHalf>,
+    invoke_id: String,
+}
+
+impl ReplyAck {
+    /// 回发交付确认行(绑定 invoke_id)并 flush;失败 = 交付未确认。
+    pub async fn acknowledge(mut self) -> Result<(), String> {
+        let Some(mut writer) = self.writer.take() else {
+            return Ok(());
+        };
+        let mut line = contract::delivery_ack_json(&self.invoke_id);
+        line.push('\n');
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|err| format!("delivery ack write failed: {err}"))?;
+        writer
+            .flush()
+            .await
+            .map_err(|err| format!("delivery ack flush failed: {err}"))
+    }
+}
+
 /// 单次 invoke:连接 → 发送 → 读应答(错误统一为 Err,不区分阶段细节)。
 ///
 /// 写半连接必须保持到应答读完:提前 drop OwnedWriteHalf 会让服务端收到
@@ -117,6 +149,20 @@ pub async fn invoke_once(
     invoke: &HookInvoke,
     wait: std::time::Duration,
 ) -> Result<HookReply, String> {
+    invoke_once_with_ack(socket, invoke, wait)
+        .await
+        .map(|(reply, _ack)| reply)
+}
+
+/// 同 [`invoke_once`],但保留连接写半并返回交付确认句柄:调用方完成原生
+/// 协议输出后必须 [`ReplyAck::acknowledge`];在此之前不关闭写半连接
+/// (R2-ZC01:输出原生结果之前关闭写半会让 Bridge 无法区分「已输出」
+/// 与「连接断开」)。
+pub async fn invoke_once_with_ack(
+    socket: &Path,
+    invoke: &HookInvoke,
+    wait: std::time::Duration,
+) -> Result<(HookReply, ReplyAck), String> {
     let connect = async {
         let stream = UnixStream::connect(socket)
             .await
@@ -144,11 +190,18 @@ pub async fn invoke_once(
         .await
         .map_err(|_| "bridge reply timed out".to_string())?
         .map_err(|err| format!("bridge socket read failed: {err}"))?;
-    drop(writer); // 请求已完成,现在才关闭写半连接。
     if reply_line.trim().is_empty() {
+        // 写半随 reader/ReplyAck 生命周期处理:读取失败时 writer 在此 drop。
+        drop(writer);
         return Err("bridge closed without reply".to_string());
     }
-    serde_json::from_str(reply_line.trim()).map_err(|err| format!("bridge reply invalid: {err}"))
+    let reply: HookReply = serde_json::from_str(reply_line.trim())
+        .map_err(|err| format!("bridge reply invalid: {err}"))?;
+    let ack = ReplyAck {
+        writer: Some(writer),
+        invoke_id: invoke.invoke_id.clone(),
+    };
+    Ok((reply, ack))
 }
 
 /// invoke 等待预算(config 收敛)。
@@ -195,23 +248,39 @@ pub async fn run_hook(config: HelperConfig) -> i32 {
         "PermissionRequest" => {
             let invoke = permission_invoke(&native, &config);
             let wait = contract::clamp_wait_ms(config.wait_ms);
-            match invoke_once(&config.socket_path, &invoke, wait).await {
-                Ok(reply) => match reply.status.as_str() {
-                    STATUS_ALLOWED => write_stdout_line(&contract::allow_decision_json()).await,
-                    STATUS_DENIED => {
-                        let message = reply
-                            .message
-                            .unwrap_or_else(|| "User declined this action in Agent Console".into());
-                        write_stdout_line(&contract::deny_decision_json(&message)).await;
+            match invoke_once_with_ack(&config.socket_path, &invoke, wait).await {
+                Ok((reply, ack)) => {
+                    // 交付确认(R2-ZC01):只有原生 decision JSON 实际写出
+                    // 成功后才回 ack;输出失败不确认,Bridge 侧按未确定处理。
+                    // expired/cancelled/rejected:空输出回原生确认(不自动
+                    // 允许),随后同样确认「本 helper 对该决定处理完毕」。
+                    let outcome = match reply.status.as_str() {
+                        STATUS_ALLOWED => {
+                            write_stdout_line(&contract::allow_decision_json()).await
+                        }
+                        STATUS_DENIED => {
+                            let message = reply.message.unwrap_or_else(|| {
+                                "User declined this action in Agent Console".into()
+                            });
+                            write_stdout_line(&contract::deny_decision_json(&message)).await
+                        }
+                        other => {
+                            helper_diag!(
+                                "agent-console helper: remote decision unavailable ({other}); \
+                                 falling back to native confirmation"
+                            );
+                            Ok(())
+                        }
+                    };
+                    if let Err(err) = outcome {
+                        helper_diag!("agent-console helper: native stdout write failed ({err}); \
+                                      decision delivery left unconfirmed");
+                        return 0;
                     }
-                    // expired/cancelled/rejected:空输出回原生确认(不自动允许)。
-                    other => {
-                        helper_diag!(
-                            "agent-console helper: remote decision unavailable ({other}); \
-                             falling back to native confirmation"
-                        );
+                    if let Err(err) = ack.acknowledge().await {
+                        helper_diag!("agent-console helper: delivery ack failed ({err})");
                     }
-                },
+                }
                 // Bridge 不可达/超时:尽快结束远程尝试,空结果无额外效果。
                 Err(err) => {
                     helper_diag!(

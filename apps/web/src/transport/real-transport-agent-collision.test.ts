@@ -1,5 +1,7 @@
 import { create } from '@bufbuild/protobuf'
 import {
+  CommandAcceptedSchema,
+  CommandReceiptStatus,
   decodeEnvelope,
   encodeEnvelope,
   EnvelopeSchema,
@@ -201,6 +203,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.useRealTimers()
   vi.unstubAllGlobals()
 })
@@ -271,27 +274,85 @@ describe('dual-agent collision on empty relay session uuid (ZC-02)', () => {
     expect(cKey && 'nativeSessionId' in cKey && cKey.nativeSessionId).toBe(NATIVE_ID)
 
     // 5) 命令目标:同 native ID 的两个 Agent 各达各的目标。
-    async function commandAgentKind(sessionId: string): Promise<unknown> {
-      void transport
+    //    受控 digest:#commandEnvelope 在发帧前 await sha256Hex(...),这是
+    //    命令发帧前唯一的异步等待点。真实 WebCrypto 走 libuv 线程池,完成
+    //    时机不受假时钟控制(Node 24/高负载下两次 50ms 推进内可能未完成,
+    //    帧缺失导致断言失败)。这里手动决定 digest 何时完成,把等待点显式
+    //    暴露出来,时序完全确定且与 Node 版本无关。两条命令各用一个门。
+    type DigestGate = { promise: Promise<ArrayBuffer>; resolve: (value: ArrayBuffer) => void }
+    const makeDigestGate = (): DigestGate => {
+      let resolve!: (value: ArrayBuffer) => void
+      const promise = new Promise<ArrayBuffer>((settle) => {
+        resolve = settle
+      })
+      return { promise, resolve }
+    }
+    let digestGate = makeDigestGate()
+    const digestSpy = vi.spyOn(crypto.subtle, 'digest').mockImplementation(() => digestGate.promise)
+
+    async function commandAgentKind(sessionId: string, receiptSequence: bigint): Promise<unknown> {
+      digestGate = makeDigestGate()
+      const requestId = '20000000-0000-4000-8000-00000000000' + (sessionId === zId ? '1' : '2')
+      // 本文件发送两条命令,tripwire 只看本次命令新增的 commandRequest 帧。
+      const commandFramesBefore = socket
+        .sentPayloads()
+        .filter((payload) => payload.case === 'commandRequest').length
+      // 不吞错:sendCommand 的任何异常都会在末尾以真实错误抛出,让本测试失败。
+      const outcome = transport
         .sendCommand({
-          requestId: '20000000-0000-4000-8000-00000000000' + (sessionId === zId ? '1' : '2'),
+          requestId,
           operation: 'ANSWER_APPROVAL',
           sessionId,
           expectedRuntimeRevision: 0,
           payload: { attentionId: 'att-1', optionId: 'allow' },
         })
-        .catch(() => undefined)
-      await vi.advanceTimersByTimeAsync(50)
-      await vi.advanceTimersByTimeAsync(50)
+        .then(
+          (receipt) => ({ ok: true as const, receipt }),
+          (error: unknown) => ({ ok: false as const, error }),
+        )
+
+      // digest 未完成前不得发帧(payloadDigest 是帧内容的一部分)。若回归出
+      // "digest 未完成就发帧/检查帧",此断言立即失败,而不是静默通过。
+      await vi.advanceTimersByTimeAsync(0)
+      expect(
+        socket
+          .sentPayloads()
+          .filter((payload) => payload.case === 'commandRequest').length,
+      ).toBe(commandFramesBefore)
+
+      digestGate.resolve(new Uint8Array(32).fill(0xab).buffer)
+      await vi.advanceTimersByTimeAsync(0)
+
       const command = socket
         .sentPayloads()
         .filter((payload) => payload.case === 'commandRequest')
         .at(-1)
       const sessionKey = (command!.value as Record<string, unknown>).sessionKey as Record<string, unknown>
-      return sessionKey.agentKind
+      const agentKind = sessionKey.agentKind
+
+      // fake socket 返回回执,收束 sendCommand:真实异常在此显式断言,不静默。
+      socket.push(
+        frame(
+          {
+            case: 'commandAccepted',
+            value: create(CommandAcceptedSchema, {
+              requestId,
+              status: CommandReceiptStatus.RECEIPT_ACCEPTED_BY_BRIDGE,
+            }),
+          },
+          LIST_STREAM,
+          receiptSequence,
+        ),
+      )
+      await vi.advanceTimersByTimeAsync(0)
+      const result = await outcome
+      if (!result.ok) throw result.error
+      expect(result.receipt).toMatchObject({ requestId, status: 'ACCEPTED_BY_BRIDGE' })
+      return agentKind
     }
-    expect(await commandAgentKind(zId)).toBe(2)
-    expect(await commandAgentKind(cId)).toBe(1)
+    expect(await commandAgentKind(zId, 2n)).toBe(2)
+    expect(await commandAgentKind(cId, 3n)).toBe(1)
+    digestSpy.mockRestore()
 
     // 6) canonical UUID 归一化:同 (device, agentKind, native) 元组随后带上
     //    各自真实 relaySessionUuid 到达时,各自升级为自己的 UUID,不互串。

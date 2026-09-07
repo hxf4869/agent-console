@@ -5,8 +5,11 @@
 //!   用户下恶意进程的沙箱,见 04 §8.5;不支持校验的平台跳过并报告)。
 //! - 一条连接 = 一个 invoke:读一行请求(超 [`MAX_FRAME_BYTES`] 整单拒绝)→
 //!   登记 pending → 发远程卡片事件 → 等决定/超时 → 回一行应答。
+//! - 决定写回结果不可忽略(R2-ZC01):写回后有限等待 helper 完成**原生
+//!   协议输出**(stdout / MCP JSON-RPC)后的交付确认行(绑定 invoke_id);
+//!   写回失败/确认缺失或超时按未确认收尾,不报成功、不静默假定已送达。
 //! - 决定前连接断开(原生取消 / helper 消失)或出现多余输入 → 撤销远程
-//!   卡片并拒绝迟到回复。
+//!   卡片并拒绝迟到回复;决定后的合法交付确认不会被当作 helper 消失。
 //! - 状态事件(status)即时确认,不等待;cancel 事件撤销指定 invoke
 //!   (MCP 宿主取消传播)。
 
@@ -24,7 +27,7 @@ use super::contract::{
     EVENT_PERMISSION_REQUEST, EVENT_STATUS, MAX_FRAME_BYTES, STATUS_WAIT_MS,
 };
 use super::link::ZcodeHooks;
-use super::pending::{InvokeKind, PendingError, PendingRegistry};
+use super::pending::{DeliveryOutcome, InvokeKind, PendingError, PendingRegistry};
 
 /// socket 服务配置。
 #[derive(Debug, Clone)]
@@ -222,7 +225,19 @@ async fn handle_connection(stream: UnixStream, hooks: Arc<ZcodeHooks>) {
     }
 }
 
-/// 审批/问答 invoke:登记 → 发卡片 → 等决定/超时/连接消失 → 回应答。
+/// 连接监视事件:监视任务恰好产出一次。决定前任何事件 = 连接失效
+/// (原生取消 / helper 消失 / 协议违约);决定写回后,该行若为绑定本
+/// invoke 的合法交付确认 = 交付完成,其余(EOF/错误内容)按未确认收尾
+/// —— 合法确认不会被当成 helper 消失(R2-ZC01)。
+enum ConnEvent {
+    /// 读到一行(内容原样;超限内容不保留,以空串表达)。
+    Line(String),
+    /// EOF / 读失败:连接关闭。
+    Closed,
+}
+
+/// 审批/问答 invoke:登记 → 发卡片 → 等决定/超时/连接消失 → 写回应答 →
+/// 有限等待交付确认(R2-ZC01)。
 async fn handle_pending_invoke(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     hooks: Arc<ZcodeHooks>,
@@ -285,20 +300,29 @@ async fn handle_pending_invoke(
         hooks.mark_awaiting_approval(invoke.native_session_id.as_deref(), true);
     }
 
-    // helper 消失/取消监视:决定前读到 EOF 或多余输入 → 撤销远程卡片。
-    let (gone_tx, gone_rx) = oneshot::channel::<()>();
+    // 连接监视:读到一行或 EOF 都汇成事件。决定前任何事件 = 连接失效
+    // (原生取消 / helper 消失 / 协议违约);决定写回后,该行若为绑定本
+    // invoke 的合法交付确认 = 交付完成,其余(EOF/错误内容)按未确认收尾
+    // —— 合法确认不会被当成 helper 消失(R2-ZC01)。
+    // 决定前后共用的连接事件(监视任务恰好产出一次)。
+    let (event_tx, mut event_rx) = oneshot::channel::<ConnEvent>();
     tokio::spawn(async move {
         let mut reader = reader;
         let mut extra = String::new();
-        // 决定前协议上不应再有输入:EOF 或第二行都视为连接失效。
-        let _ = read_limited_line(&mut reader, &mut extra).await;
-        let _ = gone_tx.send(());
+        // 决定前协议上不应再有输入;这里只读取并上报内容,分类由等待方
+        // 按所处阶段决定(确认合法性与阶段绑定在一起判断)。
+        let event = match read_limited_line(&mut reader, &mut extra).await {
+            Ok(()) => ConnEvent::Line(std::mem::take(&mut extra)),
+            Err(ReadLineError::Oversize) => ConnEvent::Line(String::new()),
+            Err(ReadLineError::Io) => ConnEvent::Closed,
+        };
+        let _ = event_tx.send(event);
         drop(reader);
     });
 
     enum Outcome {
         Decided(HookReply),
-        /// 决定前连接失效(原生取消 / helper 消失)。
+        /// 决定前连接失效(原生取消 / helper 消失 / 协议违约)。
         Gone,
         /// 等待超时。
         Timeout,
@@ -306,24 +330,66 @@ async fn handle_pending_invoke(
     let outcome = tokio::select! {
         decision = rx => {
             match decision {
-                Ok(reply) => {
-                    registry.mark_returned(&invoke.invoke_id).ok();
-                    hooks.publish_attention_returned(&invoke, kind).await;
-                    Outcome::Decided(reply)
-                }
                 // responder 被 cancel 事件取走/丢弃 → 已按本机处理撤销。
                 Err(_) => Outcome::Decided(HookReply::cancelled()),
+                Ok(reply) => Outcome::Decided(reply),
             }
         }
-        _ = gone_rx => Outcome::Gone,
+        event = &mut event_rx => {
+            match event {
+                // 决定前出现输入或连接关闭:连接失效(该事件已被消费,
+                // Decided 分支不会再等待它)。
+                _ => Outcome::Gone,
+            }
+        }
         _ = tokio::time::sleep(wait) => Outcome::Timeout,
     };
     match outcome {
         Outcome::Decided(reply) => {
+            // 交付层级:Bridge 已接受决定(Decided)→ 写回 helper(结果
+            // 不可忽略)→ 有限等待 helper 完成原生协议输出后的交付确认。
+            let delivered = match write_reply(writer, &reply).await {
+                Ok(()) => wait_delivery_ack(&mut event_rx, &invoke.invoke_id).await,
+                Err(err) => {
+                    tracing::warn!(
+                        invoke_id = %invoke.invoke_id,
+                        error = %err,
+                        "zcode decision socket write failed; delivery unconfirmed"
+                    );
+                    false
+                }
+            };
+            let outcome_state = registry
+                .complete_delivery(
+                    &invoke.invoke_id,
+                    if delivered {
+                        DeliveryOutcome::Delivered
+                    } else {
+                        DeliveryOutcome::Unconfirmed
+                    },
+                )
+                .ok();
+            // returned 事件仅在确认送达且记录真实迁移成功(Decided →
+            // ReturnedToRuntime)时发布:决定被 MCP cancel 抢先撤销时,卡片
+            // 已由 cancel 路径摘除(对 cancelled 回复的 ack 不改变终态,
+            // complete_delivery 返回 Err → outcome_state=None),不重复发布
+            // removed + summary。
+            if delivered && outcome_state.is_some() {
+                hooks.publish_attention_returned(&invoke, kind).await;
+            } else if outcome_state.is_some() {
+                // 仅在记录仍处于本连接管理的 Decided 阶段时发布;取消竞争
+                // 等情形下卡片已由对应路径摘除,不重复发布。
+                hooks.publish_attention_removed(&invoke, kind, "delivery-unconfirmed").await;
+            }
             if kind == InvokeKind::PermissionRequest {
                 hooks.mark_awaiting_approval(invoke.native_session_id.as_deref(), false);
             }
-            let _ = write_reply(writer, &reply).await;
+            if !delivered {
+                tracing::warn!(
+                    invoke_id = %invoke.invoke_id,
+                    "zcode decision delivery unconfirmed; outcome stays unknown"
+                );
+            }
         }
         Outcome::Gone | Outcome::Timeout => {
             // 超时:过期;连接失效:撤销(本机已处理)。两者都拒绝一切
@@ -332,6 +398,20 @@ async fn handle_pending_invoke(
                 .await;
             let _ = write_reply(writer, &HookReply::expired()).await;
         }
+    }
+}
+
+/// 有限等待交付确认(R2-ZC01):读监视事件,仅当该行是绑定本 invoke 的
+/// 合法 ack(helper 已完成原生协议输出)才算确认。EOF、错误内容、等待
+/// 超时一律 `false`(不静默假定已送达;迟到确认不影响既有终态)。
+async fn wait_delivery_ack(
+    event_rx: &mut oneshot::Receiver<ConnEvent>,
+    invoke_id: &str,
+) -> bool {
+    let ack_wait = std::time::Duration::from_millis(contract::DELIVERY_ACK_WAIT_MS);
+    match tokio::time::timeout(ack_wait, event_rx).await {
+        Ok(Ok(ConnEvent::Line(line))) => contract::is_delivery_ack(&line, invoke_id),
+        _ => false,
     }
 }
 
@@ -347,8 +427,19 @@ pub async fn settle_without_decision(
 ) {
     let registry = hooks.registry();
     let settled = if timed_out {
-        registry.expire(&invoke.invoke_id).is_ok()
+        // 超时收尾为单锁原子判定(检查 + 迁移同一把锁内完成):Waiting →
+        // 置 Expired;`resolve` 恰在 deadline 之后到达时已把记录置为
+        // Expired 并返回 Err(Expired)(R2-ZC01 回归分支,该路径不摘卡)
+        // → 同样返回 true,卡片移除与等待标记清理仍必须恰好执行一次。
+        // 不得拆回「探针 Expired + expire」两步:两步各自独立加锁,探针
+        // 读到 Waiting 后迟到 resolve 把记录置 Expired、expire 返回
+        // AlreadyDecided,settled=false 会漏摘卡片与等待标记。
+        registry.expire_or_already_expired(&invoke.invoke_id)
     } else {
+        // 连接失效收尾:cancel 仅在 Waiting → HandledLocally 时成功(Ok)。
+        // 记录已被 MCP cancel 事件置为 HandledLocally 或已被决定原子锁定
+        // 时,cancel 返回 AlreadyDecided(不存在 Cancelled 错误面)
+        // → settled=false,卡片/标记交给既有路径,行为与旧代码一致。
         registry.cancel(&invoke.invoke_id).is_ok()
     };
     // 竞态兜底:决定与超时/连接消失同时就绪、select 选中本分支时,决定已
@@ -538,6 +629,17 @@ mod tests {
         serde_json::from_str(line.trim()).unwrap()
     }
 
+    /// 模拟新 helper 合同:收到决定并完成原生输出后回发交付确认行。
+    async fn send_ack(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        invoke_id: &str,
+    ) {
+        let mut line = contract::delivery_ack_json(invoke_id);
+        line.push('\n');
+        writer.write_all(line.as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
     /// socket 目录 0700、socket 文件 0600(用户私有,04 §8.5)。
     #[tokio::test]
     async fn socket_permissions_are_user_private() {
@@ -571,19 +673,111 @@ mod tests {
         panic!("invoke {invoke_id} not registered in time");
     }
 
-    /// 全链路(FIXTURE):连接 → 登记 → 原子决定 → helper 收到 allowed。
+    /// 全链路(FIXTURE):连接 → 登记 → 原子决定 → helper 收到 allowed →
+    /// 完成原生输出后回 ack → ReturnedToRuntime(R2-ZC01 交付确认)。
     #[tokio::test]
     async fn round_trip_allow_via_socket() {
         let dir = tempfile::tempdir().unwrap();
         let hooks = test_hooks(dir.path());
         let socket = socket_path(dir.path());
         let handle = start(dir.path(), hooks.clone()).await;
-        let (_guard, mut reader) = send_request(&permission_invoke("rt-1", 10_000), &socket).await;
+        let (mut guard, mut reader) =
+            send_request(&permission_invoke("rt-1", 10_000), &socket).await;
         wait_registered(hooks.registry(), "rt-1").await;
         hooks.registry().resolve("rt-1", HookReply::allowed()).unwrap();
         let reply = read_reply(&mut reader).await;
         assert_eq!(reply.status, contract::STATUS_ALLOWED);
-        assert_eq!(hooks.registry().get("rt-1").unwrap().state, PendingState::ReturnedToRuntime);
+        // 决定写回后状态仍是 Decided(未确认不冒充已返回)。
+        assert_eq!(
+            hooks.registry().get("rt-1").unwrap().state,
+            PendingState::Decided
+        );
+        send_ack(&mut guard, "rt-1").await;
+        // ack 到达后: ReturnedToRuntime(确认 = 原生协议结果已输出)。
+        for _ in 0..100 {
+            if hooks.registry().get("rt-1").unwrap().state == PendingState::ReturnedToRuntime {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            hooks.registry().get("rt-1").unwrap().state,
+            PendingState::ReturnedToRuntime
+        );
+        handle.abort();
+        remove_socket(&socket);
+    }
+
+    /// 缺失/迟到确认(R2-ZC01):helper 收到决定但不回 ack(旧 helper 行为)
+    /// → 有限等待超时后按未确认收尾:HandledLocally(不冒充 Returned),
+    /// 且不自动重新投递(迟到决定被拒)。
+    #[tokio::test]
+    async fn missing_ack_leaves_delivery_unconfirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = test_hooks(dir.path());
+        let socket = socket_path(dir.path());
+        let handle = start(dir.path(), hooks.clone()).await;
+        let (_guard, mut reader) =
+            send_request(&permission_invoke("rt-noack", 10_000), &socket).await;
+        wait_registered(hooks.registry(), "rt-noack").await;
+        hooks
+            .registry()
+            .resolve("rt-noack", HookReply::allowed())
+            .unwrap();
+        let reply = read_reply(&mut reader).await;
+        assert_eq!(reply.status, contract::STATUS_ALLOWED);
+        // ack 等待超时(合同常量)→ Unconfirmed → HandledLocally。
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(contract::DELIVERY_ACK_WAIT_MS + 1_500);
+        loop {
+            match hooks.registry().get("rt-noack").map(|s| s.state) {
+                Some(PendingState::HandledLocally) => break,
+                Some(_) if tokio::time::Instant::now() >= deadline => {
+                    panic!("ack 超时后必须按未确认收尾")
+                }
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        // 不自动重新投递:迟到决定一律拒绝。
+        assert_eq!(
+            hooks
+                .registry()
+                .resolve("rt-noack", HookReply::allowed())
+                .unwrap_err(),
+            PendingError::Cancelled
+        );
+        handle.abort();
+        remove_socket(&socket);
+    }
+
+    /// 错误绑定的 ack 行(R2-ZC01):内容不是本 invoke 的确认 → 未确认收尾。
+    #[tokio::test]
+    async fn wrong_ack_binding_is_unconfirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = test_hooks(dir.path());
+        let socket = socket_path(dir.path());
+        let handle = start(dir.path(), hooks.clone()).await;
+        let (mut guard, mut reader) =
+            send_request(&permission_invoke("rt-badack", 10_000), &socket).await;
+        wait_registered(hooks.registry(), "rt-badack").await;
+        hooks
+            .registry()
+            .resolve("rt-badack", HookReply::allowed())
+            .unwrap();
+        let _ = read_reply(&mut reader).await;
+        // 回发绑定其他 invoke 的 ack:不得视为确认。
+        send_ack(&mut guard, "some-other-invoke").await;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(contract::DELIVERY_ACK_WAIT_MS + 1_500);
+        loop {
+            match hooks.registry().get("rt-badack").map(|s| s.state) {
+                Some(PendingState::HandledLocally) => break,
+                Some(_) if tokio::time::Instant::now() >= deadline => {
+                    panic!("错误绑定 ack 不得视为确认")
+                }
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
         handle.abort();
         remove_socket(&socket);
     }

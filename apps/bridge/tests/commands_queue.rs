@@ -139,7 +139,12 @@ fn start_turn_request(session: &SessionKey, input: &str) -> CommandRequest {
     }
 }
 
-fn queue_set_request(session: &SessionKey, request_id: Uuid, input: &str) -> CommandRequest {
+fn queue_set_request(
+    session: &SessionKey,
+    request_id: Uuid,
+    input: &str,
+    replace: bool,
+) -> CommandRequest {
     CommandRequest {
         request_id,
         operation: Operation::QueueNextTurn,
@@ -149,6 +154,7 @@ fn queue_set_request(session: &SessionKey, request_id: Uuid, input: &str) -> Com
         payload_digest: None,
         payload: CommandPayload::QueueNextTurn {
             input: OutputText::new(input),
+            replace,
         },
     }
 }
@@ -254,7 +260,7 @@ async fn queue_set_replace_cancel_and_duplicate_semantics() {
     // 排队(经 gateway 命令管线:去重 + ACCEPTED → Completed)。
     let request_id = Uuid::new_v4();
     let submission = gateway
-        .submit(queue_set_request(&session, request_id, "queued-body-1"))
+        .submit(queue_set_request(&session, request_id, "queued-body-1", false))
         .await
         .unwrap();
     assert!(submission.is_accepted());
@@ -268,7 +274,7 @@ async fn queue_set_replace_cancel_and_duplicate_semantics() {
     // 重复排队 → ACCEPTED 后回执流给出 REJECTED{QUEUE_ALREADY_EXISTS};
     // 重复 request_id → 重放。
     let dup = gateway
-        .submit(queue_set_request(&session, Uuid::new_v4(), "queued-body-2"))
+        .submit(queue_set_request(&session, Uuid::new_v4(), "queued-body-2", false))
         .await
         .unwrap();
     let dup_states = drain_states(dup.into_receipts().unwrap()).await;
@@ -283,7 +289,7 @@ async fn queue_set_replace_cancel_and_duplicate_semantics() {
         "实际 {dup_states:?}"
     );
     let replay = gateway
-        .submit(queue_set_request(&session, request_id, "queued-body-1"))
+        .submit(queue_set_request(&session, request_id, "queued-body-1", false))
         .await
         .unwrap();
     assert!(matches!(replay, Submission::Replayed { .. }));
@@ -345,12 +351,14 @@ async fn completed_turn_auto_sends_queue_after_final_correction() {
     assert!(!running.is_empty(), "turn-1 Running 未出现");
 
     // turn-1 运行中排队:绑定 turn-1 与当前 revision。
+    let snapshot = adapter.runtime_snapshot(&session).await.unwrap();
     let queued = queue
         .set(
             &session,
             OutputText::new("queued-next"),
             false,
             Uuid::new_v4(),
+            &snapshot,
         )
         .await
         .unwrap();
@@ -447,12 +455,14 @@ async fn failed_turn_pauses_queue_without_autosend() {
     }
     assert!(running_seen, "turn 未进入 Running");
 
+    let snapshot = adapter.runtime_snapshot(&session).await.unwrap();
     queue
         .set(
             &session,
             OutputText::new("paused-body"),
             false,
             Uuid::new_v4(),
+            &snapshot,
         )
         .await
         .unwrap();
@@ -514,12 +524,14 @@ async fn paused_queue_requires_explicit_resume_then_autosends() {
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+    let snapshot = adapter.runtime_snapshot(&session).await.unwrap();
     queue
         .set(
             &session,
             OutputText::new("resume-body"),
             false,
             Uuid::new_v4(),
+            &snapshot,
         )
         .await
         .unwrap();
@@ -535,8 +547,15 @@ async fn paused_queue_requires_explicit_resume_then_autosends() {
     );
 
     // PAUSED 下 set(不 replace)→ QUEUE_PAUSED。
+    let snapshot = adapter.runtime_snapshot(&session).await.unwrap();
     let err = queue
-        .set(&session, OutputText::new("another"), false, Uuid::new_v4())
+        .set(
+            &session,
+            OutputText::new("another"),
+            false,
+            Uuid::new_v4(),
+            &snapshot,
+        )
         .await
         .unwrap_err();
     assert_eq!(err.code, StableErrorCode::QueuePaused);
@@ -579,12 +598,14 @@ async fn foreign_new_turn_pauses_queue() {
     let queue = gateway.queue();
 
     // idle 时排队(绑定 idle 标记)。
+    let snapshot = adapter.runtime_snapshot(&session).await.unwrap();
     queue
         .set(
             &session,
             OutputText::new("preempt-body"),
             false,
             Uuid::new_v4(),
+            &snapshot,
         )
         .await
         .unwrap();
@@ -632,19 +653,349 @@ async fn offline_device_rejects_queue_set() {
         agent_role: None,
     }];
     let adapter = CodexAdapter::connect(config).await.unwrap();
-    let gateway = CommandGateway::new(adapter, LocalStore::open(&temp_dir("store")).await.unwrap());
+    let store = LocalStore::open(&temp_dir("store")).await.unwrap();
+    let gateway = CommandGateway::new(adapter, store.clone());
     let session = key(CONV_OFFLINE);
+
+    // 经 gateway 命令管线:快照不可得 → ACCEPTED 后回执 REJECTED{CODEX_UNAVAILABLE}。
+    let submission = gateway
+        .submit(queue_set_request(&session, Uuid::new_v4(), "offline-body", false))
+        .await
+        .unwrap();
+    let states = drain_states(submission.into_receipts().unwrap()).await;
+    assert!(
+        matches!(
+            &states[..],
+            [bridge::domain::ReceiptState::Rejected {
+                code: StableErrorCode::CodexUnavailable,
+                ..
+            }]
+        ),
+        "实际 {states:?}"
+    );
+    assert_eq!(gateway.queue().get(&session).await.unwrap(), None);
+
+    // 已有队列时同样拒绝且保留旧队列(§15.3:离线禁止创建或替换)。
+    let stale = bridge::local_store::NextTurnEntry {
+        session: bridge::local_store::SessionKeyRef {
+            device_id: DEVICE.to_string(),
+            agent_kind: 1,
+            native_session_id: CONV_OFFLINE.to_string(),
+        },
+        prompt: "old-queued-body".to_string(),
+        after_turn_id: "turn-old".to_string(),
+        runtime_revision: 7,
+        status: bridge::local_store::QueueStatus::Queued,
+        created_at: "2026-01-01T00:00:00+00:00".to_string(),
+        updated_at: "2026-01-01T00:00:00+00:00".to_string(),
+    };
+    store.set_next_turn(&stale, false).await.unwrap();
+    let submission = gateway
+        .submit(queue_set_request(&session, Uuid::new_v4(), "offline-body", true))
+        .await
+        .unwrap();
+    let states = drain_states(submission.into_receipts().unwrap()).await;
+    assert!(
+        matches!(
+            &states[..],
+            [bridge::domain::ReceiptState::Rejected {
+                code: StableErrorCode::CodexUnavailable,
+                ..
+            }]
+        ),
+        "实际 {states:?}"
+    );
+    assert_eq!(
+        gateway.queue().get(&session).await.unwrap().unwrap().input,
+        bridge::domain::OutputText::new("old-queued-body")
+    );
+}
+
+/// §15.3 R2-AC02:替换请求经 gateway 全链路,校验不过(过期 revision /
+/// 错误 turn)时旧队列必须保留——不再有 runtime 预删除。
+#[tokio::test]
+async fn replace_via_gateway_keeps_old_queue_when_preconditions_fail() {
+    let dir = temp_dir("replace-stale");
+    let (socket, _log, fake) = spawn_fake(&dir, &[session_node(CONV_OK, false, 80)]).await;
+    let _guard = FakeGuard(fake);
+    let adapter = CodexAdapter::connect(adapter_config(socket, &[CONV_OK])).await.unwrap();
+    let store = LocalStore::open(&temp_dir("store")).await.unwrap();
+    let gateway = CommandGateway::new(adapter.clone(), store.clone());
+    let session = key(CONV_OK);
     let queue = gateway.queue();
 
+    // 预置旧队列(经 gateway set)。
+    drain(
+        gateway
+            .submit(queue_set_request(&session, Uuid::new_v4(), "old-body", false))
+            .await
+            .unwrap()
+            .into_receipts()
+            .unwrap(),
+    )
+    .await;
+    let snapshot = adapter.runtime_snapshot(&session).await.unwrap();
+
+    // 过期 revision → STALE_TURN,旧队列保留。
+    let stale_revision = CommandRequest {
+        expected_runtime_revision: Some(snapshot.runtime_revision + 100),
+        ..queue_set_request(&session, Uuid::new_v4(), "new-body", true)
+    };
+    let states = drain_states(
+        gateway
+            .submit(stale_revision)
+            .await
+            .unwrap()
+            .into_receipts()
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        matches!(
+            &states[..],
+            [bridge::domain::ReceiptState::Rejected {
+                code: StableErrorCode::StaleTurn,
+                ..
+            }]
+        ),
+        "实际 {states:?}"
+    );
+    assert_eq!(
+        queue.get(&session).await.unwrap().unwrap().input.as_str(),
+        "old-body"
+    );
+
+    // 错误 turn → STALE_TURN,旧队列保留。
+    let stale_turn = CommandRequest {
+        expected_turn_id: Some(bridge::domain::TurnId::native("turn-gone")),
+        ..queue_set_request(&session, Uuid::new_v4(), "new-body", true)
+    };
+    let states = drain_states(
+        gateway
+            .submit(stale_turn)
+            .await
+            .unwrap()
+            .into_receipts()
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        matches!(
+            &states[..],
+            [bridge::domain::ReceiptState::Rejected {
+                code: StableErrorCode::StaleTurn,
+                ..
+            }]
+        ),
+        "实际 {states:?}"
+    );
+    assert_eq!(
+        queue.get(&session).await.unwrap().unwrap().input.as_str(),
+        "old-body"
+    );
+
+    // 同一 request_id 断线重连后重试:重放既有回执(REJECTED),不另起新任务。
+    let stale_id = Uuid::new_v4();
+    let first = CommandRequest {
+        expected_runtime_revision: Some(snapshot.runtime_revision + 100),
+        ..queue_set_request(&session, stale_id, "new-body", true)
+    };
+    let states = drain_states(gateway.submit(first).await.unwrap().into_receipts().unwrap()).await;
+    assert!(matches!(
+        &states[..],
+        [bridge::domain::ReceiptState::Rejected {
+            code: StableErrorCode::StaleTurn,
+            ..
+        }]
+    ));
+    let replay = gateway
+        .submit(queue_set_request(&session, stale_id, "new-body", true))
+        .await
+        .unwrap();
+    match replay {
+        Submission::Replayed { state, .. } => {
+            assert_eq!(state, bridge::commands::StoredReceiptState::Rejected)
+        }
+        other => panic!("应重放既有回执,实际 {other:?}"),
+    }
+    assert_eq!(
+        queue.get(&session).await.unwrap().unwrap().input.as_str(),
+        "old-body"
+    );
+}
+
+/// §15.3 R2-AC02:合法替换仅留新队列;同 requestId 重放不重复替换;
+/// 不同 payload 复用 requestId 明确拒绝;set/replace 去重摘要可区分。
+#[tokio::test]
+async fn replace_via_gateway_replay_and_mismatch_semantics() {
+    let dir = temp_dir("replace-replay");
+    let (socket, _log, fake) = spawn_fake(&dir, &[session_node(CONV_OK, false, 80)]).await;
+    let _guard = FakeGuard(fake);
+    let adapter = CodexAdapter::connect(adapter_config(socket, &[CONV_OK])).await.unwrap();
+    let gateway = CommandGateway::new(
+        adapter,
+        LocalStore::open(&temp_dir("store")).await.unwrap(),
+    );
+    let session = key(CONV_OK);
+    let queue = gateway.queue();
+
+    // 预置旧队列并合法替换:仅留新队列。
+    drain(
+        gateway
+            .submit(queue_set_request(&session, Uuid::new_v4(), "old-body", false))
+            .await
+            .unwrap()
+            .into_receipts()
+            .unwrap(),
+    )
+    .await;
+    let replace_id = Uuid::new_v4();
+    let states = drain_states(
+        gateway
+            .submit(queue_set_request(&session, replace_id, "new-body", true))
+            .await
+            .unwrap()
+            .into_receipts()
+            .unwrap(),
+    )
+    .await;
+    assert!(matches!(
+        &states[..],
+        [bridge::domain::ReceiptState::Completed]
+    ));
+    let entry = queue.get(&session).await.unwrap().unwrap();
+    assert_eq!(entry.input.as_str(), "new-body");
+
+    // 同 requestId 同 payload 重放:既有回执,队列不再变化。
+    let replay = gateway
+        .submit(queue_set_request(&session, replace_id, "new-body", true))
+        .await
+        .unwrap();
+    match replay {
+        Submission::Replayed { state, .. } => {
+            assert_eq!(state, bridge::commands::StoredReceiptState::Completed)
+        }
+        other => panic!("应重放既有回执,实际 {other:?}"),
+    }
+    assert_eq!(
+        queue.get(&session).await.unwrap().unwrap().input.as_str(),
+        "new-body"
+    );
+
+    // 同 requestId 不同 payload:DUPLICATE_REQUEST_MISMATCH,队列保留。
+    let err = gateway
+        .submit(queue_set_request(&session, replace_id, "yet-another-body", true))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, StableErrorCode::DuplicateRequestMismatch);
+    assert_eq!(
+        queue.get(&session).await.unwrap().unwrap().input.as_str(),
+        "new-body"
+    );
+
+    // set 与 replace 的去重摘要可区分:同 requestId 下先 set 再 replace
+    // (正文相同)因语义不同被拒,不发生静默替换。
+    assert!(queue.cancel(&session).await.unwrap());
+    let set_then_replace = Uuid::new_v4();
+    let states = drain_states(
+        gateway
+            .submit(queue_set_request(&session, set_then_replace, "same-body", false))
+            .await
+            .unwrap()
+            .into_receipts()
+            .unwrap(),
+    )
+    .await;
+    assert!(matches!(
+        &states[..],
+        [bridge::domain::ReceiptState::Completed]
+    ));
+    let err = gateway
+        .submit(queue_set_request(&session, set_then_replace, "same-body", true))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, StableErrorCode::DuplicateRequestMismatch);
+    assert_eq!(
+        queue.get(&session).await.unwrap().unwrap().input.as_str(),
+        "same-body"
+    );
+}
+
+/// §15.3 R2-AC02:存储写失败(并发写锁)→ 拒绝且旧队列保留。
+/// 覆盖两条真实失败路径:
+/// 1. gateway.submit 内去重落库(INSERT)失败 → Err,未触达队列;
+/// 2. QueueManager 直写 set_next_turn 的 UPDATE 重试耗尽失败 →
+///    单行事务回滚,旧行保留。
+#[tokio::test]
+async fn replace_keeps_old_queue_when_store_write_fails() {
+    let dir = temp_dir("replace-lock");
+    let (socket, _log, fake) = spawn_fake(&dir, &[session_node(CONV_OK, false, 80)]).await;
+    let _guard = FakeGuard(fake);
+    let adapter = CodexAdapter::connect(adapter_config(socket, &[CONV_OK])).await.unwrap();
+    let store_dir = temp_dir("store");
+    let store = LocalStore::open(&store_dir).await.unwrap();
+    let gateway = CommandGateway::new(adapter.clone(), store.clone());
+    let session = key(CONV_OK);
+    let queue = gateway.queue();
+
+    drain(
+        gateway
+            .submit(queue_set_request(&session, Uuid::new_v4(), "old-body", false))
+            .await
+            .unwrap()
+            .into_receipts()
+            .unwrap(),
+    )
+    .await;
+
+    // 独立连接持有 SQLite 写锁,使后续写操作失败。
+    let lock = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(store_dir.join("bridge.sqlite3"))
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(lock)
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    // 路径 1:gateway 去重落库失败 → Err{InternalError};队列未被动过。
+    let err = gateway
+        .submit(queue_set_request(&session, Uuid::new_v4(), "new-body", true))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, StableErrorCode::InternalError);
+    assert_eq!(
+        queue.get(&session).await.unwrap().unwrap().input.as_str(),
+        "old-body"
+    );
+
+    // 路径 2:QueueManager 直写(绑定快照由调用方提供,不经 gateway)→
+    // set_next_turn 在 retry_busy 重试耗尽后失败;旧行保留。
+    let snapshot = adapter.runtime_snapshot(&session).await.unwrap();
     let err = queue
         .set(
             &session,
-            OutputText::new("offline-body"),
-            false,
+            OutputText::new("new-body"),
+            true,
             Uuid::new_v4(),
+            &snapshot,
         )
         .await
         .unwrap_err();
-    assert_eq!(err.code, StableErrorCode::CodexUnavailable);
-    assert_eq!(queue.get(&session).await.unwrap(), None);
+    assert_eq!(err.code, StableErrorCode::InternalError);
+
+    sqlx::query("ROLLBACK").execute(&mut *conn).await.unwrap();
+    // 先归还持锁连接再关池:close 会等待所有连接归还。
+    drop(conn);
+    assert_eq!(
+        queue.get(&session).await.unwrap().unwrap().input.as_str(),
+        "old-body",
+        "存储写失败时旧队列必须保留"
+    );
+    pool.close().await;
 }

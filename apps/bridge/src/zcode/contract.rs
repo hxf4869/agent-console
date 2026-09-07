@@ -21,6 +21,11 @@ pub const MAX_REMOTE_WAIT_MS: u64 = DEFAULT_REMOTE_WAIT_MS;
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// 状态事件确认等待(ms;远小于决策预算)。
 pub const STATUS_WAIT_MS: u64 = 5_000;
+/// 交付确认等待(ms):Bridge 写回决定后,有限等待 helper 完成**原生协议
+/// 输出**(PermissionRequest stdout / MCP JSON-RPC 响应)后的 ack 行。
+/// 仅意味着「原生协议结果已确认输出」,不证明原生工具已执行;超时/缺失
+/// 一律按未确认处理(不静默假定已送达,兼容无 ack 的旧 helper)。
+pub const DELIVERY_ACK_WAIT_MS: u64 = 3_000;
 
 /// invoke 事件类型。
 pub const EVENT_PERMISSION_REQUEST: &str = "permission_request";
@@ -203,6 +208,28 @@ impl HookReply {
 /// 收敛等待时长到合同范围。
 pub fn clamp_wait_ms(requested: u64) -> Duration {
     Duration::from_millis(requested.clamp(MIN_REMOTE_WAIT_MS, MAX_REMOTE_WAIT_MS))
+}
+
+// ---------------------------------------------------------------------------
+// 交付确认(R2-ZC01):决定写回后的第二条 helper 行,绑定 invoke_id
+// ---------------------------------------------------------------------------
+
+/// 交付确认行:helper 在完成原生协议输出(stdout / JSON-RPC 写出+flush)
+/// 之后回发;同连接单 invoke,ack 携带 invoke_id 形成绑定。
+pub fn delivery_ack_json(invoke_id: &str) -> String {
+    serde_json::json!({ "ack": invoke_id }).to_string()
+}
+
+/// 校验一行是否为该 invoke 的合法交付确认(绑定 invoke_id;其余内容一律
+/// 不视为确认 —— 决定前出现输入仍是协议违约,迟到/错误 ack 不算送达)。
+pub fn is_delivery_ack(line: &str, invoke_id: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Ack {
+        ack: String,
+    }
+    serde_json::from_str::<Ack>(line.trim())
+        .map(|ack| ack.ack == invoke_id)
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -415,5 +442,18 @@ mod tests {
             clamp_wait_ms(u64::MAX),
             Duration::from_millis(MAX_REMOTE_WAIT_MS)
         );
+    }
+
+    /// 交付确认绑定 invoke_id:本 invoke 的 ack 合法;其他 id、缺字段、
+    /// 非 JSON、空行一律不视为确认(R2-ZC01:确认缺失/绑定不符 = 未送达)。
+    #[test]
+    fn delivery_ack_is_bound_to_invoke_id() {
+        let line = delivery_ack_json("inv-1");
+        assert!(is_delivery_ack(&line, "inv-1"));
+        assert!(!is_delivery_ack(&line, "inv-2"), "其他 invoke 的 ack 不合法");
+        assert!(!is_delivery_ack("{\"ack\":\"inv-2\"}", "inv-1"));
+        assert!(!is_delivery_ack("{}", "inv-1"), "缺 ack 字段不合法");
+        assert!(!is_delivery_ack("not json", "inv-1"));
+        assert!(!is_delivery_ack("", "inv-1"));
     }
 }

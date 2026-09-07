@@ -49,6 +49,16 @@ MCP 问答（`bridge mcp-stdio`，`agent_console.ask_user`）复用同一注册�
 工具结果 `answered / cancelled / expired`；`notifications/cancelled` 在
 tools/call 等待期间仍被处理（调用在独立任务等待），被取消请求不回响应。
 
+#### 交付确认（ack 合同）
+
+决定写回 helper 后，socket server 有限等待 3s，只接受绑定该 `invoke_id`
+的确认行；helper 在官方 decision JSON 实际写出 stdout 成功后才回 ack，
+MCP 侧在 JSON-RPC 结果写出成功后才回 ack。确认到达 → Delivered → 回执
+`RECEIPT_COMPLETED`——它只表示"已确认输出原生协议结果"，不代表工具已在
+ZCode 中执行；写回失败、确认缺失或超时（含旧版 helper 不回 ack 的安全
+收尾）一律按 `OUTCOME_UNKNOWN` 处理，不自动重新投递。runtime 命令面对
+交付确认有限等待 5s 后出终态回执。
+
 ### 关键设计决定
 
 - `invoke_id` 由 helper 生成（UUID v4）；同命令两次执行 = 两个独立请求。

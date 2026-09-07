@@ -1352,3 +1352,237 @@ async fn preview_transfer_streams_file_via_producer() {
     );
     ctx.runtime.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// 6. 队列替换(R2-AC02):runtime 入口不预删除旧队列——校验不过/同 ID
+//    mismatch 时旧队列保留;合法替换仅留新队列;同 requestId 重放
+//    返回既有回执不重复替换。
+// ---------------------------------------------------------------------------
+
+fn queue_set_envelope(
+    conversation: &str,
+    request_id: &str,
+    prompt: &str,
+    correlation: &str,
+) -> pb::Envelope {
+    inbound_envelope(
+        pb::envelope::Payload::CommandRequest(pb::CommandRequest {
+            request_id: request_id.to_owned(),
+            operation: pb::Operation::QueueSet as i32,
+            session_key: Some(pb::SessionKey {
+                device_id: DEVICE.to_string(),
+                agent_kind: pb::AgentKind::CodexDesktop as i32,
+                native_session_id: conversation.to_string(),
+                relay_session_uuid: String::new(),
+            }),
+            expected_turn_id: None,
+            expected_runtime_revision: None,
+            payload_digest: String::new(),
+            payload: Some(command_request::Payload::QueueSet(pb::QueueSetPayload {
+                prompt: prompt.to_string(),
+                after_turn_id: None,
+                runtime_revision: 0,
+            })),
+        }),
+        correlation,
+    )
+}
+
+fn queue_replace_envelope(
+    conversation: &str,
+    request_id: &str,
+    prompt: &str,
+    expected_runtime_revision: Option<u64>,
+    correlation: &str,
+) -> pb::Envelope {
+    inbound_envelope(
+        pb::envelope::Payload::CommandRequest(pb::CommandRequest {
+            request_id: request_id.to_owned(),
+            operation: pb::Operation::QueueReplace as i32,
+            session_key: Some(pb::SessionKey {
+                device_id: DEVICE.to_string(),
+                agent_kind: pb::AgentKind::CodexDesktop as i32,
+                native_session_id: conversation.to_string(),
+                relay_session_uuid: String::new(),
+            }),
+            expected_turn_id: None,
+            expected_runtime_revision,
+            payload_digest: String::new(),
+            payload: Some(command_request::Payload::QueueReplace(
+                pb::QueueReplacePayload {
+                    prompt: prompt.to_string(),
+                    after_turn_id: None,
+                    runtime_revision: 0,
+                },
+            )),
+        }),
+        correlation,
+    )
+}
+
+async fn wait_command_result(
+    ctx: &mut TestCtx,
+    all: &mut Vec<pb::Envelope>,
+    request_id: &str,
+    status: pb::CommandReceiptStatus,
+) -> pb::CommandResult {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(result) = Outbox::payload_of(all).find_map(|p| match p {
+            envelope::Payload::CommandResult(r)
+                if r.request_id == request_id && r.status == status as i32 =>
+            {
+                Some(r.clone())
+            }
+            _ => None,
+        }) {
+            return result;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("未等到 {request_id} 的 {status:?} 回执");
+        }
+        match tokio::time::timeout(Duration::from_millis(50), ctx.outbox.rx.recv()).await {
+            Ok(Some(env)) => all.push(env),
+            Ok(None) => panic!("outbox 已关闭"),
+            Err(_) => {}
+        }
+    }
+}
+
+async fn queued_prompt(ctx: &TestCtx) -> Option<String> {
+    ctx.store
+        .get_next_turn(&bridge::local_store::SessionKeyRef {
+            device_id: DEVICE.to_string(),
+            agent_kind: 1,
+            native_session_id: CONV_QUEUE.to_string(),
+        })
+        .await
+        .unwrap()
+        .map(|entry| entry.prompt)
+}
+
+#[tokio::test]
+async fn queue_replace_keeps_old_on_stale_and_replays_without_repeating() {
+    let mut ctx = setup(
+        "queue-replace",
+        json!({"sessions": [{
+            "conversationId": CONV_QUEUE,
+            "title": "fixture-queue",
+            "cwd": "/tmp/fixture-queue",
+            "turn": {"outputLines": ["r-1", "r-2", "r-3", "r-4", "r-5"], "lineDelayMs": 300}
+        }]}),
+        vec![seed(CONV_QUEUE, "fixture-queue")],
+    )
+    .await;
+    ctx.runtime
+        .handle_envelope(subscribe_session(CONV_QUEUE))
+        .await;
+    let mut all: Vec<pb::Envelope> = Vec::new();
+    all.extend(
+        ctx.outbox
+            .collect_until(Duration::from_secs(5), |events| {
+                Outbox::find_subscribed(events).is_some()
+            })
+            .await,
+    );
+
+    // 预置旧队列(QueueSet 经 runtime 全链路)。
+    let set_id = Uuid::new_v4().to_string();
+    ctx.runtime
+        .handle_envelope(queue_set_envelope(CONV_QUEUE, &set_id, "queued-old", "corr-set"))
+        .await;
+    wait_command_result(
+        &mut ctx,
+        &mut all,
+        &set_id,
+        pb::CommandReceiptStatus::ReceiptCompleted,
+    )
+    .await;
+    assert_eq!(queued_prompt(&ctx).await.as_deref(), Some("queued-old"));
+
+    // 过期 revision 的 QueueReplace:REJECTED{STALE_TURN},旧队列保留
+    // (旧实现会先删除旧队列再校验,失败即丢任务)。
+    let stale_id = Uuid::new_v4().to_string();
+    ctx.runtime
+        .handle_envelope(queue_replace_envelope(
+            CONV_QUEUE,
+            &stale_id,
+            "queued-new",
+            Some(999_999),
+            "corr-stale",
+        ))
+        .await;
+    let result = wait_command_result(
+        &mut ctx,
+        &mut all,
+        &stale_id,
+        pb::CommandReceiptStatus::ReceiptRejected,
+    )
+    .await;
+    assert_eq!(result.error_code, pb::StableErrorCode::StaleTurn as i32);
+    assert_eq!(queued_prompt(&ctx).await.as_deref(), Some("queued-old"));
+
+    // 合法替换:Completed,仅留新队列。
+    let replace_id = Uuid::new_v4().to_string();
+    ctx.runtime
+        .handle_envelope(queue_replace_envelope(
+            CONV_QUEUE,
+            &replace_id,
+            "queued-new",
+            None,
+            "corr-replace",
+        ))
+        .await;
+    wait_command_result(
+        &mut ctx,
+        &mut all,
+        &replace_id,
+        pb::CommandReceiptStatus::ReceiptCompleted,
+    )
+    .await;
+    assert_eq!(queued_prompt(&ctx).await.as_deref(), Some("queued-new"));
+
+    // 同 requestId 同 payload 重放:既有回执,不重复替换。
+    ctx.runtime
+        .handle_envelope(queue_replace_envelope(
+            CONV_QUEUE,
+            &replace_id,
+            "queued-new",
+            None,
+            "corr-replay",
+        ))
+        .await;
+    wait_command_result(
+        &mut ctx,
+        &mut all,
+        &replace_id,
+        pb::CommandReceiptStatus::ReceiptCompleted,
+    )
+    .await;
+    assert_eq!(queued_prompt(&ctx).await.as_deref(), Some("queued-new"));
+
+    // 同 requestId 不同 payload:DUPLICATE_REQUEST_MISMATCH,队列保留。
+    ctx.runtime
+        .handle_envelope(queue_replace_envelope(
+            CONV_QUEUE,
+            &replace_id,
+            "queued-different",
+            None,
+            "corr-mismatch",
+        ))
+        .await;
+    let result = wait_command_result(
+        &mut ctx,
+        &mut all,
+        &replace_id,
+        pb::CommandReceiptStatus::ReceiptRejected,
+    )
+    .await;
+    assert_eq!(
+        result.error_code,
+        pb::StableErrorCode::DuplicateRequestMismatch as i32
+    );
+    assert_eq!(queued_prompt(&ctx).await.as_deref(), Some("queued-new"));
+
+    ctx.runtime.shutdown().await;
+}

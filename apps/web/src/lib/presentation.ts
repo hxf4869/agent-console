@@ -83,8 +83,11 @@ export function requestStatusLabel(
     case 'ACCEPTED_BY_BRIDGE':
       return { text: 'Bridge 已接收', verify: false }
     case 'DISPATCHED_TO_CODEX':
-    case 'COMPLETED':
       return { text: '原生已处理', verify: false }
+    case 'COMPLETED':
+      // R2-ZC01:COMPLETED 只表示原生协议结果已确认输出(如 ZCode 审批
+      // 决定已送达 helper 并完成协议输出),不证明原生工具已执行。
+      return { text: '原生已处理该请求（不代表工具已执行）', verify: false }
     case 'REJECTED':
       return { text: `被拒绝（${errorCode ?? '未知原因'}）`, verify: false }
     case 'OUTCOME_UNKNOWN':

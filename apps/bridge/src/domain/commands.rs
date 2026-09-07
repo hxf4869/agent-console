@@ -12,6 +12,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// serde `skip_serializing_if`:`replace = false` 不出现在规范化序列化中,
+/// 既有 QueueSet 回执摘要不因新增默认字段变成 payload mismatch。
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// 写命令请求(§15.1 公共字段)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,7 +78,14 @@ pub enum CommandPayload {
     /// 更新会话设置(作用于下一次 turn,§16.2)。
     UpdateSettings { values: Vec<SettingUpdate> },
     /// 设置/替换单条下一轮队列正文(正文只落 Bridge SQLite,§15.3)。
-    QueueNextTurn { input: OutputText },
+    /// `replace = true` 即 QueueReplace 语义:更新同一条队列记录而非拒绝;
+    /// `false` 序列化时不出现该字段,与历史 QueueSet 摘要保持兼容,
+    /// set/replace 借此在去重摘要(§15.1)中可区分。
+    QueueNextTurn {
+        input: OutputText,
+        #[serde(default, skip_serializing_if = "is_false")]
+        replace: bool,
+    },
     /// 取消已排队条目。
     CancelQueue,
     /// 暂停队列条目(FAILED/INTERRUPTED 后;只能由用户重新确认,§15.3)。
@@ -159,5 +172,41 @@ mod tests {
             Some(current.clone())
         )
         .permits_revision_drift(Some(&current)));
+    }
+
+    /// §15.1 去重摘要兼容性:`replace = false` 不改变既有 QueueSet 的
+    /// 规范化序列化;`replace = true`(QueueReplace)与 set 摘要可区分;
+    /// 旧形态 JSON(无 replace 字段)仍可反序列化且摘要一致。
+    #[test]
+    fn queue_next_turn_replace_flag_keeps_set_digest_compatible() {
+        let set = CommandPayload::QueueNextTurn {
+            input: OutputText::new("body"),
+            replace: false,
+        };
+        let replace = CommandPayload::QueueNextTurn {
+            input: OutputText::new("body"),
+            replace: true,
+        };
+
+        let set_value = serde_json::to_value(&set).unwrap();
+        assert!(
+            set_value.get("replace").is_none(),
+            "set 的默认 replace 字段不得进入摘要序列化: {set_value}"
+        );
+        let replace_value = serde_json::to_value(&replace).unwrap();
+        assert_eq!(replace_value.get("replace"), Some(&serde_json::json!(true)));
+
+        let digest = |payload: &CommandPayload| crate::commands::canonical_payload_digest(payload);
+        assert_ne!(digest(&set), digest(&replace), "set/replace 摘要必须可区分");
+
+        // 历史形态(修复前 QueueSet/QueueReplace 同形)反序列化回 set,
+        // 摘要与新增省略默认字段后的序列化完全一致。
+        let legacy: CommandPayload = serde_json::from_value(serde_json::json!({
+            "payload": "queue_next_turn",
+            "input": "body"
+        }))
+        .unwrap();
+        assert_eq!(legacy, set);
+        assert_eq!(digest(&legacy), digest(&set));
     }
 }

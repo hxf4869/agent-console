@@ -790,28 +790,31 @@ pub(crate) fn answer_entries(
 /// 组装 `thread-follower-submit-user-input` 的 response(asar 归一化形状
 /// `{answers: {<题目自身id>: {answers: [<label>...]}}}`):
 /// - 内层键 = 每题自身 id(不是外层 request.id,P2-10 身份分离);
-/// - 全部题目进 payload(多题不丢);
-/// - 命令是单卡回答:所选 label 与自由文本归属第一题(与展示卡一致),
-///   其余题目显式空 answers(空 answers 的原生接受度待 N01 采样)。
+/// - 单题(唯一可达路径):所选 label 与自由文本进该题 answers。
+///
+/// 多题请求返回 `Err`(R2-CX01):单卡命令只能回答第一题,其余题目会被
+/// 自动空答——"每个 key 都存在"不等于"所有问题都得到用户回答"。调用方
+/// (`adapter::answer_response_for` → `execute_command`)必须在发送任何
+/// 原生响应之前拒绝,保持原生 pending,由用户回 Desktop 处理。
 pub fn build_request_answer_response(
     request: &RequestsQuestion,
     answered_labels: &[String],
     free_text: Option<&str>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
+    let [question] = request.questions.as_slice() else {
+        return Err(format!(
+            "native request {} carries {} questions; a single remote answer card \
+             cannot answer all of them completely, handle it in Codex Desktop",
+            request.request_id,
+            request.questions.len()
+        ));
+    };
     let entries = answer_entries(answered_labels, free_text);
-    let mut answers = serde_json::Map::new();
-    for (index, question) in request.questions.iter().enumerate() {
-        let question_answers = if index == 0 {
-            entries.clone()
-        } else {
-            Vec::new()
-        };
-        answers.insert(
-            question.question_id.clone(),
-            serde_json::json!({ "answers": question_answers }),
-        );
-    }
-    serde_json::json!({ "answers": serde_json::Value::Object(answers) })
+    Ok(serde_json::json!({
+        "answers": {
+            question.question_id.clone(): { "answers": entries },
+        },
+    }))
 }
 
 /// 审批提取(§16.4):`pendingApprovals[]`。

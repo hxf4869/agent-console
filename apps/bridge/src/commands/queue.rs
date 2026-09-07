@@ -73,17 +73,19 @@ impl QueueManager {
         })
     }
 
-    /// 设置/排队(§15.3)。`replace = false` 且已存在 QUEUED 条目 →
-    /// `QUEUE_ALREADY_EXISTS`;已存在 PAUSED 条目 → `QUEUE_PAUSED`
-    /// (须显式 resume 或 replace)。设备离线 → `CODEX_UNAVAILABLE`。
+    /// 设置/排队(§15.3)。`snapshot` 必须是调用方(Gateway)完成前置校验的
+    /// 那份快照——最终绑定与校验读取一致,两次读取不得静默换 turn;
+    /// `replace = false` 且已存在 QUEUED 条目 → `QUEUE_ALREADY_EXISTS`;
+    /// 已存在 PAUSED 条目 → `QUEUE_PAUSED`(须显式 resume 或 replace)。
+    /// set/replace 都只更新同一条队列记录,失败时既有条目不变。
     pub async fn set(
         self: &Arc<Self>,
         key: &SessionKey,
         input: OutputText,
         replace: bool,
         request_id: uuid::Uuid,
+        snapshot: &RuntimeSnapshot,
     ) -> Result<QueuedTurn, BridgeError> {
-        let snapshot = self.snapshot(key).await?;
         let session = session_ref(key);
         if let Some(existing) = self
             .store
@@ -104,7 +106,7 @@ impl QueueManager {
                 });
             }
         }
-        let entry = self.entry_from_snapshot(key, &snapshot, input.as_str());
+        let entry = self.entry_from_snapshot(key, snapshot, input.as_str());
         retry_busy(|| self.store.set_next_turn(&entry, replace))
             .await
             .map_err(store_err)?;
@@ -113,14 +115,16 @@ impl QueueManager {
         Ok(self.domain_turn(&entry, request_id, input))
     }
 
-    /// 替换既有条目(§15.3 支持替换)。等价 `set(replace = true)`。
+    /// 替换既有条目(§15.3 支持替换)。便捷入口:自行取当前快照后走
+    /// [`QueueManager::set`];经 Gateway 的请求应传通过校验的快照。
     pub async fn replace(
         self: &Arc<Self>,
         key: &SessionKey,
         input: OutputText,
         request_id: uuid::Uuid,
     ) -> Result<QueuedTurn, BridgeError> {
-        self.set(key, input, true, request_id).await
+        let snapshot = self.snapshot(key).await?;
+        self.set(key, input, true, request_id, &snapshot).await
     }
 
     /// 读取当前队列条目。

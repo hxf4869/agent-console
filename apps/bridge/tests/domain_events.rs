@@ -168,6 +168,7 @@ fn command_request_roundtrip_with_queue_payload() {
         payload_digest: Some("sha256:fixture".to_string()),
         payload: CommandPayload::QueueNextTurn {
             input: OutputText::new("下一条指令"),
+            replace: false,
         },
     };
     let text = serde_json::to_string(&request).unwrap();

@@ -61,6 +61,8 @@
 | **新建 thread** | — | **UNSUPPORTED(IPC)** | asar 全量枚举:Desktop 在 IPC 上只注册 initialize/thread-owner-discovery/thread-follower-*;新建走 Desktop 私有 app-server 通道,不在 ipc.sock 上 |
 | rename / archive / fork | — | UNSUPPORTED(IPC) | 仅有归档状态广播(thread-archived/unarchived),无 IPC 写方法 |
 
+- 2026-09-06 Bridge 行为更新(R2-CX01,静态实现与单测,无新增真机证据):多问题原生请求(`requests[]` 单请求含多题)在 Bridge 服务端即被拒——返回 `CAPABILITY_UNSUPPORTED`(消息含题数与回 Desktop 处理指引),零原生写、原生 pending 保留,不产出部分回答;单题回答组装已实现,但 `Operation::AnswerQuestion` 仍属生产白名单 NotProbed 未开放。版本探测失败/未知版本 → DEGRADED + READ_ONLY(写关闭,§6 未知版本语义),探测恢复且版本命中后写恢复。上表各方法状态与已验证结论不变。
+
 ## 4. B.11 阶段门:Desktop 控制路径新建任务
 
 - **结论:当前版本(ipc.sock)无法由外部进程新建 thread。** 按执行规格 §12“如果 Desktop 私有控制路径无法稳定创建任务,标记 capability unsupported 并触发阶段门”处理。

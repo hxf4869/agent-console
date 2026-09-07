@@ -1,5 +1,7 @@
 import { create } from '@bufbuild/protobuf'
 import {
+  CommandAcceptedSchema,
+  CommandReceiptStatus,
   decodeEnvelope,
   encodeEnvelope,
   EnvelopeSchema,
@@ -169,6 +171,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.useRealTimers()
   vi.unstubAllGlobals()
 })
@@ -239,7 +242,19 @@ describe('agent kind routing on the realtime link (ZC-02)', () => {
       summaryProto('session-z', 2),
     ])
 
-    void transport
+    // 受控 digest:#commandEnvelope 在发帧前 await sha256Hex(...),这是命令
+    // 发帧前唯一的异步等待点。真实 WebCrypto 走 libuv 线程池,完成时机不受
+    // 假时钟控制(CI Node 24 上两次 50ms 推进内可能未完成,帧缺失导致断言
+    // 失败)。这里手动决定 digest 何时完成,把等待点显式暴露出来,时序完全
+    // 确定且与 Node 版本无关。
+    let resolveDigest!: (value: ArrayBuffer) => void
+    const digestGate = new Promise<ArrayBuffer>((resolve) => {
+      resolveDigest = resolve
+    })
+    const digestSpy = vi.spyOn(crypto.subtle, 'digest').mockReturnValue(digestGate)
+
+    // 不吞错:sendCommand 的任何异常都会在末尾以真实错误抛出,让本测试失败。
+    const outcome = transport
       .sendCommand({
         requestId: '10000000-0000-4000-8000-000000000001',
         operation: 'ANSWER_APPROVAL',
@@ -247,9 +262,19 @@ describe('agent kind routing on the realtime link (ZC-02)', () => {
         expectedRuntimeRevision: 0,
         payload: { attentionId: 'att-1', optionId: 'allow' },
       })
-      .catch(() => undefined)
-    await vi.advanceTimersByTimeAsync(50)
-    await vi.advanceTimersByTimeAsync(50)
+      .then(
+        (receipt) => ({ ok: true as const, receipt }),
+        (error: unknown) => ({ ok: false as const, error }),
+      )
+
+    // digest 未完成前不得发帧(payloadDigest 是帧内容的一部分)。若回归出
+    // "digest 未完成就发帧/检查帧",此断言立即失败,而不是静默通过。
+    await vi.advanceTimersByTimeAsync(0)
+    expect(socket.sentPayloads().some((payload) => payload.case === 'commandRequest')).toBe(false)
+
+    resolveDigest(new Uint8Array(32).fill(0xab).buffer)
+    await vi.advanceTimersByTimeAsync(0)
+
     const command = socket
       .sentPayloads()
       .filter((payload) => payload.case === 'commandRequest')
@@ -258,6 +283,29 @@ describe('agent kind routing on the realtime link (ZC-02)', () => {
     const sessionKey = (command!.value as Record<string, unknown>).sessionKey as Record<string, unknown>
     expect(sessionKey.agentKind).toBe(2)
     expect(sessionKey.nativeSessionId).toBe('session-z-native')
+    digestSpy.mockRestore()
+
+    // fake socket 返回回执,收束 sendCommand:真实异常在此显式断言,不静默。
+    socket.push(
+      frame(
+        {
+          case: 'commandAccepted',
+          value: create(CommandAcceptedSchema, {
+            requestId: '10000000-0000-4000-8000-000000000001',
+            status: CommandReceiptStatus.RECEIPT_ACCEPTED_BY_BRIDGE,
+          }),
+        },
+        LIST_STREAM,
+        2n,
+      ),
+    )
+    await vi.advanceTimersByTimeAsync(0)
+    const result = await outcome
+    if (!result.ok) throw result.error
+    expect(result.receipt).toMatchObject({
+      requestId: '10000000-0000-4000-8000-000000000001',
+      status: 'ACCEPTED_BY_BRIDGE',
+    })
     disconnect()
   })
 

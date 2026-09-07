@@ -198,6 +198,10 @@ fn initial_state(node: &Value) -> Value {
         "turns": node.get("turns").cloned().unwrap_or_else(|| json!([])),
         "pendingQuestions": node.get("pendingQuestions").cloned().unwrap_or(json!([])),
         "pendingApprovals": node.get("pendingApprovals").cloned().unwrap_or(json!([])),
+        // 0.153.4 requests[] 形态(原生问题/审批;投影契约透传,fixture 可
+        // 提供 `requests` 注入 requestUserInput 等;无回答处理:pending 保持,
+        // 供多题拒绝等无 UI 场景断言)。
+        "requests": node.get("requests").cloned().unwrap_or(json!([])),
         "createdAt": 1_000i64,
         "updatedAt": 1_000i64,
         "recencyAt": 1_000i64,
@@ -416,6 +420,10 @@ async fn dispatch(
                     }
                 }
                 // 回答问题 / 审批决策:移除对应 pending 项并广播终态。
+                // stderr 记录这 4 个 pending 类写方法的到达(测试断言"零原生
+                // 写"用);start/steer/interrupt/update-settings 等其余原生
+                // 写方法由上方通用 request 日志覆盖,两条观测点共同支撑零写
+                // 断言。只含方法名/会话/路由 ID,无正文,§25.3。
                 "thread-follower-submit-user-input"
                 | "thread-follower-command-approval-decision"
                 | "thread-follower-file-approval-decision"
@@ -425,6 +433,9 @@ async fn dispatch(
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
+                    eprintln!(
+                        "[fake-owner] write method reached owner: {method} conv={conversation} request={native_id}"
+                    );
                     let removed = {
                         let mut sessions = server.sessions.lock();
                         let mut removed = false;

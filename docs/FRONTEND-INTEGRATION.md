@@ -170,6 +170,13 @@ HTTP API(`/agent-console/api/*`)不需要 ticket:网关 forward-auth 后以内�
 - sequence 只在 `stream_id + stream_epoch` 内单调;重复 sequence 幂等忽略;
   缺口在 Relay 内存窗口内会补发;超出窗口、Relay 重启或 epoch 变化 →
   `ResyncRequired{stream_id, reason_code:RESYNC_REQUIRED}`。
+- `Subscribed.base_sequence` 是**已应用水位**:快照内容覆盖到该序号,
+  后续帧 sequence 从 base+1 起连续;前端应用快照后
+  `lastSequence = baseSequence`。快照覆盖水位模型:Relay 按设备缓存最新
+  快照,新快照到达时只删除同设备且上游批号 ≤ 覆盖水位的缓冲帧;断线恢复
+  优先完整重放,存活窗口有空洞时锚定最新快照重放(客户端从快照重建)。
+- 已知 streamId 再次收到 `Subscribed`(新 epoch)时在同一连接上重绑:
+  接受新 epoch 并按 base_sequence 重建坐标,等待新快照应用,无需重连。
 - 收到 ResyncRequired 或本地状态可疑时,发
   `ResyncRequest{stream_id}` → 服务端重新走 Subscribed → 快照 → 缓冲事件。
 - **epoch 变化必须放弃本地状态、从新 snapshot 重建。**

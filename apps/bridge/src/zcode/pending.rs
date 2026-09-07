@@ -82,6 +82,11 @@ pub struct PendingRecord {
     pub deadline: Instant,
     /// 唯一回复通道;resolve 时取走。
     responder: Option<oneshot::Sender<HookReply>>,
+    /// 交付确认通道(R2-ZC01):resolve 锁定决定后,命令面经
+    /// `take_delivery` 取走接收端有限等待;socket 服务在写回+确认结局
+    /// 明确后经 `complete_delivery` 恰好发送一次。
+    delivery_tx: Option<oneshot::Sender<DeliveryOutcome>>,
+    delivery_rx: Option<oneshot::Receiver<DeliveryOutcome>>,
 }
 
 impl fmt::Debug for PendingRecord {
@@ -119,6 +124,17 @@ pub enum PendingError {
     Rejected(String),
 }
 
+/// 本地决定的交付确认结果(R2-ZC01)。确认只证明「原生协议结果已确认
+/// 输出」(helper stdout / MCP JSON-RPC 写出+flush),不证明原生工具已执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// helper 已确认完成原生协议输出。
+    Delivered,
+    /// 写回失败 / 确认缺失、迟到、绑定不符或超时:结果不确定,
+    /// 不得报成功(命令面按 OUTCOME_UNKNOWN 处理)。
+    Unconfirmed,
+}
+
 /// 内存 pending 注册表。
 #[derive(Default)]
 pub struct PendingRegistry {
@@ -145,6 +161,7 @@ impl PendingRegistry {
     ) -> Result<oneshot::Receiver<HookReply>, PendingError> {
         let now = Instant::now();
         let (tx, rx) = oneshot::channel();
+        let (delivery_tx, delivery_rx) = oneshot::channel();
         let mut inner = self.inner.lock();
         if inner.contains_key(invoke_id) {
             return Err(PendingError::Duplicate);
@@ -167,6 +184,8 @@ impl PendingRegistry {
                 created_at: now,
                 deadline: now + wait,
                 responder: Some(tx),
+                delivery_tx: Some(delivery_tx),
+                delivery_rx: Some(delivery_rx),
             },
         );
         Ok(rx)
@@ -204,9 +223,42 @@ impl PendingRegistry {
         Ok(record.state)
     }
 
-    /// helper 已收到决定(stdout 写出/送达)。
-    pub fn mark_returned(&self, invoke_id: &str) -> Result<(), PendingError> {
-        self.transition(invoke_id, PendingState::Decided, PendingState::ReturnedToRuntime)
+    /// 取走交付确认接收端(命令面在 `resolve` 成功后调用一次;二次调用
+    /// 返回 None,按结果未知处理)。
+    pub fn take_delivery(
+        &self,
+        invoke_id: &str,
+    ) -> Option<oneshot::Receiver<DeliveryOutcome>> {
+        let mut inner = self.inner.lock();
+        let record = inner.get_mut(invoke_id)?;
+        record.delivery_rx.take()
+    }
+
+    /// 交付确认完成(R2-ZC01,socket 服务恰好调用一次):
+    /// - `Delivered`:Decided → ReturnedToRuntime(既有语义:已确认输出
+    ///   原生协议结果);
+    /// - `Unconfirmed`:Decided → HandledLocally(写回失败/确认缺失或
+    ///   超时,结果不确定,不得报成功)。
+    /// 同时向命令面等待者发送结果;记录已不在/状态不合法时返回错误并
+    /// 忽略(确认迟到不影响既有终态)。
+    pub fn complete_delivery(
+        &self,
+        invoke_id: &str,
+        outcome: DeliveryOutcome,
+    ) -> Result<PendingState, PendingError> {
+        let mut inner = self.inner.lock();
+        let record = inner.get_mut(invoke_id).ok_or(PendingError::Unknown)?;
+        if record.state != PendingState::Decided {
+            return Err(PendingError::AlreadyDecided);
+        }
+        record.state = match outcome {
+            DeliveryOutcome::Delivered => PendingState::ReturnedToRuntime,
+            DeliveryOutcome::Unconfirmed => PendingState::HandledLocally,
+        };
+        if let Some(tx) = record.delivery_tx.take() {
+            let _ = tx.send(outcome);
+        }
+        Ok(record.state)
     }
 
     /// 运行时已处理(PostToolUse 等原生事件核实后)。
@@ -228,6 +280,29 @@ impl PendingRegistry {
         }
         record.state = PendingState::Expired;
         Ok(PendingState::Expired)
+    }
+
+    /// 超时收尾的原子判定:「检查 + 迁移」在同一把锁内完成,消除探针与
+    /// `expire` 两步之间被迟到 `resolve` 插入的竞态窗口:
+    /// - Waiting → 置 Expired,返回 true(正常超时过期);
+    /// - 已是 Expired(`resolve` 恰在 deadline 之后到达时已置终态并拒绝
+    ///   决定,该路径不摘卡)→ 返回 true,卡片/等待标记仍须由调用方清理
+    ///   恰好一次;
+    /// - 其余状态(Decided/HandledLocally/ReturnedToRuntime/
+    ///   RuntimeProcessed)或记录不存在 → false,由调用方竞态兜底
+    ///   (`finalize_decided_after_race`)或既有 Unknown 语义处理。
+    pub fn expire_or_already_expired(&self, invoke_id: &str) -> bool {
+        let mut inner = self.inner.lock();
+        match inner.get_mut(invoke_id) {
+            Some(record) => match record.state {
+                PendingState::Waiting | PendingState::Expired => {
+                    record.state = PendingState::Expired;
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        }
     }
 
     /// 决定与超时/连接消失竞态(`tokio::select!` 同时就绪时随机分支)的
@@ -445,6 +520,65 @@ mod tests {
         );
     }
 
+    /// 超时收尾原子判定的全状态矩阵:Waiting → true 且置 Expired;
+    /// 已是 Expired(resolve 在 deadline 后置终态、决定被拒且不摘卡的
+    /// 路径)→ true,收尾仍须恰好一次;Decided/HandledLocally → false
+    /// (Decided 交给 raced 兜底);记录不存在 → false。
+    #[test]
+    fn expire_or_already_expired_is_atomic_per_state() {
+        // Waiting → true 且状态迁移为 Expired。
+        let waiting = PendingRegistry::new();
+        let _rx = waiting
+            .register("eoa-waiting", InvokeKind::PermissionRequest, None, None, None, None, None, Duration::from_secs(10))
+            .unwrap();
+        assert!(waiting.expire_or_already_expired("eoa-waiting"));
+        assert_eq!(
+            waiting.get("eoa-waiting").unwrap().state,
+            PendingState::Expired
+        );
+
+        // 已被置为 Expired(resolve-after-deadline 终态等价:Expired 且
+        // responder 未取走)→ true,且状态保持 Expired 不再变化。
+        let expired = PendingRegistry::new();
+        let _rx = expired
+            .register("eoa-expired", InvokeKind::PermissionRequest, None, None, None, None, None, Duration::from_secs(10))
+            .unwrap();
+        expired.expire("eoa-expired").unwrap();
+        assert!(expired.expire_or_already_expired("eoa-expired"));
+        assert_eq!(
+            expired.get("eoa-expired").unwrap().state,
+            PendingState::Expired
+        );
+
+        // Decided → false(由 raced 兜底路径收尾)。
+        let decided = PendingRegistry::new();
+        let _rx = decided
+            .register("eoa-decided", InvokeKind::PermissionRequest, None, None, None, None, None, Duration::from_secs(10))
+            .unwrap();
+        decided.resolve("eoa-decided", HookReply::allowed()).unwrap();
+        assert!(!decided.expire_or_already_expired("eoa-decided"));
+        assert_eq!(
+            decided.get("eoa-decided").unwrap().state,
+            PendingState::Decided
+        );
+
+        // HandledLocally → false。
+        let handled = PendingRegistry::new();
+        let _rx = handled
+            .register("eoa-handled", InvokeKind::PermissionRequest, None, None, None, None, None, Duration::from_secs(10))
+            .unwrap();
+        handled.cancel("eoa-handled").unwrap();
+        assert!(!handled.expire_or_already_expired("eoa-handled"));
+        assert_eq!(
+            handled.get("eoa-handled").unwrap().state,
+            PendingState::HandledLocally
+        );
+
+        // 记录不存在(Unknown)→ false。
+        let unknown = PendingRegistry::new();
+        assert!(!unknown.expire_or_already_expired("eoa-missing"));
+    }
+
     #[test]
     fn cancel_rejects_late_replies() {
         let registry = PendingRegistry::new();
@@ -508,14 +642,19 @@ mod tests {
         ));
     }
 
+    /// Decided → ReturnedToRuntime → RuntimeProcessed 状态链:决定经交付
+    /// 确认(complete_delivery(Delivered))返回运行时,PostToolUse 核实后
+    /// 进入 RuntimeProcessed;随后不再是 ReturnedToRuntime,不会被二次匹配。
     #[test]
-    fn lifecycle_mark_returned_and_runtime_processed() {
+    fn lifecycle_complete_delivery_and_runtime_processed() {
         let registry = PendingRegistry::new();
         let _rx = registry
             .register("i8", InvokeKind::PermissionRequest, None, None, Some("tool-1".into()), None, None, Duration::from_secs(10))
             .unwrap();
         registry.resolve("i8", HookReply::allowed()).unwrap();
-        registry.mark_returned("i8").unwrap();
+        registry
+            .complete_delivery("i8", DeliveryOutcome::Delivered)
+            .unwrap();
         assert_eq!(
             registry.find_returned_by_tool_use("tool-1").as_deref(),
             Some("i8")
@@ -527,6 +666,66 @@ mod tests {
         );
         // 不再是 ReturnedToRuntime:不会被二次匹配。
         assert_eq!(registry.find_returned_by_tool_use("tool-1"), None);
+    }
+
+    /// R2-ZC01:交付确认只允许从 Decided 出发恰好一次;Delivered →
+    /// ReturnedToRuntime,Unconfirmed → HandledLocally;命令面等待者收到
+    /// 对应结果;二次确认/重复取通道均不得成功(迟到确认不算送达)。
+    #[test]
+    fn delivery_confirmation_is_once_and_phase_bound() {
+        let registry = PendingRegistry::new();
+        let _rx = registry
+            .register("d1", InvokeKind::PermissionRequest, None, Some("Bash".into()), None, None, None, Duration::from_secs(10))
+            .unwrap();
+        // 决定前交付确认不得生效(合法阶段绑定)。
+        assert_eq!(
+            registry.complete_delivery("d1", DeliveryOutcome::Delivered).unwrap_err(),
+            PendingError::AlreadyDecided
+        );
+        registry.resolve("d1", HookReply::allowed()).unwrap();
+        let wait = registry.take_delivery("d1").expect("接收端恰可取一次");
+        assert!(
+            registry.take_delivery("d1").is_none(),
+            "二次取走按未知处理"
+        );
+        assert_eq!(
+            registry
+                .complete_delivery("d1", DeliveryOutcome::Delivered)
+                .unwrap(),
+            PendingState::ReturnedToRuntime
+        );
+        assert_eq!(
+            tokio::runtime::Runtime::new().unwrap().block_on(wait).unwrap(),
+            DeliveryOutcome::Delivered
+        );
+        // 迟到/重复确认不再改变终态。
+        assert_eq!(
+            registry.complete_delivery("d1", DeliveryOutcome::Unconfirmed).unwrap_err(),
+            PendingError::AlreadyDecided
+        );
+
+        // Unconfirmed 路径:决定已锁定但交付不确定 → HandledLocally。
+        let registry2 = PendingRegistry::new();
+        let _rx2 = registry2
+            .register("d2", InvokeKind::PermissionRequest, None, None, None, None, None, Duration::from_secs(10))
+            .unwrap();
+        registry2.resolve("d2", HookReply::denied("no")).unwrap();
+        let wait2 = registry2.take_delivery("d2").unwrap();
+        assert_eq!(
+            registry2
+                .complete_delivery("d2", DeliveryOutcome::Unconfirmed)
+                .unwrap(),
+            PendingState::HandledLocally
+        );
+        assert_eq!(
+            tokio::runtime::Runtime::new().unwrap().block_on(wait2).unwrap(),
+            DeliveryOutcome::Unconfirmed
+        );
+        // Unconfirmed 后迟到决定仍被拒(不得二次决定)。
+        assert_eq!(
+            registry2.resolve("d2", HookReply::allowed()).unwrap_err(),
+            PendingError::Cancelled
+        );
     }
 
     #[test]

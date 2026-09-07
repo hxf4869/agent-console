@@ -327,10 +327,12 @@ impl CommandGateway {
 
         // ---- ③ expected turn/revision 校验(§15.2 STALE_TURN) ----
         // 仅当请求携带期望值或 payload 需要快照(队列绑定)时才取快照,
-        // 避免无谓的快照依赖。
+        // 避免无谓的快照依赖。队列 payload 通过校验的快照原样传给
+        // QueueManager 绑定,两次读取不得静默换 turn(§15.3)。
         let needs_snapshot = req.expected_turn_id.is_some()
             || req.expected_runtime_revision.is_some()
             || matches!(req.payload, CommandPayload::QueueNextTurn { .. });
+        let mut validated_snapshot: Option<crate::domain::RuntimeSnapshot> = None;
         if needs_snapshot {
             match self.adapter.runtime_snapshot(&key).await {
                 Err(err) => {
@@ -385,14 +387,23 @@ impl CommandGateway {
                             return Ok(accepted(rx));
                         }
                     }
+                    validated_snapshot = Some(snapshot);
                 }
             }
         }
 
         // ---- ⑤/⑥ 分发:队列/后台命令本地处理,其余交给 executor ----
         match req.payload.clone() {
-            CommandPayload::QueueNextTurn { input } => {
-                let result = self.queue.set(&key, input, false, request_id).await;
+            CommandPayload::QueueNextTurn { input, replace } => {
+                // needs_snapshot 已覆盖 QueueNextTurn:绑定必须使用通过校验
+                // 的快照;set/replace 都在同一工作流内,失败不丢旧队列。
+                let snapshot = validated_snapshot
+                    .as_ref()
+                    .expect("QueueNextTurn implies validated snapshot");
+                let result = self
+                    .queue
+                    .set(&key, input, replace, request_id, snapshot)
+                    .await;
                 self.finalize_local(request_id, &tx, result).await;
             }
             CommandPayload::CancelQueue => {

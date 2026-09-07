@@ -1501,11 +1501,15 @@ pub fn command_request_from_proto(
             }
             dm::CommandPayload::UpdateSettings { values }
         }
+        // §15.3:set/replace 语义随 payload 进入 gateway(先去重与快照校验,
+        // 确认可替换后单行事务更新),runtime 不再预取消。
         Some(Payload::QueueSet(queue)) => dm::CommandPayload::QueueNextTurn {
             input: dm::OutputText::new(queue.prompt.clone()),
+            replace: false,
         },
         Some(Payload::QueueReplace(queue)) => dm::CommandPayload::QueueNextTurn {
             input: dm::OutputText::new(queue.prompt.clone()),
+            replace: true,
         },
         Some(Payload::QueueCancel(_)) => dm::CommandPayload::CancelQueue,
         Some(Payload::StopBackgroundCommand(stop)) => dm::CommandPayload::StopBackgroundCommand {
@@ -1863,6 +1867,44 @@ mod tests {
         let domain = command_request_from_proto(&queue, &caps).unwrap();
         assert_eq!(domain.operation, dm::Operation::QueueNextTurn);
         assert!(matches!(domain.payload, dm::CommandPayload::CancelQueue));
+
+        // QueueSet/QueueReplace 映射为同一 payload 族,仅 replace 标志不同
+        // (§15.3:gateway 据此走 set/replace 分支,摘要可区分二者语义)。
+        let set = pb::CommandRequest {
+            request_id: request_id.to_string(),
+            operation: pb::Operation::QueueSet as i32,
+            session_key: Some(session_key_to_proto(&sample_session_key())),
+            payload: Some(pb::command_request::Payload::QueueSet(pb::QueueSetPayload {
+                prompt: "q".to_string(),
+                after_turn_id: None,
+                runtime_revision: 0,
+            })),
+            ..Default::default()
+        };
+        match command_request_from_proto(&set, &caps).unwrap().payload {
+            dm::CommandPayload::QueueNextTurn { input, replace } => {
+                assert_eq!(input.as_str(), "q");
+                assert!(!replace);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let replace = pb::CommandRequest {
+            request_id: request_id.to_string(),
+            operation: pb::Operation::QueueReplace as i32,
+            session_key: Some(session_key_to_proto(&sample_session_key())),
+            payload: Some(pb::command_request::Payload::QueueReplace(
+                pb::QueueReplacePayload {
+                    prompt: "q".to_string(),
+                    after_turn_id: None,
+                    runtime_revision: 0,
+                },
+            )),
+            ..Default::default()
+        };
+        match command_request_from_proto(&replace, &caps).unwrap().payload {
+            dm::CommandPayload::QueueNextTurn { replace, .. } => assert!(replace),
+            other => panic!("unexpected: {other:?}"),
+        }
 
         // 设置:kind 按 option_id 动态解析。
         let settings = pb::CommandRequest {
