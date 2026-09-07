@@ -1,6 +1,8 @@
 //! Git 只读能力集成测试(§23.1、§29.1:固定 argv、超时、detached HEAD、
 //! binary、大 Diff、授权根)。测试仓库全部使用无害合成数据。
 
+use std::fs::File;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -86,7 +88,12 @@ fn sleeping_git(dir: &Path, pid_out: &Path) -> PathBuf {
         pid_out.display()
     );
     let path = dir.join("sleepy-git");
-    std::fs::write(&path, script).unwrap();
+    // Linux(overlayfs)上“写入关闭后立即 exec”存在 ETXTBSY 概率竞态:
+    // 落盘并显式关闭写句柄,降低写侧尚未完全释放即被 exec 的概率。
+    let mut f = File::create(&path).unwrap();
+    f.write_all(script.as_bytes()).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
@@ -333,7 +340,17 @@ async fn timeout_kills_git_process() {
     let pid_file = tmp.path().join("pid.txt");
     let fake = sleeping_git(tmp.path(), &pid_file);
     // 预热:同步空跑一次,完成可执行文件的首次加载(`-C` 开头才挂起)。
-    Command::new(&fake).arg("--version").output().unwrap();
+    // Linux(overlayfs)上“写入关闭后立即 exec”仍可能概率性命中 ETXTBSY
+    // (ErrorKind::ExecutableFileBusy),这里对该错误做有界重试,其余错误照常报错。
+    for attempt in 0..5 {
+        match Command::new(&fake).arg("--version").output() {
+            Ok(_) => break,
+            Err(e) if e.kind() == ErrorKind::ExecutableFileBusy && attempt < 4 => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("warm-up spawn of fake git failed: {e}"),
+        }
+    }
     // 500ms:远短于脚本里 sleep 60,又给 /bin/sh 充足启动时间。
     let svc = GitService::with_limits(fake, Duration::from_millis(500), 1024);
 
