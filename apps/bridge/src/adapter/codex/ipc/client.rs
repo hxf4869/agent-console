@@ -38,6 +38,9 @@ use super::messages::{
 };
 
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Desktop owner 路由器在无匹配客户端时约 10 秒返回 `no-client-found`；
+/// discovery 必须等到该稳定结果，不能先以通用请求超时截断。
+const OWNER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 发送队列上限(§12:一次连接的队列有上限)。满即拒绝,不无界缓冲。
 pub const DEFAULT_OUTBOUND_QUEUE: usize = 256;
@@ -599,7 +602,10 @@ impl IpcClient {
             .request(
                 m::method::THREAD_OWNER_DISCOVERY,
                 params,
-                RequestOptions::default(),
+                RequestOptions {
+                    timeout: Some(OWNER_DISCOVERY_TIMEOUT),
+                    ..Default::default()
+                },
             )
             .await
         {

@@ -13,6 +13,7 @@ import {
   mapRuntimeSnapshotJson,
   mapSessionSummaryJson,
   RealConsoleTransport,
+  RuntimeSnapshotUnavailableError,
   ticketSubprotocol,
 } from './real-transport'
 
@@ -132,6 +133,55 @@ describe('real transport contract mapping', () => {
       sizeBytes: 12,
       previewKind: 'text',
       fileHandle: 'refreshed-handle',
+    })
+  })
+
+  it('keeps resolved history when the live runtime is unavailable', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input)
+        if (path.includes('/runtime')) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                code: 'SESSION_NOT_FOUND',
+                message: 'session has no desktop owner (not open)',
+              },
+            }),
+            { status: 404, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        return new Response(
+          JSON.stringify({
+            historyPage: {
+              entries: [
+                {
+                  item: {
+                    itemId: { id: 'history-1' },
+                    createdAt: '2026-09-07T00:00:00Z',
+                    content: { userMessage: { text: '历史指令' } },
+                  },
+                },
+              ],
+              nextCursor: 'older',
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }),
+    )
+
+    const transport = new RealConsoleTransport()
+    const error = await transport.getRuntimeSnapshot('session-1').catch((caught) => caught)
+
+    expect(error).toBeInstanceOf(RuntimeSnapshotUnavailableError)
+    expect(error).toMatchObject({
+      code: 'SESSION_NOT_FOUND',
+      history: {
+        nextCursor: 'older',
+        items: [{ id: 'history-1', type: 'commentary', author: '你', body: '历史指令' }],
+      },
     })
   })
 

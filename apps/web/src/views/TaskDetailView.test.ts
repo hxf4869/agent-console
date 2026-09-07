@@ -78,4 +78,22 @@ describe('task detail view (UX-09 save-to-toolbox source label)', () => {
       agentDisplay: 'ZCode Desktop',
     })
   })
+
+  it('keeps task history visible and offers retry when the Desktop task is not open', async () => {
+    const { wrapper, store } = await mountTaskDetail()
+    const runtime = store.state.runtimes['session-ui']!
+    runtime.unavailable = {
+      code: 'SESSION_NOT_FOUND',
+      message: 'session has no desktop owner (not open)',
+    }
+    await nextTick()
+
+    expect(wrapper.text()).toContain('请先在 Mac 的 Codex Desktop 中打开此任务')
+    expect(wrapper.find('[aria-label="保存该条消息到工具箱"]').exists()).toBe(true)
+
+    await wrapper.get('button.runtime-retry').trigger('click')
+    await vi.advanceTimersByTimeAsync(700)
+    await nextTick()
+    expect(wrapper.text()).not.toContain('请先在 Mac 的 Codex Desktop 中打开此任务')
+  })
 })

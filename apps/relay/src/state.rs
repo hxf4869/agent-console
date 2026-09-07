@@ -82,7 +82,7 @@ pub mod limits {
     /// 握手等待超时。
     pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
     /// HTTP → Bridge 在线查询超时(§27.3)。
-    pub const UPSTREAM_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+    pub const UPSTREAM_QUERY_TIMEOUT: Duration = Duration::from_secs(85);
     /// Browser WS auth 本地过期检查兜底周期(expires_at 精确判定在每次写入与 introspect)。
     pub const LOCAL_EXPIRY_CHECK: Duration = Duration::from_secs(30);
 

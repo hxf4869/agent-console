@@ -139,6 +139,26 @@ describe('session list snapshots', () => {
     expect(reconciled.phase).toBe('IDLE')
     expect(reconciled.activeTurnId).toBeUndefined()
   })
+
+  it('clears the history-only fallback after a live snapshot succeeds at the same revision', () => {
+    const current = {
+      sessionId: 'session-current',
+      unavailable: { code: 'SESSION_NOT_FOUND', message: 'not open' },
+      runtimeRevision: 0,
+      phase: 'IDLE',
+      timeline: [],
+    } as RuntimeSnapshot
+    const incoming = {
+      sessionId: 'session-current',
+      runtimeRevision: 0,
+      phase: 'IDLE',
+      timeline: [],
+    } as RuntimeSnapshot
+
+    const reconciled = reconcileRuntimeSnapshot(current, incoming, true)
+
+    expect(reconciled.unavailable).toBeUndefined()
+  })
 })
 
 describe('detail reconciliation', () => {

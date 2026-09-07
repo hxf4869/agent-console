@@ -374,6 +374,13 @@ fn runtime_query(conversation: &str) -> pb::Envelope {
     )
 }
 
+fn heartbeat(correlation: &str) -> pb::Envelope {
+    inbound_envelope(
+        pb::envelope::Payload::Heartbeat(pb::Heartbeat {}),
+        correlation,
+    )
+}
+
 fn start_turn_request(conversation: &str, prompt: &str, correlation: &str) -> pb::Envelope {
     inbound_envelope(
         pb::envelope::Payload::CommandRequest(pb::CommandRequest {
@@ -453,6 +460,59 @@ async fn list_subscribe_delivers_summary_batch() {
 // ---------------------------------------------------------------------------
 // 2. 详情订阅 + 命令回执 + 编号输出 + 权威校正
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn runtime_query_does_not_block_connection_heartbeat() {
+    let mut ctx = setup(
+        "query-heartbeat",
+        json!({"sessions": [{
+            "conversationId": CONV_FAST,
+            "title": "fixture-query-heartbeat",
+            "cwd": "/tmp/fixture-query-heartbeat"
+        }]}),
+        vec![seed(CONV_FAST, "fixture-query-heartbeat")],
+    )
+    .await;
+
+    ctx.runtime.handle_envelope(runtime_query(CONV_FAST)).await;
+    ctx.runtime
+        .handle_envelope(heartbeat("corr-heartbeat"))
+        .await;
+
+    let events = ctx
+        .outbox
+        .collect_until(Duration::from_secs(5), |events| {
+            let has_ack = Outbox::payload_of(events)
+                .any(|payload| matches!(payload, envelope::Payload::HeartbeatAck(_)));
+            let has_query = Outbox::payload_of(events)
+                .any(|payload| matches!(payload, envelope::Payload::QueryResponse(_)));
+            has_ack && has_query
+        })
+        .await;
+    let ack_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.payload.as_ref(),
+                Some(envelope::Payload::HeartbeatAck(_))
+            )
+        })
+        .expect("HeartbeatAck 缺失");
+    let query_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.payload.as_ref(),
+                Some(envelope::Payload::QueryResponse(_))
+            )
+        })
+        .expect("QueryResponse 缺失");
+    assert!(
+        ack_index < query_index,
+        "运行态查询必须在后台执行，心跳确认不能被查询阻塞"
+    );
+    ctx.runtime.shutdown().await;
+}
 
 #[tokio::test]
 async fn detail_pipeline_outputs_and_command_receipts() {

@@ -200,6 +200,11 @@ export interface RuntimeSettings {
 
 export interface RuntimeSnapshot {
   sessionId: string
+  /** 实时态暂不可用时，详情仍可展示已读取的历史。 */
+  unavailable?: {
+    code: string
+    message: string
+  }
   runtimeRevision: number
   activeTurnId?: string
   phase: ActiveTurnPhase

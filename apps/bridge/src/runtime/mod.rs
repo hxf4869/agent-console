@@ -433,7 +433,7 @@ impl BridgeRuntime {
             state.session_streams.keys().cloned().collect()
         };
         for slot in stream_slots {
-            self.establish_session_stream(&slot, String::new(), None)
+            self.establish_session_stream(&slot, String::new(), None, true)
                 .await;
         }
         let active_slots: Vec<SessionSlot> = {
@@ -471,22 +471,41 @@ impl BridgeRuntime {
                 // 上游流 id 以 Relay 在 Subscribe 上的 stream_id 为准
                 // (Bridge 回包必须回显,Routing 由 Relay upstream_index 完成)。
                 let upstream_id = (!envelope.stream_id.is_empty()).then_some(envelope.stream_id);
-                self.handle_subscribe(subscribe, upstream_id, correlation)
-                    .await;
+                let runtime = self.clone();
+                tokio::spawn(async move {
+                    runtime
+                        .handle_subscribe(subscribe, upstream_id, correlation)
+                        .await;
+                });
             }
             Payload::Unsubscribe(unsubscribe) => {
                 self.handle_unsubscribe(&unsubscribe.stream_id);
             }
             Payload::ResyncRequest(request) => {
-                self.handle_stream_resync(&request.stream_id, correlation)
-                    .await;
+                let runtime = self.clone();
+                tokio::spawn(async move {
+                    runtime
+                        .handle_stream_resync(&request.stream_id, correlation)
+                        .await;
+                });
             }
             // Relay 侧 sequence 缺口/重启:重建该流(新 epoch + snapshot,§17.5)。
             Payload::ResyncRequired(required) => {
-                self.handle_stream_resync(&required.stream_id, correlation)
-                    .await;
+                let runtime = self.clone();
+                tokio::spawn(async move {
+                    runtime
+                        .handle_stream_resync(&required.stream_id, correlation)
+                        .await;
+                });
             }
-            Payload::QueryRequest(query) => self.handle_query(query, correlation).await,
+            Payload::QueryRequest(query) => {
+                // Desktop 查询可能等待 IPC；独立执行，不能阻塞本连接的心跳和
+                // 其他入站消息。
+                let runtime = self.clone();
+                tokio::spawn(async move {
+                    runtime.handle_query(query, correlation).await;
+                });
+            }
             Payload::CommandRequest(request) => self.handle_command(request, correlation).await,
             Payload::TransferOffer(offer) => {
                 transfers::handle_transfer_offer(self, offer, correlation).await;
@@ -529,7 +548,7 @@ impl BridgeRuntime {
                     return;
                 };
                 let slot = SessionSlot::of(&key);
-                self.establish_session_stream(&slot, correlation, upstream_id)
+                self.establish_session_stream(&slot, correlation, upstream_id, false)
                     .await;
             }
             None => {
@@ -578,7 +597,7 @@ impl BridgeRuntime {
         match target {
             Some(None) => self.establish_list_stream(correlation, None).await,
             Some(Some(slot)) => {
-                self.establish_session_stream(&slot, correlation, None)
+                self.establish_session_stream(&slot, correlation, None, true)
                     .await
             }
             None => {}
@@ -685,6 +704,7 @@ impl BridgeRuntime {
         slot: &SessionSlot,
         correlation: String,
         upstream_id: Option<String>,
+        force_refresh: bool,
     ) {
         let key = slot.key(&self.inner.device_id);
         self.attach_session(&key).await;
@@ -722,12 +742,12 @@ impl BridgeRuntime {
         // Codex = adapter 投影;ZCode = Hook 观察 + pending 注册表镜像。
         let snapshot_result: Result<dm::RuntimeSnapshot, dm::BridgeError> = match slot.0 {
             dm::AgentKind::CodexDesktop => {
-                let mut snapshot = self
-                    .inner
-                    .adapter
-                    .refresh_snapshot(&key)
-                    .await
-                    .map_err(adapter_err);
+                let mut snapshot = if force_refresh {
+                    self.inner.adapter.refresh_snapshot(&key).await
+                } else {
+                    self.inner.adapter.runtime_snapshot(&key).await
+                }
+                .map_err(adapter_err);
                 if let Ok(snapshot) = snapshot.as_mut() {
                     if let Ok(queue) = self.queue().queue_status(&key).await {
                         snapshot.queue = queue;

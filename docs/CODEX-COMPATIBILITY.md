@@ -15,7 +15,7 @@
 |---|---|---|
 | fixture 开发可开始 | 前端/联调可用 `contracts/fixtures/` 与 fake owner 驱动 UI 开发,不依赖真实写验证 | FIXTURE_ONLY 能力 + fixtures 生产类型校验(`apps/relay/tests/fixtures_schema.rs`) |
 | 真实只读联调可开始 | 真实 Desktop 链路上列表/快照/历史/输出等只读能力已 VERIFIED,可进行真实只读联调 | §2 只读观察能力全部 VERIFIED |
-| 0.153.1 的核心轮次控制 start/steer/interrupt 已验收 | start/steer/interrupt 已在 0.153.1 真机 VERIFIED(§9);设置写入仅方法级 VERIFIED(update-thread-settings,effort 实测),因 Desktop 未提供动态可选值列表,产品 UpdateSettings 保持关闭、生产白名单 NotProbed(§6/§9.2);审批与原生问题回答未自然出现(FIXTURE_ONLY),均不得在产品中标榜其可用 | §3/§4/§6/§9 |
+| 0.153.1 / 0.153.4 的核心轮次控制 start/steer/interrupt 已验收 | start/steer/interrupt 已在两个版本的专用任务真机 VERIFIED(§9/§10);设置写入仅方法级 VERIFIED(update-thread-settings,effort 实测),因 Desktop 未提供动态可选值列表,产品 UpdateSettings 保持关闭、生产白名单 NotProbed;审批与原生问题回答未自然出现(FIXTURE_ONLY),均不得在产品中标榜其可用 | §3/§4/§6/§9/§10 |
 
 ## 1. 发现与连接
 
@@ -85,8 +85,8 @@
 
 - 版本判定与写能力注入分三层,互不共用同一判断:
   1. **只读协议兼容版本**:`VERIFIED_VERSIONS = ["0.153.0-alpha.5", "0.153.1", "0.153.4"]`(asar 复核 + 真机只读复验;0.153.1 Ev 版本表 22 项零 diff,见 §8;0.153.4 只读探针 + Ev 差异面核对,见 §10)。命中即 `CompatibilityState::Verified`,语义仅为协议/只读兼容,不等于任何写能力开放。
-  2. **每版本实际验证过的写操作**:生产写白名单独立按版本注入(逐版本矩阵见 §9.2)——0.153.1 注入 start/steer/interrupt = Passed(§9.1 真机验证);0.153.0-alpha.5(写验证仍 FIXTURE_ONLY,§3)与一切未知版本的全部写操作保持 NotProbed;未知版本另加 DEGRADED + READ_ONLY 只读降级。
-  3. **方法已验证但产品未开放的设置能力**:update-thread-settings 方法级已真机验证(§9.1,effort max→high),但因 Desktop 0.153.1 不提供动态可选值列表(availableValues 恒空),产品 UpdateSettings capability 保持关闭、生产白名单 update_settings = NotProbed;解锁条件与命令层防御见 §9.2。
+  2. **每版本实际验证过的写操作**:生产写白名单独立按版本注入(逐版本矩阵见 §9.2/§10.3)——0.153.1 与 0.153.4 注入 start/steer/interrupt = Passed(专用测试会话真机验证);0.153.0-alpha.5(写验证仍 FIXTURE_ONLY,§3)与一切未知版本的全部写操作保持 NotProbed;未知版本另加 DEGRADED + READ_ONLY 只读降级。
+  3. **方法已验证但产品未开放的设置能力**:update-thread-settings 方法级已在 0.153.1 与 0.153.4 真机验证(effort max→high),但 Desktop 未提供动态可选值列表(availableValues 恒空),产品 UpdateSettings capability 保持关闭、生产白名单 update_settings = NotProbed;解锁条件与命令层防御见 §9.2。
 - 版本表(asar `Ev`)随 Desktop 演进;`version` 字段不匹配时对端拒绝(`request-version-mismatch`),Bridge 的 capability probe 必须覆盖该表。
 
 ## 7. 任务创建路径调查(2026-09-04,共享 app-server daemon 假设)
@@ -169,7 +169,7 @@
 
 - 复核日期:2026-09-05(ChatGPT Desktop 自动更新至 bundle `26.901.41600`,`CFBundleVersion=7982`;`codex --version` = `codex-cli 0.153.4`,进程以 `-c features.code_mode_host=true` 拉起 app-server,与 §7 记录的私有 stdio 模式一致)。
 - 复核方式:新版 asar 静态逆向(`.vite/build/src-VqXTPopo.js` 路由/客户端库 + `webview/assets/app-initial-86767c3d23e5.js` 渲染进程)+ 真实 socket 只读探针(`cargo test -p bridge --test ipc_live -- --ignored --nocapture`;initialize / thread-owner-discovery / thread-stream-following-changed / thread-follower-load-complete-history,**未发送任何写方法**)。
-- **判定:只读协议 COMPATIBLE(`VERIFIED_VERSIONS` 已增补 `0.153.4`,§6);写能力全部 NotProbed(写矩阵未注入,真实写验证受 B.11 阶段门约束,待专用测试会话窗口)。**
+- **判定:协议/只读兼容，且 start/steer/interrupt 已通过专用测试会话真机验证并纳入写矩阵；问题、审批和产品设置写入仍未开放。**
 
 ### 10.1 协议差异面(0.153.4 vs 0.153.1,静态 + 真机)
 
@@ -196,7 +196,7 @@
 | 能力 | 状态 | 证据 |
 |---|---|---|
 | 只读观察能力(§1/§2 全部) | VERIFIED(0.153.4) | 真机只读探针(ipc_live,2026-09-05);Ev 表核对发送侧版本零 diff |
-| start/steer/interrupt | NOT_RUN(0.153.4) | 写矩阵未注入(§9.2 逐版本独立);0.153.1 证据不自动外推,待专用测试会话真机重验 |
+| start/steer/interrupt | VERIFIED(0.153.4) | 2026-09-07 专用测试会话 S0–S9 完整剧本通过：idle→start→completed、同轮 steer、带 expectedTurnId interrupt、中断后新轮恢复；现场恢复为 idle、无 pending attention、设置还原 |
 | 回答原生问题 | FIXTURE_ONLY(识别层已适配 `requests[]`,回答 payload 形状已按 asar 修正) | §10.2;N01 真机采样 BLOCKED_AUTH |
 | 命令/文件审批 | FIXTURE_ONLY(识别层已适配;decisions 空) | §10.2;N01 真机采样 BLOCKED_AUTH |
 | 权限审批 / MCP elicitation / queued follow-ups / edit / compact | FIXTURE_ONLY | 无新证据,维持 §3 状态 |

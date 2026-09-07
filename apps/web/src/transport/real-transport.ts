@@ -145,6 +145,14 @@ export class AuthRequiredError extends ConsoleApiError {
   }
 }
 
+/** runtime 查询失败，但同一次详情加载已经取得可展示的历史。 */
+export class RuntimeSnapshotUnavailableError extends ConsoleApiError {
+  constructor(error: ConsoleApiError, readonly history: Page<TimelineItem>) {
+    super(error.status, error.code, error.message)
+    this.name = 'RuntimeSnapshotUnavailableError'
+  }
+}
+
 /**
  * dev-toolbox 返回的 ticket 自身已经是 Base64URL 文本；WS 子协议合同要求
  * 再对这段明文做一次 Base64URL 编码，避免 ticket 中任何字节被协议解析。
@@ -296,12 +304,24 @@ export class RealConsoleTransport implements ConsoleTransport {
     const historyRequest = options?.includeHistory === false
       ? Promise.resolve<Page<TimelineItem>>({ items: [] })
       : this.getHistory(sessionId).catch((): Page<TimelineItem> => ({ items: [] }))
-    const [runtimeBody, history] = await Promise.all([
-      this.#json<{ runtimeSnapshot: unknown }>(`${API_ROOT}/sessions/${encodeURIComponent(sessionId)}/runtime`),
-      // RuntimeSnapshot 是详情首屏事实；HistoryPage 是可选分页补充。fake owner
-      // 或旧 Desktop 暂时不能提供历史时，不得把已成功的 runtime 一并丢弃。
-      historyRequest,
-    ])
+    let runtimeBody: { runtimeSnapshot: unknown }
+    let history: Page<TimelineItem>
+    try {
+      const result = await Promise.all([
+        this.#json<{ runtimeSnapshot: unknown }>(`${API_ROOT}/sessions/${encodeURIComponent(sessionId)}/runtime`),
+        // RuntimeSnapshot 是详情首屏事实；HistoryPage 是可选分页补充。fake owner
+        // 或旧 Desktop 暂时不能提供历史时，不得把已成功的 runtime 一并丢弃。
+        historyRequest,
+      ])
+      runtimeBody = result[0]
+      history = result[1]
+    } catch (error) {
+      const resolvedHistory = await historyRequest
+      if (error instanceof ConsoleApiError && !(error instanceof AuthRequiredError)) {
+        throw new RuntimeSnapshotUnavailableError(error, resolvedHistory)
+      }
+      throw error
+    }
     const runtime = mapRuntimeSnapshotJson(sessionId, runtimeBody.runtimeSnapshot)
     runtime.timeline = history.items
     if (history.nextCursor) runtime.historyNextCursor = history.nextCursor
@@ -784,10 +804,15 @@ export class RealConsoleTransport implements ConsoleTransport {
         if (payload.value.streamId) {
           const stream = this.#streamStates.get(payload.value.streamId)
           if (stream?.target.kind === 'session') {
+            this.#completeSubscription(payload.value.streamId)
+            const reason = stableErrorName(payload.value.errorCode)
+            // 初始详情快照不可得时，HTTP runtime/history 会给出可展示的
+            // 历史回退态；这不是序号缺口，不应触发重同步提示或重连循环。
+            if (reason === 'SESSION_NOT_FOUND' || reason === 'CODEX_UNAVAILABLE') return
             this.#listener?.({
               type: 'resync-required',
               sessionId: stream.target.sessionId,
-              reason: stableErrorName(payload.value.errorCode),
+              reason,
             })
           }
         }

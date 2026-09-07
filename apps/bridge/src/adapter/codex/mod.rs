@@ -157,7 +157,6 @@ struct SessionRuntime {
     mapper: SessionMapper,
     watchers: Vec<mpsc::Sender<DomainEvent>>,
     following: bool,
-    owner_client_id: Option<String>,
 }
 
 impl SessionRuntime {
@@ -167,7 +166,6 @@ impl SessionRuntime {
             key,
             watchers: Vec::new(),
             following: false,
-            owner_client_id: None,
         }
     }
 }
@@ -418,6 +416,9 @@ impl CodexAdapter {
         key: &SessionKey,
     ) -> Result<RuntimeSnapshot, AdapterError> {
         let runtime_key = key.native_session_id.clone();
+        // Catalog 会保留历史任务，但 Desktop 只为当前已打开的任务提供实时态。
+        // 先确认 owner，避免把“任务未打开”误报成等待快照超时。
+        self.ensure_owner(&runtime_key).await?;
         {
             let mut sessions = self.inner.sessions.lock();
             let runtime = sessions.entry(runtime_key.clone()).or_insert_with(|| {
@@ -460,6 +461,7 @@ impl CodexAdapter {
         &self,
         key: &SessionKey,
     ) -> Result<RuntimeSnapshot, AdapterError> {
+        let owner = self.ensure_owner(&key.native_session_id).await?;
         let ipc = self.inner.ipc.read().clone().ok_or_else(|| {
             AdapterError::stable(StableErrorCode::CodexUnavailable, "ipc offline")
         })?;
@@ -479,7 +481,7 @@ impl CodexAdapter {
                 host_id: LOCAL_HOST_ID.to_string(),
                 following: true,
             },
-            None,
+            Some(vec![owner]),
         )
         .await
         .map_err(AdapterError::from)?;
@@ -903,20 +905,12 @@ impl CodexAdapter {
         Ok(())
     }
 
-    /// owner 确认(§12:所有写操作先确认 owner)。
+    /// owner 确认(§12:所有写操作先确认 owner)。每次重新发现，避免任务关闭或
+    /// Desktop owner 切换后继续使用陈旧 client id。
     async fn ensure_owner(&self, conversation: &str) -> Result<String, AdapterError> {
         let ipc = self.inner.ipc.read().clone().ok_or_else(|| {
             AdapterError::stable(StableErrorCode::CodexUnavailable, "ipc offline")
         })?;
-        // 缓存的 owner 仍然有效 → 直接用。
-        {
-            let sessions = self.inner.sessions.lock();
-            if let Some(runtime) = sessions.get(conversation) {
-                if let Some(owner) = &runtime.owner_client_id {
-                    return Ok(owner.clone());
-                }
-            }
-        }
         let owner = ipc
             .discover_owner(LOCAL_HOST_ID, conversation)
             .await
@@ -927,14 +921,6 @@ impl CodexAdapter {
                     "session has no desktop owner (not open)",
                 )
             })?;
-        let mut sessions = self.inner.sessions.lock();
-        let runtime = sessions.entry(conversation.to_string()).or_insert_with(|| {
-            SessionRuntime::new(SessionKey::codex(
-                self.inner.device_id.clone(),
-                conversation.to_string(),
-            ))
-        });
-        runtime.owner_client_id = Some(owner.clone());
         Ok(owner)
     }
 
@@ -1346,19 +1332,11 @@ async fn try_attach(inner: &Inner) -> Result<(), IpcError> {
     );
     let capabilities = probe(&input);
 
-    // ---- 代次切换:旧 pump/旧连接/owner 缓存一并回收 ----
+    // ---- 代次切换:旧 pump/旧连接一并回收 ----
     // 旧 IpcClient drop 时 abort 其 reader/writer,旧事件通道随之关闭:
     // 旧连接的迟到消息无法进入新代次(同一原生事件只处理一次)。
     if let Some(old_pump) = inner.pump.lock().take() {
         old_pump.abort();
-    }
-    {
-        let mut sessions = inner.sessions.lock();
-        for runtime in sessions.values_mut() {
-            // 旧 client 上的 owner clientId 全部失效;写路径经 ensure_owner
-            // 重新发现 owner(§12:所有写操作先确认 owner)。
-            runtime.owner_client_id = None;
-        }
     }
     *inner.ipc.write() = Some(client.clone());
     // send_replace:无条件更新当前值(不依赖 receiver 存活)。

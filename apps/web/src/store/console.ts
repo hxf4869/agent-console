@@ -8,7 +8,12 @@ import {
 } from '@/lib/build-info'
 import { getOperationAvailability } from '@/transport/capabilities'
 import { FixtureConsoleTransport } from '@/transport/fixture-transport'
-import { AuthRequiredError, loginUrl, RealConsoleTransport } from '@/transport/real-transport'
+import {
+  AuthRequiredError,
+  loginUrl,
+  RealConsoleTransport,
+  RuntimeSnapshotUnavailableError,
+} from '@/transport/real-transport'
 import { reduceOutput, shouldHydrateFinalOutput } from '@/transport/output-reducer'
 import {
   isTerminalReceipt,
@@ -232,7 +237,22 @@ async function ensureRuntime(
     delete state.historyCursors[sessionId]
     return runtime
   }
-  const incoming = await transport.getRuntimeSnapshot(sessionId, { includeHistory })
+  let incoming: RuntimeSnapshot
+  try {
+    incoming = await transport.getRuntimeSnapshot(sessionId, { includeHistory })
+  } catch (error) {
+    if (!(includeHistory && summary && error instanceof RuntimeSnapshotUnavailableError)) {
+      throw error
+    }
+    const runtime = offlineRuntime(summary)
+    runtime.unavailable = { code: error.code, message: error.message }
+    runtime.timeline = error.history.items
+    if (error.history.nextCursor) runtime.historyNextCursor = error.history.nextCursor
+    state.runtimes[sessionId] = runtime
+    if (runtime.historyNextCursor) state.historyCursors[sessionId] = runtime.historyNextCursor
+    else delete state.historyCursors[sessionId]
+    return runtime
+  }
   const runtime = reconcileRuntimeSnapshot(state.runtimes[sessionId], incoming, includeHistory)
   state.runtimes[sessionId] = runtime
   if (includeHistory) {
@@ -799,6 +819,8 @@ export function reconcileRuntimeSnapshot(
       ? mergeTimeline(incoming.timeline, current.timeline)
       : mergeTimeline(current.timeline, incoming.timeline),
   }
+  // 只要本次已取得实时快照，就清除历史回退态；revision 相同也表示恢复成功。
+  delete runtime.unavailable
 
   if (historyAuthoritative) {
     if (incoming.historyNextCursor) runtime.historyNextCursor = incoming.historyNextCursor

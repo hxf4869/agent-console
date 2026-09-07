@@ -69,15 +69,16 @@ impl WriteMethodProbes {
     }
 }
 
-/// 0.153.1 真机逐操作写验证白名单(docs/CODEX-COMPATIBILITY.md §9:2026-09-04
-/// 专用测试会话真机逐操作验收)。`thread-follower-start-turn`、
-/// `thread-follower-steer-turn`(steer 需带 restoreMessage{cwd,context};§9.1)
+/// 0.153.1 / 0.153.4 真机逐操作写验证白名单
+/// (docs/CODEX-COMPATIBILITY.md §9/§10:专用测试会话真机逐操作验收)。
+/// `thread-follower-start-turn`、
+/// `thread-follower-steer-turn`(steer 需带 restoreMessage{cwd,context};§9/§10)
 /// 与 `thread-follower-interrupt-turn` 通过;审批、原生问题回答未自然出现,
-/// 保持 `NotProbed`(§9.1)。`thread-follower-update-thread-settings` 方法级
+/// 保持 `NotProbed`。`thread-follower-update-thread-settings` 方法级
 /// effort 已真机验证,但产品因 Desktop 不提供动态可选值列表而关闭设置写能力
 /// (方法级 VERIFIED 记录见 §9)。新建/rename/archive/unarchive/fork/后台
 /// 命令停止无 IPC 方法(§3 UNSUPPORTED),永不在白名单。
-const REAL_DESKTOP_VERIFIED_OPS_0_153_1: WriteMethodProbes = WriteMethodProbes {
+const REAL_DESKTOP_VERIFIED_CORE_OPS: WriteMethodProbes = WriteMethodProbes {
     start_turn: ProbeResult::Passed,
     steer_turn: ProbeResult::Passed,
     interrupt_turn: ProbeResult::Passed,
@@ -86,12 +87,12 @@ const REAL_DESKTOP_VERIFIED_OPS_0_153_1: WriteMethodProbes = WriteMethodProbes {
 };
 
 /// 逐版本写能力矩阵:与协议/只读兼容版本表(`ipc::discovery::VERIFIED_VERSIONS`)
-/// 相互独立。仅 0.153.1 有真机逐操作写验证证据;0.153.0-alpha.5 只读协议兼容
-/// (CompatibilityState 仍为 Verified),其余一切版本(含未知/未探测到)一律
+/// 相互独立。0.153.1 与 0.153.4 有真机逐操作写验证证据;0.153.0-alpha.5
+/// 只有只读协议兼容证据(CompatibilityState 仍为 Verified),其余版本一律
 /// 全 `NotProbed`(§5:不凭版本表命中开启写)。
 pub fn verified_write_probes(version_report: Option<&str>) -> WriteMethodProbes {
     match version_report.map(normalized_version) {
-        Some("0.153.1") => REAL_DESKTOP_VERIFIED_OPS_0_153_1,
+        Some("0.153.1") | Some("0.153.4") => REAL_DESKTOP_VERIFIED_CORE_OPS,
         _ => WriteMethodProbes::default(),
     }
 }
@@ -339,9 +340,14 @@ mod tests {
     }
 
     #[test]
-    fn verified_write_probes_0_153_1_matches_real_device_matrix() {
-        // 0.153.1:§9 真机逐操作验收;设置写能力产品侧关闭(§9)。
-        for version in ["0.153.1", "codex-cli 0.153.1"] {
+    fn verified_write_probes_real_versions_match_real_device_matrix() {
+        // 0.153.1/0.153.4:§9/§10 真机逐操作验收;设置写能力产品侧关闭。
+        for version in [
+            "0.153.1",
+            "codex-cli 0.153.1",
+            "0.153.4",
+            "codex-cli 0.153.4",
+        ] {
             let probes = verified_write_probes(Some(version));
             assert_eq!(probes.start_turn, ProbeResult::Passed);
             assert_eq!(probes.steer_turn, ProbeResult::Passed);

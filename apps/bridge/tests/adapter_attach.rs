@@ -264,6 +264,21 @@ async fn cold_start_attaches_when_owner_appears_later() {
     assert_eq!(caps.control_mode, bridge::domain::ControlMode::FullControl);
     assert!(caps.supports(Operation::StartTurn));
 
+    // Catalog 中存在但当前未在 Desktop 打开的任务应立即归类为
+    // SESSION_NOT_FOUND，不能等待首个快照后误报 CODEX_UNAVAILABLE。
+    let unopened = key("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    let unopened_err = tokio::time::timeout(
+        Duration::from_secs(1),
+        adapter.runtime_snapshot(&unopened),
+    )
+    .await
+    .expect("未打开任务的 owner discovery 应快速返回")
+    .unwrap_err();
+    assert_eq!(
+        unopened_err.code(),
+        bridge::domain::StableErrorCode::SessionNotFound
+    );
+
     // 权威快照先行:attach 后订阅/快照路径可用。
     let snapshot = adapter.runtime_snapshot(&key(CONV)).await.unwrap();
     assert_eq!(snapshot.current_turn, None, "初始 idle");

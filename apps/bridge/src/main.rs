@@ -1026,6 +1026,10 @@ mod tests {
         // 逐版本写能力矩阵:仅 §9 真机 VERIFIED 的操作注入 Passed(§9.2);
         // 设置写能力产品侧关闭(§9),保持 NotProbed。
         let probes = bridge::capabilities::verified_write_probes(Some("codex-cli 0.153.1"));
+        assert_eq!(
+            bridge::capabilities::verified_write_probes(Some("codex-cli 0.153.4")),
+            probes
+        );
         assert_eq!(probes.start_turn, ProbeResult::Passed);
         assert_eq!(probes.interrupt_turn, ProbeResult::Passed);
         assert_eq!(probes.steer_turn, ProbeResult::Passed);

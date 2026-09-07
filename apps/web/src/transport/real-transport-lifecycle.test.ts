@@ -9,12 +9,14 @@ import {
   OutputChannel,
   OutputReplaceSchema,
   PROTOCOL_VERSION,
+  ProtocolErrorSchema,
   RuntimeSnapshotSchema,
   ServerHelloSchema,
   SessionKeySchema,
   SessionSummaryBatchSchema,
   SessionSummarySchema,
   SubscribedSchema,
+  StableErrorCode,
   type Envelope,
 } from '@agent-console/protocol/source'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -282,6 +284,52 @@ afterEach(() => {
 })
 
 describe('real transport lifecycle (AC-06)', () => {
+  it('settles an unavailable detail subscription without resync toast or reconnect loop', async () => {
+    vi.useFakeTimers()
+    const events: ConsoleEvent[] = []
+    const { transport, socket, disconnect } = await startTransport(events)
+
+    transport.retainRuntime('session-1')
+    await transport.getRuntimeSnapshot('session-1')
+    await vi.advanceTimersByTimeAsync(0)
+    socket.push(
+      frame(
+        {
+          case: 'subscribed',
+          value: create(SubscribedSchema, {
+            streamId: SESSION_STREAM,
+            streamEpoch: 1n,
+            baseSequence: 1n,
+          }),
+        },
+        SESSION_STREAM,
+        0n,
+        1n,
+        socket.sessionSubscribeCorrelation(),
+      ),
+    )
+    socket.push(
+      frame(
+        {
+          case: 'protocolError',
+          value: create(ProtocolErrorSchema, {
+            errorCode: StableErrorCode.SESSION_NOT_FOUND,
+            message: 'session has no desktop owner (not open)',
+            streamId: SESSION_STREAM,
+          }),
+        },
+        SESSION_STREAM,
+        0n,
+      ),
+    )
+    await vi.advanceTimersByTimeAsync(15_500)
+
+    expect(events.filter((event) => event.type === 'resync-required')).toHaveLength(0)
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(socket.readyState).toBe(FakeWebSocket.OPEN)
+    disconnect()
+  })
+
   it('T21: releases browsed detail subscriptions; reconnect restores only the live list', async () => {
     vi.useFakeTimers()
     const events: ConsoleEvent[] = []

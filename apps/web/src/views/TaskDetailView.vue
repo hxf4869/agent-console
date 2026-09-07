@@ -50,6 +50,7 @@ const {
   notify,
 } = useConsoleStore()
 const loading = ref(true)
+const retrying = ref(false)
 const errorMessage = ref('')
 const mobileSection = ref<MobileSection>('activity')
 const mobileMedia = window.matchMedia('(max-width: 759px)')
@@ -64,6 +65,11 @@ const { sheetElement, sheetOpen, openSheet, closeSheet, onSheetKeydown } = useBo
 const sessionId = computed(() => String(route.params.sessionId))
 const session = computed(() => state.sessions.find((item) => item.id === sessionId.value))
 const runtime = computed<RuntimeSnapshot | undefined>(() => state.runtimes[sessionId.value])
+const runtimeUnavailableTitle = computed(() =>
+  runtime.value?.unavailable?.code === 'SESSION_NOT_FOUND'
+    ? '请先在 Mac 的 Codex Desktop 中打开此任务'
+    : '暂时无法读取实时运行状态',
+)
 const presence = computed(() => presenceFor(sessionId.value))
 const interruptAvailability = computed(() => availability(sessionId.value, 'INTERRUPT'))
 const activityItems = computed(() =>
@@ -126,6 +132,18 @@ async function answerCurrentAttention(optionId: string): Promise<void> {
   if (!selectedAttention.value) return
   await answerAttention(selectedAttention.value.id, optionId)
   await closeSheet()
+}
+
+async function retryRuntime(): Promise<void> {
+  if (retrying.value) return
+  retrying.value = true
+  try {
+    await ensureRuntime(sessionId.value, true)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '重新读取运行态失败。', 'danger')
+  } finally {
+    retrying.value = false
+  }
 }
 
 function openAttentionSheet(): void {
@@ -226,7 +244,25 @@ function onSaved(message: string): void {
     </header>
 
     <NoticeBanner
-      v-if="presence.connection !== 'ONLINE'"
+      v-if="runtime.unavailable"
+      class="connection-notice"
+      tone="warning"
+      :title="runtimeUnavailableTitle"
+    >
+      <span>任务历史已保留显示。请在 Desktop 中打开对应任务后重新读取。</span>
+      <UiButton
+        class="runtime-retry"
+        variant="secondary"
+        size="small"
+        :disabled="retrying"
+        @click="retryRuntime"
+      >
+        {{ retrying ? '读取中…' : '重新读取' }}
+      </UiButton>
+    </NoticeBanner>
+
+    <NoticeBanner
+      v-else-if="presence.connection !== 'ONLINE'"
       class="connection-notice"
       tone="danger"
       title="设备离线"
@@ -557,6 +593,11 @@ function onSaved(message: string): void {
 
 .connection-notice {
   margin: 10px 12px 0;
+}
+
+.runtime-retry {
+  margin-left: 10px;
+  vertical-align: middle;
 }
 
 .mobile-task-tabs {
