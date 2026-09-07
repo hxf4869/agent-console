@@ -32,9 +32,17 @@ pub struct E2ePostgres {
 impl E2ePostgres {
     /// 启动一次性 postgres:16-alpine 容器(随机宿主端口);Drop 时强制清理。
     pub async fn start() -> E2ePostgres {
-        // 防御性清理此前测试进程异常退出遗留的容器。
+        // 防御性清理此前测试进程异常退出遗留的容器。只清理同前缀且已退出
+        // 的容器:并发运行中的同前缀容器属于其他测试进程,不得误删。
         let _ = Command::new("docker")
-            .args(["ps", "-aq", "--filter", "name=e2e-no-ui-pg-"])
+            .args([
+                "ps",
+                "-aq",
+                "--filter",
+                "name=e2e-no-ui-pg-",
+                "--filter",
+                "status=exited",
+            ])
             .output()
             .map(|o| {
                 let ids = String::from_utf8_lossy(&o.stdout).to_string();

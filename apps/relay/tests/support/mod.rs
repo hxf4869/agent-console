@@ -38,23 +38,75 @@ pub struct Postgres {
     pub port: u16,
 }
 
+/// 清理此前测试进程遗留的本套件容器。共享 PG 挂在进程级 static 上,进程
+/// 退出不会触发 Drop,孤儿容器只能由下一次运行防御性回收;判定标准是
+/// 属主测试进程已消亡(容器已退出,或 owner 标签的宿主 PID 不存在),
+/// 并发运行中的其他测试进程容器绝不动。
+async fn cleanup_stale_pg_containers() {
+    let Ok(out) = Command::new("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            "name=relay-it-pg-",
+            "--filter",
+            "label=agent-console-it=1",
+        ])
+        .output()
+    else {
+        return;
+    };
+    let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let mut stale: Vec<String> = Vec::new();
+    for id in &ids {
+        // 早于标签机制创建的遗留容器没有属主信息:一律保守保留。
+        let Ok(inspect) = Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{.State.Status}}|{{index .Config.Labels \"agent-console-it-owner\"}}",
+                id,
+            ])
+            .output()
+        else {
+            continue;
+        };
+        let info = String::from_utf8_lossy(&inspect.stdout).trim().to_string();
+        let mut parts = info.splitn(2, '|');
+        let status = parts.next().unwrap_or("");
+        let owner = parts.next().unwrap_or("");
+        if status.is_empty() {
+            continue;
+        }
+        if status == "exited" {
+            stale.push(id.clone());
+            continue;
+        }
+        let Some(owner) = owner.trim().parse::<u32>().ok() else {
+            continue;
+        };
+        // 属主进程已消亡 → 孤儿。PID 复用时误判为存活只会保守保留。
+        match Command::new("ps").args(["-p", &owner.to_string()]).output() {
+            Ok(alive) if !alive.status.success() => stale.push(id.clone()),
+            _ => {}
+        }
+    }
+    if !stale.is_empty() {
+        let _ = Command::new("docker")
+            .args(["rm", "-f"])
+            .args(&stale)
+            .output();
+    }
+}
+
 impl Postgres {
     /// 启动一次性 postgres:17-alpine 容器(随机宿主端口);Drop 时强制清理。
     /// docker run 偶发瞬时失败(并发启动/端口竞争),最多重试 3 次。
     pub async fn start() -> Postgres {
-        // 防御性清理此前测试进程异常退出遗留的容器。
-        let _ = Command::new("docker")
-            .args(["ps", "-aq", "--filter", "name=relay-it-pg-"])
-            .output()
-            .map(|o| {
-                let ids = String::from_utf8_lossy(&o.stdout).to_string();
-                if !ids.trim().is_empty() {
-                    let _ = Command::new("docker")
-                        .args(["rm", "-f"])
-                        .args(ids.split_whitespace())
-                        .output();
-                }
-            });
+        cleanup_stale_pg_containers().await;
         let mut last_err = String::new();
         for _ in 0..3 {
             let name = format!("relay-it-pg-{}", uuid::Uuid::new_v4().simple());
@@ -66,6 +118,11 @@ impl Postgres {
                     "-d",
                     "--name",
                     &name,
+                    // 属主标签:并发测试进程的容器靠它区分,防御清理绝不动。
+                    "--label",
+                    "agent-console-it=1",
+                    "--label",
+                    &format!("agent-console-it-owner={}", std::process::id()),
                     "-e",
                     "POSTGRES_PASSWORD=test",
                     "-e",

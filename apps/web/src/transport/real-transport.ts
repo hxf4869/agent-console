@@ -98,6 +98,8 @@ const HANDSHAKE_TIMEOUT_MS = 10_000
 const TICKET_TIMEOUT_MS = 10_000
 // 回执等待超时后的一次性 receipt 查询超时。
 const RECEIPT_QUERY_TIMEOUT_MS = 5_000
+// 已发出订阅的 correlation 记录上限(FIFO;超时订阅的迟到响应仍需可关联)。
+const SENT_SUBSCRIBE_HISTORY = 64
 // 受控恢复(ResyncRequest)看门狗:在途恢复超时未完成才断开重连(§17.5)。
 const RESYNC_TIMEOUT_MS = 10_000
 // Browser WebSocket.close 只允许 1000 或 3000–4999；内部主动关闭使用私有码。
@@ -182,6 +184,17 @@ export class RealConsoleTransport implements ConsoleTransport {
   #sessionKeys = new Map<string, { deviceId: string; agentKind: number; nativeSessionId: string }>()
   #wantedSessions = new Set<string>()
   #streamStates = new Map<string, StreamState>()
+  /** 已收到 Subscribed 但目标尚未可确认的新流(streamId → Subscribed 锚点)。 */
+  #unboundStreams = new Map<string, { epoch: bigint; baseSequence: bigint }>()
+  /**
+   * 已发出 Subscribe 的 correlation_id → 目标(含已超时的订阅,按 FIFO 有界):
+   * Relay 在 Subscribed 上回显 correlation_id,客户端据此做请求级关联——
+   * 消息载荷类型只能区分列表/详情,无法确认具体任务,不得把未知响应猜成
+   * 当前等待中的目标(§17.2)。
+   */
+  #sentSubscribes = new Map<string, SubscriptionTarget>()
+  /** 列表流订阅意图:连接在线期间始终想要列表流(§17.4 迟到 Subscribed 关联用)。 */
+  #listWanted = false
   #pendingSubscription: SubscriptionTarget | undefined
   #pendingSubscriptionStream = ''
   #pendingSubscriptionDone: (() => void) | undefined
@@ -607,6 +620,7 @@ export class RealConsoleTransport implements ConsoleTransport {
     this.#emitLink({ state: 'ONLINE', stage: 'CONNECTED' })
     this.#lastHeartbeatAck = Date.now()
     this.#startHeartbeat()
+    this.#listWanted = true
     this.#queueSubscription({ kind: 'list' })
     for (const sessionId of this.#wantedSessions) this.#queueSubscription({ kind: 'session', sessionId })
     await this.#reconcilePendingReceipts()
@@ -639,28 +653,49 @@ export class RealConsoleTransport implements ConsoleTransport {
         // 合法窗口形态——快照帧开头时首帧 seq=base(#acceptSnapshot 无门控,
         // 直接生效),事件帧开头时首帧 seq=base+1(#sequencedStream 门控恰好
         // 放行),两种形态均自洽;不依赖新 TCP 连接(R2-AC01)。
-        const existing = this.#streamStates.get(payload.value.streamId)
+        const streamId = payload.value.streamId
+        const existing = this.#streamStates.get(streamId)
         if (existing) {
           existing.epoch = payload.value.streamEpoch
           existing.lastSequence = payload.value.baseSequence
           return
         }
-        // 仅新流才依赖待建立订阅信息;未知或无法关联的响应不绑定到
-        // 当前另一个会话。
-        const target = this.#pendingSubscription
-        if (!target) return
-        this.#pendingSubscriptionStream = payload.value.streamId
-        this.#streamStates.set(payload.value.streamId, {
-          target,
+        // 新流按请求级关联绑定(§17.2):Subscribed 回显的 correlation_id
+        // 指向确定的一次已发出订阅(含已超时的),目标是可确认的——消息
+        // 载荷类型只能区分列表/详情,无法确认具体任务,绝不能把未知响应
+        // 猜成当前等待中的另一个订阅。关联目标意图已消失(如会话已释放)
+        // 时忽略该响应,不抢占、不结束任何等待中的订阅。
+        const correlation = envelope.correlationId
+        const correlated = correlation ? this.#sentSubscribes.get(correlation) : undefined
+        if (correlated) {
+          this.#sentSubscribes.delete(correlation)
+          if (this.#targetStillWanted(correlated)) {
+            if (
+              this.#pendingSubscription &&
+              targetEqual(this.#pendingSubscription, correlated)
+            ) {
+              this.#pendingSubscriptionStream = streamId
+            }
+            this.#streamStates.set(streamId, {
+              target: correlated,
+              epoch: payload.value.streamEpoch,
+              lastSequence: payload.value.baseSequence,
+            })
+          }
+          return
+        }
+        // 未回显 correlation(旧服务端)时只记录锚点,延迟到首帧快照按载荷
+        // 类型识别;载荷只能确认列表意图,详情无法确认具体任务,不做猜测。
+        this.#unboundStreams.set(streamId, {
           epoch: payload.value.streamEpoch,
-          lastSequence: payload.value.baseSequence,
+          baseSequence: payload.value.baseSequence,
         })
         return
       }
       case 'sessionSummaryBatch': {
         const stream = payload.value.snapshot
-          ? this.#acceptSnapshot(envelope)
-          : this.#sequencedStream(envelope)
+          ? this.#acceptSnapshot(envelope, 'list')
+          : this.#sequencedStream(envelope, 'list')
         if (!stream) return
         const sessions = payload.value.summaries.map(mapSessionSummaryProto)
         try {
@@ -695,7 +730,10 @@ export class RealConsoleTransport implements ConsoleTransport {
         return
       }
       case 'eventBatch': {
-        const stream = this.#sequencedStream(envelope)
+        const stream = this.#sequencedStream(
+          envelope,
+          this.#eventBatchUnboundKind(payload.value.events),
+        )
         if (!stream) return
         try {
           if (stream.target.kind === 'list') {
@@ -946,21 +984,76 @@ export class RealConsoleTransport implements ConsoleTransport {
    * 快照接受校验(不提交水位):同 stream+epoch 才接受,成功快照重建坐标、
    * 解除该流的恢复在途标记;序号由调用方在应用成功后提交并 ACK,
    * 应用失败保留恢复状态走受控恢复(R2-AC01)。
+   * 未绑定流在此按首帧快照载荷识别(`unboundKind`,仅列表:summary 快照是
+   * 列表流专属载荷,§17.4);识别不出则该快照不应用,不猜测。
    */
-  #acceptSnapshot(envelope: Envelope): StreamState | undefined {
-    const stream = this.#streamStates.get(envelope.streamId)
+  #acceptSnapshot(
+    envelope: Envelope,
+    unboundKind?: 'list',
+  ): StreamState | undefined {
+    let stream = this.#streamStates.get(envelope.streamId)
+    if (!stream && unboundKind) {
+      stream = this.#identifyUnboundStream(envelope)
+    }
     if (!stream || stream.epoch !== envelope.streamEpoch) return undefined
     this.#clearResyncInFlight(envelope.streamId)
     return stream
+  }
+
+  /** 关联目标是否仍有效:会话需仍被需要且无既有同目标流;列表需意图存在且无既有列表流。 */
+  #targetStillWanted(target: SubscriptionTarget): boolean {
+    if (target.kind === 'list') {
+      return (
+        this.#listWanted &&
+        ![...this.#streamStates.values()].some((state) => state.target.kind === 'list')
+      )
+    }
+    return (
+      this.#wantedSessions.has(target.sessionId) &&
+      ![...this.#streamStates.values()].some((state) => targetEqual(state.target, target))
+    )
+  }
+
+  /**
+   * 未绑定流的载荷识别:仅列表可通过载荷确认——列表快照/摘要增量只可能
+   * 属于列表意图(连接期间持续存在且唯一,无跨任务串绑风险)。详情侧载荷
+   * (RuntimeSnapshot/领域事件)不含任务标识,无法确认属于哪个会话,不做
+   * 猜测;详情流必须经 Subscribed 的 correlation_id 关联(见 subscribed 分支)。
+   */
+  #identifyUnboundStream(envelope: Envelope): StreamState | undefined {
+    const unbound = this.#unboundStreams.get(envelope.streamId)
+    if (!unbound) return undefined
+    this.#unboundStreams.delete(envelope.streamId)
+    if (unbound.epoch !== envelope.streamEpoch) return undefined
+    if (!this.#targetStillWanted({ kind: 'list' })) return undefined
+    if (this.#pendingSubscription?.kind === 'list') {
+      this.#pendingSubscriptionStream = envelope.streamId
+    }
+    const state: StreamState = {
+      target: { kind: 'list' },
+      epoch: unbound.epoch,
+      lastSequence: unbound.baseSequence,
+    }
+    this.#streamStates.set(envelope.streamId, state)
+    return state
   }
 
   /**
    * 序号校验(不提交水位):同 stream+epoch 内只接受 lastSequence+1;
    * 重复幂等忽略;缺口对列表与详情都发起一次受控恢复(§17.5),
    * 同一流已有恢复在途时不重复发送。调用方在应用完成后自行提交水位并 ACK。
+   * 未绑定流在此按首帧内容识别(仅列表合同事件,`unboundKind`):识别锚定
+   * Subscribed 的 base,门控恰好只放行 base+1 的事件帧开头窗口(合法窗口
+   * 形态之一);识别不出则不应用,不猜测。
    */
-  #sequencedStream(envelope: Envelope): StreamState | undefined {
-    const stream = this.#streamStates.get(envelope.streamId)
+  #sequencedStream(
+    envelope: Envelope,
+    unboundKind?: 'list',
+  ): StreamState | undefined {
+    let stream = this.#streamStates.get(envelope.streamId)
+    if (!stream && unboundKind) {
+      stream = this.#identifyUnboundStream(envelope)
+    }
     if (!stream || stream.epoch !== envelope.streamEpoch) return undefined
     if (envelope.sequence <= stream.lastSequence) return undefined
     if (envelope.sequence !== stream.lastSequence + 1n) {
@@ -975,6 +1068,22 @@ export class RealConsoleTransport implements ConsoleTransport {
       return undefined
     }
     return stream
+  }
+
+  /**
+   * 未绑定流首帧 eventBatch 的内容类别(§17.4 列表订阅只含 SessionSummary):
+   * 全部为列表合同事件(摘要/设备状态)时按列表识别;出现任何详情侧领域
+   * 事件时无法确认具体任务(详情流必须经 correlation_id 关联),返回
+   * undefined 不识别;空批不识别。
+   */
+  #eventBatchUnboundKind(events: DomainEvent[]): 'list' | undefined {
+    if (events.length === 0) return undefined
+    const listOnly = events.every(
+      (domain) =>
+        domain.event.case === 'sessionSummaryChanged' ||
+        domain.event.case === 'devicePresenceChanged',
+    )
+    return listOnly ? 'list' : undefined
   }
 
   /** 发送受控恢复请求;在途去重 + 看门狗超时才断开重连。 */
@@ -1063,6 +1172,10 @@ export class RealConsoleTransport implements ConsoleTransport {
     if (!subscribe) return
     this.#pendingSubscription = target
     this.#pendingSubscriptionStream = ''
+    // correlation_id 请求级关联:Relay 在 Subscribed 上回显,用于把响应
+    // 关联到确定的订阅请求(超时后的迟到响应也能正确归属/正确忽略)。
+    const correlation = newMessageId()
+    this.#rememberSentSubscribe(correlation, target)
     await new Promise<void>((resolve) => {
       let completed = false
       const done = () => {
@@ -1076,8 +1189,18 @@ export class RealConsoleTransport implements ConsoleTransport {
       }
       const timer = window.setTimeout(done, SUBSCRIBE_TIMEOUT_MS)
       this.#pendingSubscriptionDone = done
-      this.#send(baseEnvelope({ case: 'subscribe', value: subscribe }))
+      this.#send(baseEnvelope({ case: 'subscribe', value: subscribe }, correlation))
     })
+  }
+
+  /** 记录已发出的订阅(FIFO 有界;含超时订阅,迟到响应仍可正确关联)。 */
+  #rememberSentSubscribe(correlation: string, target: SubscriptionTarget): void {
+    this.#sentSubscribes.set(correlation, target)
+    while (this.#sentSubscribes.size > SENT_SUBSCRIBE_HISTORY) {
+      const oldest = this.#sentSubscribes.keys().next().value
+      if (oldest === undefined) break
+      this.#sentSubscribes.delete(oldest)
+    }
   }
 
   #sessionSubscribe(sessionId: string) {
@@ -1147,6 +1270,7 @@ export class RealConsoleTransport implements ConsoleTransport {
     this.#resyncInFlight.clear()
     this.#socket = undefined
     this.#streamStates.clear()
+    this.#unboundStreams.clear()
     this.#pendingSubscriptionDone?.()
     this.#listener?.({ type: 'connection', state: 'OFFLINE' })
     if (this.#closed) return
@@ -1295,12 +1419,13 @@ export class RealConsoleTransport implements ConsoleTransport {
   }
 }
 
-function baseEnvelope(payload: Envelope['payload']): Envelope {
+function baseEnvelope(payload: Envelope['payload'], correlationId = ''): Envelope {
   // Envelope.agent_kind 是设备级元数据(路由不依赖它;会话级身份在
   // SessionKey.agent_kind,ZC-02),沿用主 Agent 值。
   return create(EnvelopeSchema, {
     protocolVersion: PROTOCOL_VERSION,
     messageId: newMessageId(),
+    ...(correlationId ? { correlationId } : {}),
     agentKind: AgentKind.CODEX_DESKTOP,
     payload,
   })
@@ -2102,13 +2227,16 @@ function commandTimelineItem(id: string, createdAt: string, value: Record<string
     cwdDisplay: '',
     status: status === 'UNKNOWN' ? 'RUNNING' : status,
     elapsed: duration ? `${Math.round(duration / 100) / 10}s` : '',
+    // 历史与状态条目不携带输出正文:输出保持"未取得"占位(LIVE_PREVIEW),
+    // 不能因命令结束就冒充权威最终;权威值由 outputCursors 补全或
+    // OutputFinal/OutputReplace 事件校正(§13 实时输出真实性合同)。
     output: {
       itemId: id,
       revision: 0,
       text: '',
       byteLength: 0,
-      isFinal: status !== 'RUNNING',
-      authority: status === 'RUNNING' ? 'LIVE_PREVIEW' : 'AUTHORITATIVE_FINAL',
+      isFinal: false,
+      authority: 'LIVE_PREVIEW',
       hasGap: false,
     },
   }

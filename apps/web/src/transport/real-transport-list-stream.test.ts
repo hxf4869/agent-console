@@ -36,10 +36,17 @@ function toFrame(envelope: Envelope): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
 }
 
-function frame(payload: Envelope['payload'], streamId: string, sequence: bigint, epoch = 1n): Envelope {
+function frame(
+  payload: Envelope['payload'],
+  streamId: string,
+  sequence: bigint,
+  epoch = 1n,
+  correlation = '',
+): Envelope {
   return create(EnvelopeSchema, {
     protocolVersion: PROTOCOL_VERSION,
     messageId: '00000000-0000-4000-8000-0000000000aa',
+    ...(correlation ? { correlationId: correlation } : {}),
     streamId,
     streamEpoch: epoch,
     sequence,
@@ -139,6 +146,21 @@ class FakeWebSocket extends EventTarget {
   sentPayloads(): Array<Envelope['payload']> {
     return this.sent.map((data) => decodeEnvelope(new Uint8Array(data)).payload)
   }
+  sentEnvelopes(): Envelope[] {
+    return this.sent.map((data) => decodeEnvelope(new Uint8Array(data)))
+  }
+
+  /** 第 n 个(默认最后)会话订阅的 correlation_id,供 Subscribed 回显。 */
+  sessionSubscribeCorrelation(index = -1): string {
+    const list = this.sentEnvelopes()
+      .filter(
+        (env) =>
+          env.payload.case === 'subscribe' && env.payload.value.target?.case === 'session',
+      )
+      .map((env) => env.correlationId)
+    return list.at(index) ?? ''
+  }
+
 
   payloadCount(caseName: string): number {
     return this.sentPayloads().filter((payload) => payload.case === caseName).length
@@ -406,6 +428,8 @@ describe('real transport list stream', () => {
         },
         SESSION_STREAM,
         0n,
+        1n,
+        socket.sessionSubscribeCorrelation(),
       ),
     )
     socket.push(
@@ -455,6 +479,81 @@ describe('real transport list stream', () => {
       .filter((payload) => payload.case === 'ack' && payload.value.streamId === SESSION_STREAM)
       .at(-1)
     expect(ack && payloadSequence(ack)).toBe(2n)
+    disconnect()
+  })
+
+  it('rebinds a late list Subscribed after the subscription wait timed out', async () => {
+    vi.useFakeTimers()
+    const events: ConsoleEvent[] = []
+    // 连接后不回 Subscribed:模拟浏览器先打开、Bridge 尚未配对上线,列表
+    // 订阅等待超时后关联信息被清空(问题:迟到快照无人认领)。
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input)
+        let body: unknown = { ticket: 'ticket-test' }
+        if (path.endsWith('/api/v1/auth/session')) body = { csrfToken: 'csrf-test' }
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }),
+    )
+    const transport = new RealConsoleTransport()
+    const connecting = transport.connect((event) => events.push(event))
+    await vi.advanceTimersByTimeAsync(0)
+    const disconnect = await connecting
+    await vi.advanceTimersByTimeAsync(0)
+    const socket = FakeWebSocket.instances.at(-1)!
+
+    // 订阅等待超时(15s)。
+    await vi.advanceTimersByTimeAsync(16_000)
+    expect(events.some((event) => event.type === 'sessions')).toBe(false)
+
+    // Bridge 随后配对上线:迟到的 Subscribed + 列表快照必须仍能建立流并应用。
+    socket.push(
+      frame(
+        {
+          case: 'subscribed',
+          value: create(SubscribedSchema, {
+            streamId: LIST_STREAM,
+            streamEpoch: 1n,
+            baseSequence: 1n,
+          }),
+        },
+        LIST_STREAM,
+        0n,
+      ),
+    )
+    socket.push(
+      frame(
+        {
+          case: 'sessionSummaryBatch',
+          value: create(SessionSummaryBatchSchema, {
+            snapshot: true,
+            summaries: [summaryProto('session-late', DEVICE_A, '迟到任务')],
+          }),
+        },
+        LIST_STREAM,
+        1n,
+      ),
+    )
+    await vi.advanceTimersByTimeAsync(0)
+
+    const snapshot = events.find(
+      (event) => event.type === 'sessions' && event.snapshot,
+    )
+    expect(snapshot).toMatchObject({
+      type: 'sessions',
+      snapshot: true,
+      sessions: [{ id: 'session-late', title: '迟到任务' }],
+    })
+    const ack = socket
+      .sentPayloads()
+      .filter((payload) => payload.case === 'ack' && payload.value.streamId === LIST_STREAM)
+      .at(-1)
+    expect(ack && payloadSequence(ack)).toBe(1n)
     disconnect()
   })
 })

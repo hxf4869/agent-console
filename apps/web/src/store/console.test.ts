@@ -185,6 +185,69 @@ describe('detail reconciliation', () => {
     })
   })
 
+  it('keeps received command output when a terminal status entry replaces the timeline item', () => {
+    const receivedOutput = {
+      itemId: 'item-1',
+      revision: 3,
+      text: 'line1\nline2\n',
+      byteLength: 14,
+      isFinal: true,
+      authority: 'AUTHORITATIVE_FINAL',
+      hasGap: false,
+    } as const
+    const current = {
+      sessionId: 'session-output',
+      runtimeRevision: 10,
+      phase: 'RUNNING',
+      timeline: [
+        {
+          id: 'item-1',
+          type: 'command',
+          createdAt: '2026-09-05T01:00:00Z',
+          command: 'echo',
+          cwdDisplay: '',
+          status: 'RUNNING',
+          elapsed: '',
+          output: { ...receivedOutput },
+        },
+      ],
+    } as RuntimeSnapshot
+    // 命令结束后刷新快照:历史条目重新映射,输出是未取得的空占位。
+    const incoming = {
+      ...current,
+      runtimeRevision: 11,
+      timeline: [
+        {
+          id: 'item-1',
+          type: 'command',
+          createdAt: '2026-09-05T01:00:00Z',
+          command: 'echo',
+          cwdDisplay: '',
+          status: 'COMPLETED',
+          elapsed: '2s',
+          output: {
+            itemId: 'item-1',
+            revision: 0,
+            text: '',
+            byteLength: 0,
+            isFinal: false,
+            authority: 'LIVE_PREVIEW',
+            hasGap: false,
+          },
+        },
+      ],
+    } as RuntimeSnapshot
+
+    const merged = reconcileRuntimeSnapshot(current, incoming, false)
+    const item = merged.timeline.find((entry) => entry.id === 'item-1')
+    expect(item).toMatchObject({
+      type: 'command',
+      status: 'COMPLETED',
+      elapsed: '2s',
+      output: receivedOutput,
+    })
+  })
+
   it('keeps interrupt reconciliation active until the authoritative turn is idle', () => {
     const context = { operation: 'INTERRUPT' as const, baselineRevision: 12 }
     expect(

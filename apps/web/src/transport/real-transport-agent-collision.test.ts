@@ -61,10 +61,17 @@ function toFrame(envelope: Envelope): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
 }
 
-function frame(payload: Envelope['payload'], streamId: string, sequence: bigint, epoch = 1n): Envelope {
+function frame(
+  payload: Envelope['payload'],
+  streamId: string,
+  sequence: bigint,
+  epoch = 1n,
+  correlation = '',
+): Envelope {
   return create(EnvelopeSchema, {
     protocolVersion: PROTOCOL_VERSION,
     messageId: '00000000-0000-4000-8000-0000000000aa',
+    ...(correlation ? { correlationId: correlation } : {}),
     streamId,
     streamEpoch: epoch,
     sequence,
@@ -124,6 +131,21 @@ class FakeWebSocket extends EventTarget {
   sentPayloads(): Array<Envelope['payload']> {
     return this.sent.map((data) => decodeEnvelope(new Uint8Array(data)).payload)
   }
+  sentEnvelopes(): Envelope[] {
+    return this.sent.map((data) => decodeEnvelope(new Uint8Array(data)))
+  }
+
+  /** 第 n 个(默认最后)会话订阅的 correlation_id,供 Subscribed 回显。 */
+  sessionSubscribeCorrelation(index = -1): string {
+    const list = this.sentEnvelopes()
+      .filter(
+        (env) =>
+          env.payload.case === 'subscribe' && env.payload.value.target?.case === 'session',
+      )
+      .map((env) => env.correlationId)
+    return list.at(index) ?? ''
+  }
+
 }
 
 async function startTransport(
@@ -260,6 +282,8 @@ describe('dual-agent collision on empty relay session uuid (ZC-02)', () => {
         },
         'st-z',
         0n,
+        1n,
+        socket.sessionSubscribeCorrelation(),
       ),
     )
     socket.push(

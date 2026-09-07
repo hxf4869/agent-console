@@ -1,4 +1,5 @@
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
+import { h } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { RuntimeSnapshot, SessionSummary } from '@/transport/types'
@@ -98,6 +99,44 @@ beforeEach(() => {
 })
 
 describe('queue composer closed loop (UX-03)', () => {
+  it('recomputes the submitted operation after an accepted queue update', async () => {
+    const { QueueComposer, useConsoleStore } = await loadFixtureModules()
+    const { FixtureConsoleTransport } = await import('@/transport/fixture-transport')
+    const store = useConsoleStore()
+    const id = 'session-queue-replace'
+    store.state.connection = 'ONLINE'
+    store.state.sessions.push(session(id, '2026-09-05T01:00:00Z'))
+    store.state.runtimes[id] = runtime(id)
+    const queued = { ...runtime(id, 'QUEUED'), runtimeRevision: 10 }
+    const snapshot = vi.spyOn(FixtureConsoleTransport.prototype, 'getRuntimeSnapshot')
+      .mockResolvedValueOnce({ ...runtime(id), runtimeRevision: 9 })
+      .mockResolvedValueOnce(queued)
+    const send = vi.spyOn(FixtureConsoleTransport.prototype, 'sendCommand')
+      .mockImplementation(async (request) => ({ requestId: request.requestId, status: 'ACCEPTED_BY_BRIDGE' }))
+    const wrapper = mount({
+      render: () => h(QueueComposer, {
+        sessionId: id,
+        queue: store.state.runtimes[id]!.queue,
+        phase: store.state.runtimes[id]!.phase,
+      }),
+    })
+    try {
+      await wrapper.get('textarea').setValue('original')
+      await wrapper.get('.queue-composer__footer .ui-button--primary').trigger('click')
+      await flushPromises()
+      expect(wrapper.text()).toContain('替换队列')
+      await wrapper.get('textarea').setValue('replacement')
+      await wrapper.get('.queue-composer__footer .ui-button--primary').trigger('click')
+      await flushPromises()
+      expect(send.mock.calls.map(([request]) => request.operation)).toEqual(['SET_QUEUE', 'REPLACE_QUEUE'])
+      expect(wrapper.get('textarea').element.value).toBe('')
+    } finally {
+      wrapper.unmount()
+      snapshot.mockRestore()
+      send.mockRestore()
+    }
+  })
+
   it('keeps per-session drafts isolated and preserved across session switches', async () => {
     const { wrapper } = await mountComposer('session-a', (store) => {
       store.state.sessions.push(session('session-a', '2026-09-05T01:00:00Z'), session('session-b', '2026-09-05T02:00:00Z'))
@@ -173,6 +212,29 @@ describe('queue composer closed loop (UX-03)', () => {
     expect(wrapper.get('textarea').element.value).toBe('重试前的草稿')
     expect(wrapper.text()).toContain('结果未知')
     expect(store.state.receipts).toHaveLength(1)
+  })
+
+  it('keeps an explicitly cleared draft empty instead of falling back to the queued text', async () => {
+    const { wrapper } = await mountComposer(
+      'session-queued',
+      (store) => {
+        store.state.sessions.push(session('session-queued', '2026-09-05T01:00:00Z'))
+        store.state.runtimes['session-queued'] = runtime('session-queued', 'QUEUED')
+      },
+      'QUEUED',
+    )
+    await wrapper.setProps({ queue: { status: 'QUEUED', text: '旧的队列正文' } })
+    await wrapper.vm.$nextTick()
+
+    // 尚未建立草稿时预填当前队列正文,便于整体替换。
+    expect(wrapper.get('textarea').element.value).toBe('旧的队列正文')
+
+    // 用户明确清空草稿:输入保持为空、提交禁用,不得回退旧正文提交旧指令。
+    await wrapper.get('textarea').setValue('')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.get('textarea').element.value).toBe('')
+    const desktopSubmit = wrapper.findAll('button').find((button) => button.text().includes('替换队列'))!
+    expect(desktopSubmit.attributes('disabled')).toBeDefined()
   })
 
   it('explains a paused queue as requiring manual confirmation', async () => {

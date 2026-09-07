@@ -31,10 +31,17 @@ function toFrame(envelope: Envelope): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
 }
 
-function frame(payload: Envelope['payload'], streamId: string, sequence: bigint, epoch = 1n): Envelope {
+function frame(
+  payload: Envelope['payload'],
+  streamId: string,
+  sequence: bigint,
+  epoch = 1n,
+  correlation = '',
+): Envelope {
   return create(EnvelopeSchema, {
     protocolVersion: PROTOCOL_VERSION,
     messageId: '00000000-0000-4000-8000-0000000000aa',
+    ...(correlation ? { correlationId: correlation } : {}),
     streamId,
     streamEpoch: epoch,
     sequence,
@@ -73,7 +80,7 @@ function turnLifecycleEvent(phase: ActiveTurnPhase): DomainEvent {
   })
 }
 
-function subscribed(streamId: string, epoch: bigint, base: bigint): Envelope {
+function subscribed(streamId: string, epoch: bigint, base: bigint, correlation = ''): Envelope {
   return frame(
     {
       case: 'subscribed',
@@ -85,6 +92,8 @@ function subscribed(streamId: string, epoch: bigint, base: bigint): Envelope {
     },
     streamId,
     0n,
+    1n,
+    correlation,
   )
 }
 
@@ -142,6 +151,21 @@ class FakeWebSocket extends EventTarget {
 
   sentPayloads(): Array<Envelope['payload']> {
     return this.sent.map((data) => decodeEnvelope(new Uint8Array(data)).payload)
+  }
+
+  sentEnvelopes(): Envelope[] {
+    return this.sent.map((data) => decodeEnvelope(new Uint8Array(data)))
+  }
+
+  /** 第 n 个(默认最后)会话订阅的 correlation_id,供 Subscribed 回显。 */
+  sessionSubscribeCorrelation(index = -1): string {
+    const list = this.sentEnvelopes()
+      .filter(
+        (env) =>
+          env.payload.case === 'subscribe' && env.payload.value.target?.case === 'session',
+      )
+      .map((env) => env.correlationId)
+    return list.at(index) ?? ''
   }
 
   payloadCount(caseName: string): number {
@@ -296,7 +320,7 @@ describe('real transport snapshot epoch recovery (R2-AC01)', () => {
 
     // 先到已知 list 流的重绑定响应(新 epoch),再到新详情流的订阅响应。
     socket.push(subscribed(LIST_STREAM, 2n, 5n))
-    socket.push(subscribed(SESSION_STREAM, 1n, 1n))
+    socket.push(subscribed(SESSION_STREAM, 1n, 1n, socket.sessionSubscribeCorrelation()))
     socket.push(
       frame(
         {
@@ -519,7 +543,7 @@ describe('real transport snapshot epoch recovery (R2-AC01)', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     // 新流 Subscribed(base=5) 后窗口以事件帧开头:首事件 seq=6。
-    socket.push(subscribed(SESSION_STREAM, 1n, 5n))
+    socket.push(subscribed(SESSION_STREAM, 1n, 5n, socket.sessionSubscribeCorrelation()))
     socket.push(
       frame(
         {
@@ -576,7 +600,7 @@ describe('real transport snapshot epoch recovery (R2-AC01)', () => {
     // 新详情订阅在途;窗口以快照帧开头:快照 seq=base。
     const runtimePromise = transport.getRuntimeSnapshot('session-1')
     await vi.advanceTimersByTimeAsync(0)
-    socket.push(subscribed(SESSION_STREAM, 1n, 5n))
+    socket.push(subscribed(SESSION_STREAM, 1n, 5n, socket.sessionSubscribeCorrelation()))
     socket.push(
       frame(
         {

@@ -61,21 +61,22 @@ fn docker_ok(args: &[&str], what: &str) {
     );
 }
 
-/// 启动前清理本套件残留容器/网络(测试进程异常退出的兜底)。
+/// 启动前清理本套件残留容器(测试进程异常退出的兜底)。只清理同前缀且
+/// 已退出的容器:并发运行中的同前缀容器/网络属于其他测试进程,不得误删
+/// (网络的防御清理因此整体移除,自有资源由各 Drop/teardown 清理)。
 pub fn cleanup_stale() {
-    let out = docker(&["ps", "-aq", "--filter", &format!("name={RES_PREFIX}-")]);
+    let out = docker(&[
+        "ps",
+        "-aq",
+        "--filter",
+        &format!("name={RES_PREFIX}-"),
+        "--filter",
+        "status=exited",
+    ]);
     if let Ok(ids) = String::from_utf8(out.stdout) {
         let ids: Vec<&str> = ids.split_whitespace().collect();
         if !ids.is_empty() {
             let _ = docker(&[&["rm", "-f"], ids.as_slice()].concat());
-        }
-    }
-    let out = docker(&["network", "ls", "--format", "{{.Name}}"]);
-    if let Ok(names) = String::from_utf8(out.stdout) {
-        for name in names.split_whitespace() {
-            if name.starts_with(RES_PREFIX) {
-                let _ = docker(&["network", "rm", name]);
-            }
         }
     }
 }

@@ -375,14 +375,23 @@ async fn detail_stream_snapshot_then_events_order() {
         ))
         .await;
 
-    // 顺序:Subscribed → 缓冲的 OutputAppend → RuntimeSnapshot。重放按
-    // Bridge 实际发送顺序(上游批 11 在快照水位之后,内容不被快照覆盖),
-    // 与活跃订阅者的应用顺序一致(R2-AC01:恢复者不得反向应用)。
+    // 顺序:Subscribed(base) → RuntimeSnapshot → 缓冲的 OutputAppend(§17.4
+    // 步骤 5:先发快照,再发 base_sequence 之后的事件——上游批 11 在快照
+    // 水位 10 之后,排在快照之后交付,快照内容不会反向覆盖事件)。
     let subd = browser.recv(Duration::from_secs(5)).await;
     let (subd_base, downstream_stream) = match subd.payload {
         Some(envelope::Payload::Subscribed(s)) => (s.base_sequence, s.stream_id),
         other => panic!("expected Subscribed, got {other:?}"),
     };
+    let snap = browser.recv(Duration::from_secs(5)).await;
+    assert!(matches!(
+        snap.payload,
+        Some(envelope::Payload::RuntimeSnapshot(_))
+    ));
+    assert_eq!(
+        snap.sequence, subd_base,
+        "快照 sequence 必须等于 base_sequence,占据已应用水位(§17.4 步骤 5)"
+    );
     let ev = browser.recv(Duration::from_secs(5)).await;
     match ev.payload {
         Some(envelope::Payload::EventBatch(b)) => {
@@ -392,22 +401,12 @@ async fn detail_stream_snapshot_then_events_order() {
                 Some(domain_event::Event::OutputAppend(_))
             ));
         }
-        other => panic!("expected buffered output append, got {other:?}"),
+        other => panic!("expected buffered output append after the snapshot, got {other:?}"),
     }
     assert_eq!(
         ev.sequence,
         subd_base + 1,
-        "first replayed frame follows the subscribed base"
-    );
-    let snap = browser.recv(Duration::from_secs(5)).await;
-    assert!(matches!(
-        snap.payload,
-        Some(envelope::Payload::RuntimeSnapshot(_))
-    ));
-    assert_eq!(
-        snap.sequence,
-        ev.sequence + 1,
-        "snapshot follows the buffered event with a contiguous sequence"
+        "snapshot 之后的缓冲事件紧邻快照序号"
     );
 
     // 单会话 resync 不重放已经合并过的旧窗口，而是重新向 Bridge 取
@@ -472,6 +471,59 @@ async fn detail_stream_snapshot_then_events_order() {
     assert_eq!(after_resync.sequence, refreshed_snapshot.sequence + 1);
 }
 
+/// round3 契约:Relay 必须在下游 Subscribed 上回显浏览器 Subscribe 的
+/// correlation_id(§17.2 请求级关联)——浏览器据此把响应关联到确定的订阅
+/// 请求(含已超时的迟到响应),载荷类型无法确认具体任务,不允许猜测。
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribed_echoes_browser_subscribe_correlation() {
+    let (env, _d) = basic_env().await;
+    let device_id = uuid::Uuid::new_v4();
+    let (credential, digest) = test_credential();
+    insert_device(&env.pool, device_id, &digest).await;
+    let mut bridge = FakeBridge::connect(&env.relay, &device_id.to_string(), &credential)
+        .await
+        .expect("bridge");
+    let ticket = env.toolbox.issue_ticket(chrono::Duration::seconds(30));
+    let mut browser = connect_browser(&env.relay, &ticket).await.expect("browser");
+
+    let mut subscribe = subscribe_session(&device_id.to_string(), "native-corr");
+    subscribe.correlation_id = "corr-round3-target-a".to_string();
+    browser.send(&subscribe).await;
+
+    let sub = bridge.recv(Duration::from_secs(5)).await;
+    let upstream_id = match sub.payload {
+        Some(envelope::Payload::Subscribe(s)) => {
+            assert!(matches!(
+                s.target,
+                Some(agent_console_protocol::v1::subscribe::Target::Session(_))
+            ));
+            sub.stream_id.clone()
+        }
+        other => panic!("expected upstream Subscribe, got {other:?}"),
+    };
+    bridge.send_subscribed(&upstream_id, 1, 1).await;
+    bridge
+        .send(&FakeBridge::runtime_snapshot_env(
+            &device_id.to_string(),
+            "native-corr",
+            &upstream_id,
+            1,
+        ))
+        .await;
+
+    let subd = browser.recv(Duration::from_secs(5)).await;
+    match subd.payload {
+        Some(envelope::Payload::Subscribed(s)) => {
+            assert_eq!(
+                subd.correlation_id, "corr-round3-target-a",
+                "Subscribed 必须回显发起订阅的 correlation_id"
+            );
+            assert!(!s.stream_id.is_empty());
+        }
+        other => panic!("expected Subscribed, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_consumer_gets_resync_and_disconnect_upstream_unblocked() {
     let (env, _d) = basic_env().await;
@@ -501,6 +553,32 @@ async fn slow_consumer_gets_resync_and_disconnect_upstream_unblocked() {
     // 消化 Subscribed + snapshot。
     let _ = browser.recv(Duration::from_secs(5)).await;
     let _ = browser.recv(Duration::from_secs(5)).await;
+
+    // 先确认业务帧实际转发，再施压。Outbox 关闭会丢弃尚未发送的帧，
+    // 因此洪泛阶段收到多少业务帧取决于调度，不能用它证明转发成功。
+    bridge
+        .send(&FakeBridge::output_append_env(
+            &device_id.to_string(),
+            &upstream,
+            "before-flood",
+            0,
+            16,
+            1,
+        ))
+        .await;
+    let forwarded = browser.recv(Duration::from_secs(5)).await;
+    assert!(
+        matches!(
+            forwarded.payload,
+            Some(envelope::Payload::EventBatch(ref batch))
+                if matches!(batch.events.as_slice(), [event]
+                    if matches!(&event.event,
+                        Some(domain_event::Event::OutputAppend(output))
+                            if output.item_id.as_ref().is_some_and(|id| id.id == "before-flood")
+                                && output.bytes == vec![b'x'; 16]))
+        ),
+        "browser must receive the business frame before flooding"
+    );
 
     // 受控慢 sink:接管浏览器 socket,持续但低速(每帧 5ms)读取,连接
     // 保持可写。背压确定性作用在应用 Outbox(帧上限 2048)上,不再依赖
@@ -544,7 +622,7 @@ async fn slow_consumer_gets_resync_and_disconnect_upstream_unblocked() {
             .await;
     }
 
-    // 期望帧序:…洪泛业务帧… → ResyncRequired → Close(稳定 reason)。
+    // 期望帧序:零到多帧洪泛业务帧 → ResyncRequired → Close(稳定 reason)。
     // 连接可写,ResyncRequired 必须实际送达;跳过业务帧并计数。
     let mut saw_resync = false;
     let mut business_frames = 0usize;
@@ -572,10 +650,6 @@ async fn slow_consumer_gets_resync_and_disconnect_upstream_unblocked() {
     eprintln!(
         "SLOW SINK: business_frames={business_frames} saw_resync={saw_resync} close=({}, {})",
         close.0, close.1
-    );
-    assert!(
-        business_frames > 0,
-        "slow sink must receive forwarded stream frames before close"
     );
     assert!(saw_resync, "ResyncRequired must precede disconnect");
     assert_eq!(close.1, "RESYNC_REQUIRED", "stable close reason");
@@ -844,7 +918,12 @@ async fn list_snapshot_for_device_a_does_not_cover_or_renumber_device_b_events()
     // WebSocket 消息流。间隔 25ms,总预算 5s,超时带当前注册状态 panic。
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let resp = http_get(&env.relay, "/agent-console/api/devices", &identity_headers()).await;
+        let resp = http_get(
+            &env.relay,
+            "/agent-console/api/devices",
+            &identity_headers(),
+        )
+        .await;
         assert_eq!(resp.status(), 200, "devices endpoint must be reachable");
         let body: serde_json::Value = resp.json().await.expect("devices json");
         let registered = |id: uuid::Uuid| {
@@ -902,16 +981,22 @@ async fn list_snapshot_for_device_a_does_not_cover_or_renumber_device_b_events()
         ))
         .await;
     let subd1 = recv_env(&mut browser1.ws, Duration::from_secs(5)).await;
-    assert!(matches!(subd1.payload, Some(envelope::Payload::Subscribed(_))));
-    let mut tracker1 = SeqTracker::from_base(
-        match subd1.payload {
-            Some(envelope::Payload::Subscribed(s)) => s.base_sequence,
-            _ => unreachable!(),
-        },
-    );
+    assert!(matches!(
+        subd1.payload,
+        Some(envelope::Payload::Subscribed(_))
+    ));
+    let mut tracker1 = SeqTracker::from_base(match subd1.payload {
+        Some(envelope::Payload::Subscribed(s)) => s.base_sequence,
+        _ => unreachable!(),
+    });
 
     // 依次推进业务帧;presence 帧由 tracker 按连续序号消化(不跳过校验)。
-    async fn next_summary(tracker: &mut SeqTracker, ws: &mut Ws, title: &str, snapshot: bool) -> Envelope {
+    async fn next_summary(
+        tracker: &mut SeqTracker,
+        ws: &mut Ws,
+        title: &str,
+        snapshot: bool,
+    ) -> Envelope {
         loop {
             let e = tracker.recv(ws).await;
             // 快照帧 = SessionSummaryBatch(snapshot=true);增量 = EventBatch
@@ -921,12 +1006,12 @@ async fn list_snapshot_for_device_a_does_not_cover_or_renumber_device_b_events()
                 Some(envelope::Payload::SessionSummaryBatch(b)) if snapshot => {
                     b.summaries[0].title == title
                 }
-                Some(envelope::Payload::EventBatch(b)) if !snapshot => b.events.iter().any(
-                    |ev| matches!(
+                Some(envelope::Payload::EventBatch(b)) if !snapshot => b.events.iter().any(|ev| {
+                    matches!(
                         ev.event.as_ref(),
                         Some(domain_event::Event::SessionSummaryChanged(s)) if s.title == title
-                    ),
-                ),
+                    )
+                }),
                 _ => false,
             };
             if hit {

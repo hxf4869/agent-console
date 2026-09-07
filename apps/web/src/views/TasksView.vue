@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Bell, ChevronRight, GitBranch, LoaderCircle, Pin } from 'lucide-vue-next'
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
 import StatusBadge from '@/components/StatusBadge.vue'
@@ -19,8 +19,22 @@ const sessions = computed(() =>
     )
   }),
 )
+/** 搜索尚未覆盖全部页:此时"没有匹配"会是误导性结论,继续静默取下一页。 */
+const searchingMore = computed(() => Boolean(query.value) && Boolean(state.sessionsCursor))
 const runningCount = computed(() => state.sessions.filter((session) => session.phase === 'RUNNING').length)
 const attentionCount = computed(() => state.sessions.reduce((total, session) => total + session.attentionCount, 0))
+
+// 搜索只过滤已加载数据,未加载页可能仍有匹配:搜索期间按游标链式加载
+// 剩余页(每次状态变化拉一页,loading 守卫防止并发重入),直到游标耗尽。
+watch(
+  () => [query.value, state.sessionsCursor] as const,
+  ([currentQuery]) => {
+    if (currentQuery && state.sessionsCursor && !state.sessionsLoading) {
+      void loadMoreSessions().catch(() => undefined)
+    }
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
@@ -75,10 +89,13 @@ const attentionCount = computed(() => state.sessions.reduce((total, session) => 
         </RouterLink>
       </div>
 
-      <div v-if="!sessions.length" class="tasks-empty">没有匹配的任务。</div>
+      <div v-if="!sessions.length && searchingMore" class="tasks-empty">
+        正在搜索更多任务…
+      </div>
+      <div v-else-if="!sessions.length" class="tasks-empty">没有匹配的任务。</div>
 
       <UiButton
-        v-if="state.sessionsCursor && !query"
+        v-if="state.sessionsCursor"
         class="load-more"
         variant="secondary"
         :disabled="state.sessionsLoading"

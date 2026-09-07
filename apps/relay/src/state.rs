@@ -50,6 +50,10 @@ pub mod limits {
     pub const BROWSER_QUEUE_MAX_FRAMES: usize = 2_048;
     /// 每 Bridge 出站队列上限(帧数)。
     pub const BRIDGE_QUEUE_MAX_FRAMES: usize = 1_024;
+    /// 每上游快照在途暂存事件条数上限(§17.4 步骤 4:快照生成期间的新事件
+    /// 只入暂存不定序;条数与 `BUFFER_MAX_BYTES` 字节双上限,压力下只挤出
+    /// 非第 1 类事件,关键事件绝不静默丢弃,见 `DStream::push_pending`)。
+    pub const SNAPSHOT_PENDING_MAX_EVENTS: usize = 1_024;
 
     /// Browser WS auth session introspection 周期(§20.5:至少每 60 秒)。
     pub const INTROSPECT_INTERVAL: Duration = Duration::from_secs(60);

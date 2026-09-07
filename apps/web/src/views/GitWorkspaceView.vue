@@ -14,6 +14,7 @@ import { useRoute } from 'vue-router'
 
 import NoticeBanner from '@/components/NoticeBanner.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
+import { parsePatch, countPatchChanges, type PatchRow } from '@/lib/git-diff'
 import { useConsoleStore } from '@/store/console'
 import type { FileMetadata, GitFileDiff, GitSummary } from '@/transport/types'
 
@@ -23,7 +24,7 @@ interface ChangedFile {
   additions: number
   deletions: number
   language: string
-  diff: Array<{ kind: 'context' | 'add' | 'remove'; oldLine?: number; newLine?: number; text: string }>
+  diff: PatchRow[]
   preview: string[]
 }
 
@@ -35,6 +36,7 @@ const fixtureFiles: ChangedFile[] = [
     deletions: 0,
     language: 'Vue',
     diff: [
+      { kind: 'hunk', text: '@@ -0,0 +1,10 @@' },
       { kind: 'context', oldLine: 0, newLine: 1, text: '<script setup lang="ts">' },
       { kind: 'add', newLine: 2, text: "import { computed, ref, watch } from 'vue'" },
       { kind: 'add', newLine: 3, text: "import { useRoute } from 'vue-router'" },
@@ -67,6 +69,7 @@ const fixtureFiles: ChangedFile[] = [
     deletions: 5,
     language: 'TypeScript',
     diff: [
+      { kind: 'hunk', text: '@@ -8,4 +8,10 @@' },
       { kind: 'context', oldLine: 8, newLine: 8, text: 'if (event.itemId !== state.itemId) return state' },
       { kind: 'context', oldLine: 9, newLine: 9, text: '' },
       { kind: 'remove', oldLine: 10, text: "if (event.type === 'append') return append(state, event.text)" },
@@ -99,6 +102,7 @@ const fixtureFiles: ChangedFile[] = [
     deletions: 0,
     language: 'CSS',
     diff: [
+      { kind: 'hunk', text: '@@ -0,0 +1,8 @@' },
       { kind: 'context', oldLine: 0, newLine: 1, text: ':root,' },
       { kind: 'add', newLine: 2, text: ":root[data-theme='dark'] {" },
       { kind: 'add', newLine: 3, text: '  color-scheme: dark;' },
@@ -142,6 +146,8 @@ const errorMessage = ref('')
 const selectedPath = ref('')
 const uploaded = ref<FileMetadata>()
 const uploadedHandle = ref('')
+/** 本次上传声明的原始文件名(展示优先于 Bridge 内部存储名)。 */
+const uploadedName = ref('')
 const transferMessage = ref('')
 const uploadedPreview = ref<string[]>([])
 const previewObjectUrl = ref('')
@@ -149,23 +155,41 @@ const files = computed<ChangedFile[]>(() => {
   if (state.fixtureMode) return fixtureFiles
   return (summary.value?.entries ?? []).map((entry) => {
     const diff = diffs.value[entry.relativePath]
+    const rows = parsePatch(diff?.patchText ?? '')
+    const { additions, deletions } = countPatchChanges(rows)
     return {
       path: entry.relativePath,
       status: /added|untracked/i.test(entry.status) ? 'A' : 'M',
-      additions: 0,
-      deletions: 0,
+      additions,
+      deletions,
       language: languageFor(entry.relativePath),
-      diff: parsePatch(diff?.patchText ?? ''),
+      diff: rows,
       preview: (diff?.patchText ?? '').split('\n'),
     }
   })
+})
+/** 预览正文属于上传文件时(而非当前 Git 变更),标题与类型同样取上传文件。 */
+const previewingUpload = computed(
+  () => Boolean(uploaded.value) && (uploadedPreview.value.length > 0 || Boolean(previewObjectUrl.value)),
+)
+const uploadedDisplayName = computed(() => uploadedName.value || uploaded.value?.displayName || '')
+const previewTitle = computed(() =>
+  previewingUpload.value ? uploadedDisplayName.value : selectedFile.value?.path ?? '',
+)
+const previewKindLabel = computed(() => {
+  if (!previewingUpload.value) return selectedFile.value?.language ?? ''
+  const kind = uploaded.value!.previewKind
+  if (kind === 'image') return '图片'
+  if (kind === 'pdf') return 'PDF'
+  if (kind === 'text') return '文本'
+  return '文件'
 })
 const selectedFile = computed(() =>
   files.value.find((file) => file.path === selectedPath.value) ?? files.value[0],
 )
 const mode = ref<'diff' | 'preview'>('diff')
-const additions = computed(() => summary.value?.insertions ?? fixtureFiles.reduce((sum, file) => sum + file.additions, 0))
-const deletions = computed(() => summary.value?.deletions ?? fixtureFiles.reduce((sum, file) => sum + file.deletions, 0))
+const additions = computed(() => summary.value?.insertions ?? (state.fixtureMode ? fixtureFiles.reduce((sum, file) => sum + file.additions, 0) : 0))
+const deletions = computed(() => summary.value?.deletions ?? (state.fixtureMode ? fixtureFiles.reduce((sum, file) => sum + file.deletions, 0) : 0))
 
 watch(
   sessionId,
@@ -207,6 +231,9 @@ async function onUpload(event: Event): Promise<void> {
   try {
     const result = await uploadFile(sessionId.value, file)
     if (!result.uploadFileHandle) throw new Error('Bridge 未返回 upload handle。')
+    // 上传声明的原始文件名:预览/下载的展示名以它为准(metadata 的
+    // displayName 是 Bridge 内部存储名,如 "payload",不面向用户)。
+    uploadedName.value = file.name
     uploadedHandle.value = result.uploadFileHandle
     uploaded.value = await getFileMetadata(sessionId.value, result.uploadFileHandle)
     uploadedHandle.value = uploaded.value.fileHandle
@@ -222,7 +249,7 @@ async function onUpload(event: Event): Promise<void> {
 
 async function previewUploaded(): Promise<void> {
   if (!uploaded.value || !uploadedHandle.value) return
-  const response = await previewFile(sessionId.value, uploadedHandle.value, uploaded.value.displayName)
+  const response = await previewFile(sessionId.value, uploadedHandle.value, uploadedDisplayName.value)
   const blob = await response.blob()
   if (previewObjectUrl.value) URL.revokeObjectURL(previewObjectUrl.value)
   if (uploaded.value.previewKind === 'text') {
@@ -237,11 +264,11 @@ async function previewUploaded(): Promise<void> {
 
 async function downloadUploaded(): Promise<void> {
   if (!uploaded.value || !uploadedHandle.value) return
-  const response = await downloadFile(sessionId.value, uploadedHandle.value, uploaded.value.displayName)
+  const response = await downloadFile(sessionId.value, uploadedHandle.value, uploadedDisplayName.value)
   const url = URL.createObjectURL(await response.blob())
   const anchor = document.createElement('a')
   anchor.href = url
-  anchor.download = uploaded.value.displayName
+  anchor.download = uploadedDisplayName.value
   anchor.click()
   URL.revokeObjectURL(url)
 }
@@ -252,36 +279,6 @@ onBeforeUnmount(() => {
 
 function languageFor(path: string): string {
   return path.split('.').at(-1)?.toUpperCase() ?? 'TEXT'
-}
-
-function parsePatch(patch: string): ChangedFile['diff'] {
-  let oldLine = 0
-  let newLine = 0
-  return patch
-    .split('\n')
-    .filter(
-      (line) =>
-        !line.startsWith('diff --git') &&
-        !line.startsWith('index ') &&
-        !line.startsWith('---') &&
-        !line.startsWith('+++'),
-    )
-    .map((line) => {
-      if (line.startsWith('@@')) {
-        const match = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)/)
-        oldLine = Number(match?.[1] ?? 0)
-        newLine = Number(match?.[2] ?? 0)
-        return { kind: 'context' as const, text: line }
-      }
-      if (line.startsWith('+')) return { kind: 'add' as const, newLine: newLine++, text: line.slice(1) }
-      if (line.startsWith('-')) return { kind: 'remove' as const, oldLine: oldLine++, text: line.slice(1) }
-      return {
-        kind: 'context' as const,
-        oldLine: oldLine++,
-        newLine: newLine++,
-        text: line.startsWith(' ') ? line.slice(1) : line,
-      }
-    })
 }
 </script>
 
@@ -319,7 +316,7 @@ function parsePatch(patch: string): ChangedFile['diff'] {
       </button>
       <label class="file-upload-action">
         <span>{{ transferMessage || '上传到当前会话' }}</span>
-        <input type="file" :disabled="presence.connection !== 'ONLINE'" @change="onUpload" />
+        <input type="file" :disabled="state.connection !== 'ONLINE' || presence.connection !== 'ONLINE'" @change="onUpload" />
       </label>
       <button v-if="uploaded" type="button" @click="previewUploaded">预览上传</button>
       <button v-if="uploaded" type="button" @click="downloadUploaded">下载上传</button>
@@ -347,17 +344,16 @@ function parsePatch(patch: string): ChangedFile['diff'] {
         </button>
       </aside>
 
-      <section v-if="selectedFile" class="code-pane" aria-label="文件内容">
+      <section v-if="selectedFile || previewingUpload" class="code-pane" aria-label="文件内容">
         <header>
           <div>
             <Braces :size="15" aria-hidden="true" />
-            <strong>{{ selectedFile.path }}</strong>
+            <strong>{{ mode === 'preview' ? previewTitle : selectedFile?.path }}</strong>
           </div>
-          <span>{{ selectedFile.language }}</span>
+          <span>{{ mode === 'preview' ? previewKindLabel : selectedFile?.language }}</span>
         </header>
 
-        <div v-if="mode === 'diff'" class="diff-view" role="region" aria-label="统一 Diff" tabindex="0">
-          <div class="diff-hunk">@@ -8,4 +8,{{ selectedFile.diff.length }} @@</div>
+        <div v-if="mode === 'diff' && selectedFile" class="diff-view" role="region" aria-label="统一 Diff" tabindex="0">
           <code>
             <span v-for="(line, index) in selectedFile.diff" :key="index" :class="`diff-line diff-line--${line.kind}`">
               <b>{{ line.oldLine ?? '' }}</b><b>{{ line.newLine ?? '' }}</b><i>{{ line.kind === 'add' ? '+' : line.kind === 'remove' ? '−' : ' ' }}</i><em>{{ line.text || ' ' }}</em>
@@ -369,7 +365,7 @@ function parsePatch(patch: string): ChangedFile['diff'] {
           <img
             v-if="previewObjectUrl && uploaded?.previewKind === 'image'"
             :src="previewObjectUrl"
-            :alt="uploaded.displayName"
+            :alt="uploadedDisplayName"
           />
           <iframe
             v-else-if="previewObjectUrl && uploaded?.previewKind === 'pdf'"
@@ -379,7 +375,7 @@ function parsePatch(patch: string): ChangedFile['diff'] {
           />
           <code>
             <span
-              v-for="(line, index) in uploadedPreview.length ? uploadedPreview : selectedFile.preview"
+              v-for="(line, index) in uploadedPreview.length ? uploadedPreview : selectedFile?.preview ?? []"
               :key="index"
             ><b>{{ index + 1 }}</b><em>{{ line || ' ' }}</em></span>
           </code>
@@ -684,9 +680,7 @@ function parsePatch(patch: string): ChangedFile['diff'] {
   border: 0;
 }
 
-.diff-hunk {
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--border-subtle);
+.diff-line--hunk {
   background: color-mix(in srgb, var(--accent), transparent 90%);
   color: var(--accent);
 }
@@ -834,6 +828,14 @@ function parsePatch(patch: string): ChangedFile['diff'] {
   }
 
   .git-toolbar button {
+    min-height: 44px;
+  }
+
+  .git-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .file-upload-action {
     min-height: 44px;
   }
 

@@ -11,9 +11,10 @@ import type { ActiveTurnPhase, QueueState } from '@/transport/types'
 const props = defineProps<{ sessionId: string; queue: QueueState; phase: ActiveTurnPhase }>()
 const { availability, sendCommand, getDraft, setDraft, verifyRequest, state } = useConsoleStore()
 
-/** 草稿按 (device, agentKind, nativeSession) 存于 store(UX-03):切会话不串、状态更新不清空。 */
+/** 草稿按 (device, agentKind, nativeSession) 存于 store(UX-03):切会话不串、状态更新不清空。
+ * 仅在尚未建立草稿时预填当前队列正文;用户明确清空('')保持为空,提交随之禁用。 */
 const draft = computed<string>({
-  get: () => getDraft(props.sessionId) || props.queue.text || '',
+  get: () => getDraft(props.sessionId) ?? props.queue.text ?? '',
   set: (value) => setDraft(props.sessionId, value),
 })
 const sendMode = ref<'queue' | 'steer'>('queue')

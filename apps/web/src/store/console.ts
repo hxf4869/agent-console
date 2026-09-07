@@ -29,6 +29,7 @@ import type {
   FileMetadata,
   GitFileDiff,
   GitSummary,
+  OutputState,
   PairingChallenge,
   ReceiptStatus,
   RelayLinkState,
@@ -239,7 +240,8 @@ async function ensureRuntime(
     else delete state.historyCursors[sessionId]
     prepareDeferredOutputs(runtime)
   }
-  return runtime
+  // 后续回执会修改此运行态；返回 store 中的代理，确保队列等计算属性同步更新。
+  return state.runtimes[sessionId]!
 }
 
 /** 详情视图进入:计数持有该会话订阅。 */
@@ -548,6 +550,12 @@ function handleEvent(event: ConsoleEvent): void {
   }
   if (event.type === 'sessions') {
     mergeSessions(event.sessions, event.snapshot)
+    // 列表快照到达证明至少一台 Bridge 已上线;设备列表仍为空时(首次
+    // 配对后 presence 帧可能被 Relay 的首快照守卫跳过)顺带补拉一次,
+    // 设备无需手动刷新即可出现。
+    if (event.snapshot && event.sessions.length > 0 && !state.devices.length) {
+      void loadDevices().catch(() => undefined)
+    }
     return
   }
   if (event.type === 'receipt') {
@@ -572,6 +580,10 @@ function handleEvent(event: ConsoleEvent): void {
       if (event.lastSeenAt) device.lastSeenAt = event.lastSeenAt
       if (event.degradedReason) device.degradedReason = event.degradedReason
       else delete device.degradedReason
+    } else if (event.connection === 'ONLINE') {
+      // 尚未进入本地设备列表的设备出现上线 presence(首次配对后 Bridge
+      // 上线):拉一次列表让设备自动出现,不依赖手动刷新页面。
+      void loadDevices().catch(() => undefined)
     }
     return
   }
@@ -804,12 +816,37 @@ function isUuid(value: string): boolean {
 
 function mergeTimeline(current: TimelineItem[], incoming: TimelineItem[]): TimelineItem[] {
   const byId = new Map(current.map((item) => [item.id, item]))
-  for (const item of incoming) byId.set(item.id, item)
+  for (const item of incoming) {
+    const existing = byId.get(item.id)
+    byId.set(item.id, existing ? mergeTimelineItem(existing, item) : item)
+  }
   return [...byId.values()].sort((left, right) => {
     const leftTime = Date.parse(left.createdAt) || 0
     const rightTime = Date.parse(right.createdAt) || 0
     return leftTime - rightTime
   })
+}
+
+/**
+ * 同 id 条目合并:状态/时长等展示字段以较新一方为准;命令输出例外——
+ * 历史/状态条目不携带输出正文,若较新条目是空占位而已有条目已收到
+ * 实时输出或权威校正,保留已有输出,避免轮次结束的状态更新清空输出。
+ */
+function mergeTimelineItem(current: TimelineItem, incoming: TimelineItem): TimelineItem {
+  if (
+    (current.type === 'command' || current.type === 'outcome-unknown') &&
+    incoming.type === current.type &&
+    current.output.itemId === incoming.output.itemId &&
+    isPlaceholderOutput(incoming.output)
+  ) {
+    return { ...incoming, output: current.output }
+  }
+  return incoming
+}
+
+/** 空占位输出:无文本、零字节、未定稿且无补全状态(见 commandTimelineItem)。 */
+function isPlaceholderOutput(output: OutputState): boolean {
+  return !output.text && output.byteLength === 0 && !output.isFinal && !output.loadState
 }
 
 function reduceTimelineOutput(item: TimelineItem, event: Parameters<typeof reduceOutput>[1]): TimelineItem {
@@ -1154,8 +1191,10 @@ function draftKey(sessionId: string): string {
   )
 }
 
-function getDraft(sessionId: string): string {
-  return state.drafts[draftKey(sessionId)] ?? ''
+/** 未建立草稿返回 undefined;返回 '' 表示用户明确清空(不能回退到旧队列正文)。 */
+function getDraft(sessionId: string): string | undefined {
+  const key = draftKey(sessionId)
+  return key in state.drafts ? state.drafts[key] : undefined
 }
 
 function setDraft(sessionId: string, text: string): void {

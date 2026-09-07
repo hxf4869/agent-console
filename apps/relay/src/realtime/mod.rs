@@ -64,6 +64,10 @@ struct SubscriberState {
     /// 尚未收到首个 snapshot:事件只入缓冲,不发往订阅者(§17.4 步骤 4/5)。
     awaiting_snapshot: bool,
     acked: u64,
+    /// 该订阅者最近一次进入 awaiting 所对应 Subscribe 的 correlation_id:
+    /// 快照 flush 时回显到 Subscribed,浏览器据此做请求级关联(§17.2),
+    /// 不把未知响应猜成某个等待中的目标。
+    subscribe_correlation: String,
 }
 
 struct UpstreamBinding {
@@ -77,6 +81,19 @@ struct UpstreamBinding {
     snapshot_received: bool,
 }
 
+/// 流尚无任何快照期间暂存的上游事件批(§17.4 步骤 4):不分配下游序号、
+/// 不扇出;首个快照定序后按上游批号依序 flush,保证重放/实时顺序都是
+/// 快照先于其后事件。多设备列表流同理按"流级首快照"判定。
+struct PendingUpstreamBatch {
+    /// 来源上游流 id(flush 时按其 binding 的 covers 过滤)。
+    upstream_id: String,
+    /// 上游批级 sequence;0 表示上游未提供。
+    upstream_seq: u64,
+    sent_at: Option<prost_types::Timestamp>,
+    device_id: String,
+    events: Vec<domain_event::Event>,
+}
+
 struct DStream {
     #[allow(dead_code)] // 调试/未来路由使用;当前 stream_id 即唯一标识。
     key: DKey,
@@ -85,6 +102,13 @@ struct DStream {
     next_seq: u64,
     /// 各上游设备最新缓存的 snapshot 帧(会话流 1 条;列表流每设备一条)。
     snapshots: VecDeque<Arc<Frame>>,
+    /// 流尚无快照期间暂存的上游事件批(§17.4 步骤 4;事件数/字节双上限,
+    /// 压力下只挤出非第 1 类,见 `push_pending`)。
+    pending_batches: VecDeque<PendingUpstreamBatch>,
+    /// 暂存事件的序列化字节与条数(事件 encoded_len 之和;计入单流预算与
+    /// 全局内存统计,§17.6)。
+    pending_bytes: usize,
+    pending_events: usize,
     buffer: StreamBuffer,
     subscribers: HashMap<uuid::Uuid, SubscriberState>,
     /// 上游绑定:upstream_stream_id → binding。
@@ -103,6 +127,9 @@ impl DStream {
             epoch: 1,
             next_seq: 1,
             snapshots: VecDeque::new(),
+            pending_batches: VecDeque::new(),
+            pending_bytes: 0,
+            pending_events: 0,
             buffer: StreamBuffer::new(
                 limits::BUFFER_MAX_EVENTS,
                 limits::BUFFER_MAX_BYTES,
@@ -111,6 +138,61 @@ impl DStream {
             subscribers: HashMap::new(),
             upstreams: HashMap::new(),
         }
+    }
+
+    /// 暂存一批"流尚无快照期间"到达的上游事件(§17.4 步骤 4)。字节计入
+    /// 单流缓冲预算(`BUFFER_MAX_BYTES`),条数计入 `SNAPSHOT_PENDING_MAX_EVENTS`,
+    /// 两者都计入全局内存统计。压力策略比 StreamBuffer 更保守:暂存窗口没有
+    /// 序号缺口检测可以触发恢复,快照水位又固定在订阅时——水位之后第 1 类
+    /// (问题/审批/生命周期)与第 2 类(最终回复等 item 内容,需触发恢复才能
+    /// 经历史重读)都丢了就无任何自动路径补回。因此只允许挤出第 3 类可合并
+    /// 事件(高频输出增量,LIVE_PREVIEW 最佳努力,§13.1);仅剩第 1/第 2 类
+    /// 仍超限时返回 true,由调用方复用显式恢复流程(向订阅者发 ResyncRequired
+    /// 并强制重取快照),不得丢事件后继续宣称同步正常。被挤空的批次立即
+    /// 整体移除,空壳不残留、不占内存。
+    fn push_pending(&mut self, batch: PendingUpstreamBatch) -> bool {
+        self.pending_events += batch.events.len();
+        self.pending_bytes += batch.events.iter().map(|e| e.encoded_len()).sum::<usize>();
+        self.pending_batches.push_back(batch);
+        while self.pending_events > limits::SNAPSHOT_PENDING_MAX_EVENTS
+            || self.pending_bytes > limits::BUFFER_MAX_BYTES
+        {
+            let mut evicted_bytes = 0usize;
+            let mut evicted_batch: Option<usize> = None;
+            let mut evicted = false;
+            'drop: for (index, batch) in self.pending_batches.iter_mut().enumerate() {
+                let Some(pos) = batch
+                    .events
+                    .iter()
+                    .position(|e| classify(e).0 == FrameKind::Mergeable)
+                else {
+                    continue;
+                };
+                let event = batch.events.remove(pos);
+                evicted_bytes = event.encoded_len();
+                if batch.events.is_empty() {
+                    evicted_batch = Some(index);
+                }
+                evicted = true;
+                break 'drop;
+            }
+            if !evicted {
+                return true;
+            }
+            self.pending_events -= 1;
+            self.pending_bytes = self.pending_bytes.saturating_sub(evicted_bytes);
+            if let Some(index) = evicted_batch {
+                self.pending_batches.remove(index);
+            }
+        }
+        false
+    }
+
+    /// 清空暂存并归零计数(快照 flush/epoch 变化/内存压力等重置路径共用)。
+    fn clear_pending(&mut self) {
+        self.pending_batches.clear();
+        self.pending_bytes = 0;
+        self.pending_events = 0;
     }
 
     /// 缓存该设备的最新快照(替换同设备旧快照;列表聚合按设备维护,一台设备
@@ -199,10 +281,13 @@ impl DStream {
         (base, frames)
     }
 
-    /// 该流的全部上游绑定重取快照(已有 fresh snapshot 在途的绑定不重复订阅,
-    /// 避免 epoch 抖动);清空缓存并让订阅者回到 awaiting 状态。
-    fn refresh_snapshot_envs(&mut self) -> Vec<(uuid::Uuid, Envelope)> {
+    /// 该流的全部上游绑定重取快照;清空缓存并让订阅者回到 awaiting 状态。
+    /// `force=false`:已有 fresh snapshot 在途的绑定不重复订阅,避免 epoch 抖动。
+    /// `force=true`:暂存压力恢复用——在途快照的水位固定在订阅时,无法覆盖
+    /// 已超出暂存预算的关键事件,必须重订阅取得更高水位的新快照。
+    fn refresh_snapshot_envs(&mut self, force: bool) -> Vec<(uuid::Uuid, Envelope)> {
         self.snapshots.clear();
+        self.clear_pending();
         self.buffer.clear();
         for subscriber in self.subscribers.values_mut() {
             subscriber.awaiting_snapshot = true;
@@ -211,7 +296,7 @@ impl DStream {
         self.upstreams
             .values_mut()
             .filter_map(|binding| {
-                if !binding.snapshot_received {
+                if !force && !binding.snapshot_received {
                     // 同一流已有 fresh snapshot 在途:只等待,不再发 Subscribe。
                     return None;
                 }
@@ -331,15 +416,24 @@ fn resync_required_env(stream_id: &str) -> Envelope {
     )
 }
 
-fn subscribed_env(stream_id: &str, epoch: u64, base_sequence: u64) -> Envelope {
-    base_envelope(
+fn subscribed_env(
+    stream_id: &str,
+    epoch: u64,
+    base_sequence: u64,
+    correlation: &str,
+) -> Envelope {
+    let mut env = base_envelope(
         "",
         envelope::Payload::Subscribed(Subscribed {
             stream_id: stream_id.to_string(),
             stream_epoch: epoch,
             base_sequence,
         }),
-    )
+    );
+    // 回显发起订阅的 correlation_id:浏览器用它把响应关联到确定的订阅
+    // 请求,消息载荷类型只能区分列表/详情,无法确认具体任务。
+    env.correlation_id = correlation.to_string();
+    env
 }
 
 /// 慢 consumer / 快照回放入队失败的统一收尾(§17.6):尽力送达 ResyncRequired、
@@ -705,11 +799,14 @@ impl Hub {
     }
 
     /// Browser Subscribe 入口(needs_binding:需要建立上游绑定的设备)。
+    /// `correlation`:本次 Subscribe 信封的 correlation_id,flush/重放的
+    /// Subscribed 依此回显(§17.2 请求级关联)。
     pub fn browser_subscribe(
         &self,
         conn_id: uuid::Uuid,
         key: DKey,
         needs_binding: Vec<(uuid::Uuid, TargetTag)>,
+        correlation: String,
     ) {
         let refresh_session = matches!(key.1, TargetTag::Session { .. });
         let mut g1 = self.inner.lock().unwrap();
@@ -757,6 +854,7 @@ impl Hub {
                         binding.snapshot_received = false;
                     }
                     ds.snapshots.clear();
+                    ds.clear_pending();
                     ds.buffer.clear();
                     for subscriber in ds.subscribers.values_mut() {
                         subscriber.awaiting_snapshot = true;
@@ -791,8 +889,11 @@ impl Hub {
                 let sub = ds.subscribers.entry(conn_id).or_insert(SubscriberState {
                     awaiting_snapshot: !has_snapshot,
                     acked: 0,
+                    subscribe_correlation: correlation.clone(),
                 });
                 sub.awaiting_snapshot = !has_snapshot;
+                // 记录本次订阅的 correlation:flush 到达的 Subscribed 依此回显。
+                sub.subscribe_correlation = correlation.clone();
             }
             browser_streams.entry(conn_id).or_default().insert(key.clone());
 
@@ -805,7 +906,8 @@ impl Hub {
                     None => ds.anchored_replay(),
                 };
                 let (epoch, stream_id) = (ds.epoch, ds.stream_id.clone());
-                let subscribed = encode_direct(&subscribed_env(&stream_id, epoch, base));
+                let subscribed =
+                    encode_direct(&subscribed_env(&stream_id, epoch, base, &correlation));
                 let mut ok = outbox.push_direct(subscribed);
                 if ok {
                     for frame in &frames {
@@ -849,7 +951,7 @@ impl Hub {
     /// 窗口,空洞时锚定最新快照),不为单个订阅者改写坐标;单会话详情始终
     /// 向 Bridge 重取完整 RuntimeSnapshot,避免合并窗口的序号空洞反复触发
     /// resync。回放入队失败复用重同步/断开收尾。
-    pub fn browser_resync(&self, conn_id: uuid::Uuid, stream_id: &str) {
+    pub fn browser_resync(&self, conn_id: uuid::Uuid, stream_id: &str, correlation: &str) {
         let mut g = self.inner.lock().unwrap();
         let Some(key) = g
             .streams
@@ -876,7 +978,7 @@ impl Hub {
             if matches!(key.1, TargetTag::Session { .. }) || ds.snapshots.is_empty() {
                 // 详情流:权威快照重取(全部订阅者回到 awaiting)。
                 // 列表流尚无快照(如内存压力清理后)同样重取上游权威快照。
-                ds.refresh_snapshot_envs()
+                ds.refresh_snapshot_envs(false)
             } else {
                 // 列表流恢复:优先完整存活窗口;空洞时锚定最新快照。序号即
                 // 全局序号,不为单个订阅者改写坐标;全部入队成功才宣告恢复
@@ -889,7 +991,10 @@ impl Hub {
                 let Some(outbox) = browsers.get(&conn_id).map(|b| b.outbox.clone()) else {
                     return;
                 };
-                let subscribed = encode_direct(&subscribed_env(&stream_id, epoch, base));
+                // resync 是订阅者对已知流的恢复,Subscribed 走已知流重绑路径;
+                // 仍回显 ResyncRequest 的 correlation 保持请求级关联语义。
+                let subscribed =
+                    encode_direct(&subscribed_env(&stream_id, epoch, base, correlation));
                 let mut ok = outbox.push_direct(subscribed);
                 if ok {
                     for frame in &frames {
@@ -1000,6 +1105,7 @@ impl Hub {
             };
             ds.epoch += 1;
             ds.snapshots.clear();
+            ds.clear_pending();
             ds.buffer.clear();
             let stream_id = ds.stream_id.clone();
             let conn_ids: Vec<uuid::Uuid> = ds.subscribers.keys().cloned().collect();
@@ -1042,9 +1148,9 @@ impl Hub {
     /// 占用下一个全局序号(即活跃订阅者的下一期待帧),活跃坐标不被扰动;
     /// 恢复订阅者按存活帧重放(完整窗口,空洞时锚定最新快照),与活跃订阅
     /// 者交付同一序号含义。
-    fn handle_upstream_snapshot(g: &mut HubInner, upstream_id: &str, env: &Envelope) {
+    fn handle_upstream_snapshot(g: &mut HubInner, upstream_id: &str, env: &Envelope) -> Vec<crate::push::PushTrigger> {
         let Some(key) = g.upstream_index.get(upstream_id).cloned() else {
-            return;
+            return Vec::new();
         };
         let HubInner {
             streams,
@@ -1053,14 +1159,20 @@ impl Hub {
             ..
         } = &mut *g;
         let Some(ds) = streams.get_mut(&key) else {
-            return;
+            return Vec::new();
         };
         let Some(binding) = ds.upstreams.get_mut(upstream_id) else {
-            return;
+            return Vec::new();
         };
         binding.snapshot_received = true;
         let covered = binding.snapshot_covers;
         let device = env.device_id.clone();
+        // 暂存批按来源上游的 covers 过滤:本快照设备的批号 ≤ covers 已被
+        // 覆盖,其他设备的暂存批按各自 binding 的水位判定。计数随 take 归零,
+        // flush 重新入下游缓冲时按帧正常计量。
+        let pending = std::mem::take(&mut ds.pending_batches);
+        ds.pending_bytes = 0;
+        ds.pending_events = 0;
         ds.buffer.retain_uncovered(&device, covered);
         // 下游 snapshot 帧:占用下一个全局序号,按设备替换缓存快照。
         let seq = ds.next_seq;
@@ -1087,7 +1199,15 @@ impl Hub {
             };
             match awaiting {
                 Some(true) => {
-                    let subscribed = encode_direct(&subscribed_env(&stream_id, epoch, base));
+                    // 逐订阅者回显其 Subscribe 的 correlation_id(§17.2):
+                    // 浏览器据此做请求级关联,不把响应猜成别的等待中目标。
+                    let correlation = ds
+                        .subscribers
+                        .get(&conn_id)
+                        .map(|s| s.subscribe_correlation.clone())
+                        .unwrap_or_default();
+                    let subscribed =
+                        encode_direct(&subscribed_env(&stream_id, epoch, base, &correlation));
                     let mut ok = outbox.push_direct(subscribed);
                     if ok {
                         for f in &replay_frames {
@@ -1119,6 +1239,35 @@ impl Hub {
         for conn_id in to_detach {
             detach_failed_subscriber(streams, browsers, browser_streams, &key, conn_id);
         }
+        drop((streams, browsers, browser_streams));
+
+        // §17.4 步骤 5:快照已定序并交付后,流尚无快照期间暂存的上游事件
+        // 按到达顺序依序进入下游——每批按其来源上游 binding 的 covers 过滤
+        // (批号 ≤ covers 的已被对应快照覆盖,直接丢弃),保证订阅者看到的
+        // 顺序是快照 → 其后事件;push 触发照常收集(§24)。
+        let mut triggers = Vec::new();
+        for batch in pending {
+            let batch_covered = g
+                .streams
+                .get(&key)
+                .and_then(|ds| ds.upstreams.get(&batch.upstream_id))
+                .map(|binding| binding.snapshot_covers)
+                .unwrap_or(0);
+            if batch.upstream_seq != 0 && batch.upstream_seq <= batch_covered {
+                continue;
+            }
+            let mut batch_env = base_envelope(
+                &batch.device_id,
+                envelope::Payload::EventBatch(EventBatch {
+                    stream_id: String::new(),
+                    events: Vec::new(),
+                }),
+            );
+            batch_env.sequence = batch.upstream_seq;
+            batch_env.sent_at = batch.sent_at;
+            triggers.extend(Self::fan_out_events(g, &batch.upstream_id, &batch_env, batch.events));
+        }
+        triggers
     }
 
     /// 上游事件 → 下游逐事件帧(重编号、缓冲、扇出、慢 consumer 处理)。
@@ -1135,21 +1284,68 @@ impl Hub {
             return push_triggers;
         };
         {
-            let Some(ds) = g.streams.get_mut(&key) else {
+            let HubInner {
+                streams, browsers, bridges, ..
+            } = &mut *g;
+            let Some(ds) = streams.get_mut(&key) else {
                 return push_triggers;
             };
-            let binding = ds.upstreams.get_mut(upstream_id).unwrap();
-            if env.sequence != 0 {
-                if env.sequence <= binding.last_seq {
+            let should_stash = {
+                let Some(binding) = ds.upstreams.get_mut(upstream_id) else {
+                    return push_triggers;
+                };
+                // 上游批级 sequence(批级去重;0 表示未提供,跳过去重)。水位只在
+                // 事件真正进入下游时推进;暂存批不推进,由 flush 时同一检查兜底。
+                if env.sequence != 0 && env.sequence <= binding.last_seq {
                     tracing::debug!(target: "relay::realtime", "duplicate upstream batch sequence ignored");
                     return push_triggers;
                 }
-                binding.last_seq = env.sequence;
+                !binding.snapshot_received && ds.snapshots.is_empty()
+            };
+            if events.is_empty() {
+                return push_triggers;
             }
-        }
-
-        if events.is_empty() {
-            return push_triggers;
+            if should_stash {
+                // §17.4 步骤 4:流尚无任何快照(首订阅握手)期间,新事件只入
+                // 暂存,不分配下游序号、不扇出——否则事件会落在首快照之前,
+                // 违反"先发快照,再发 base_sequence 之后的事件"的握手顺序。
+                // 首个快照到达后定序快照帧、再依序 flush(见
+                // handle_upstream_snapshot)。流已有快照后(如多设备列表流的
+                // 其他设备)事件按到达定序扇出,跨设备窗口由锚定重放维持。
+                if ds.push_pending(PendingUpstreamBatch {
+                    upstream_id: upstream_id.to_string(),
+                    upstream_seq: env.sequence,
+                    sent_at: env.sent_at,
+                    device_id: env.device_id.clone(),
+                    events,
+                }) {
+                    // §17.6:暂存仅剩第 1 类仍超限,不能丢关键事件后继续宣称
+                    // 同步——复用显式恢复流程:向订阅者发 ResyncRequired,清空并
+                    // 强制重取快照(在途快照水位固定在订阅时,覆盖不了这些
+                    // 事件)。重订阅 env 必须在本分支内发出:分支结尾统一 return,
+                    // events 已移动,锁外无法再访问。
+                    let stream_id = ds.stream_id.clone();
+                    for conn_id in ds.subscribers.keys().cloned().collect::<Vec<_>>() {
+                        if let Some(bc) = browsers.get(&conn_id) {
+                            bc.outbox
+                                .push_direct(encode_direct(&resync_required_env(&stream_id)));
+                        }
+                    }
+                    let refresh = ds.refresh_snapshot_envs(true);
+                    for (device, env) in refresh {
+                        if let Some(conn) = bridges.get(&device) {
+                            let _ = conn.sink.try_send(encode_direct(&env));
+                        }
+                    }
+                    tracing::debug!(target: "relay::realtime", "pending overflow forced snapshot refresh");
+                }
+                return push_triggers;
+            }
+            if let Some(binding) = ds.upstreams.get_mut(upstream_id) {
+                if env.sequence != 0 {
+                    binding.last_seq = env.sequence;
+                }
+            }
         }
 
         // push 触发映射(§24):turn 终态 / 等待问题 / 等待审批。
@@ -1428,13 +1624,15 @@ impl Hub {
         let mut total: u64 = 0;
         let mut worst: Option<(DKey, usize)> = None;
         for (key, ds) in g.streams.iter() {
-            total += ds.buffer.bytes as u64;
+            // 暂存(快照在途事件)计入全局内存统计与单流压力排名(§17.6)。
+            total += ds.buffer.bytes as u64 + ds.pending_bytes as u64;
+            let charged = ds.buffer.bytes + ds.pending_bytes;
             if worst
                 .as_ref()
-                .map(|(_, b)| ds.buffer.bytes > *b)
+                .map(|(_, b)| charged > *b)
                 .unwrap_or(true)
             {
-                worst = Some((key.clone(), ds.buffer.bytes));
+                worst = Some((key.clone(), charged));
             }
         }
         let mut queued = 0u64;
@@ -1455,6 +1653,7 @@ impl Hub {
         if total > limits::GLOBAL_BUFFER_MAX_BYTES as u64 {
             if let Some((key, _)) = worst {
                 if let Some(ds) = g.streams.get_mut(&key) {
+                    ds.clear_pending();
                     ds.buffer.clear();
                     ds.snapshots.clear();
                     let stream_id = ds.stream_id.clone();
@@ -1491,8 +1690,11 @@ impl Hub {
                 Self::handle_upstream_subscribed(&mut g, &upstream_id, &env, sub);
             }
             Some(P::RuntimeSnapshot(_)) => {
-                let mut g = self.inner.lock().unwrap();
-                Self::handle_upstream_snapshot(&mut g, &upstream_id, &env);
+                let triggers = {
+                    let mut g = self.inner.lock().unwrap();
+                    Self::handle_upstream_snapshot(&mut g, &upstream_id, &env)
+                };
+                crate::push::notify(app, &triggers).await;
             }
             Some(P::SessionSummaryBatch(batch)) => {
                 // 先落库(不持锁;摘要持久化,§11),再扇出。
@@ -1504,8 +1706,7 @@ impl Hub {
                 let triggers = {
                     let mut g = self.inner.lock().unwrap();
                     if batch.snapshot {
-                        Self::handle_upstream_snapshot(&mut g, &upstream_id, &env);
-                        Vec::new()
+                        Self::handle_upstream_snapshot(&mut g, &upstream_id, &env)
                     } else {
                         let events: Vec<domain_event::Event> = batch
                             .summaries
@@ -1718,7 +1919,8 @@ impl Hub {
         use envelope::Payload as P;
         match env.payload.as_ref() {
             Some(P::Subscribe(subscribe)) => {
-                self.on_browser_subscribe(app, conn_id, subscribe).await;
+                self.on_browser_subscribe(app, conn_id, subscribe, &env.correlation_id)
+                    .await;
             }
             Some(P::Unsubscribe(unsub)) => {
                 self.browser_unsubscribe(conn_id, &unsub.stream_id);
@@ -1727,7 +1929,7 @@ impl Hub {
                 self.browser_ack(conn_id, &ack.stream_id, ack.sequence);
             }
             Some(P::ResyncRequest(ResyncRequest { stream_id })) => {
-                self.browser_resync(conn_id, stream_id);
+                self.browser_resync(conn_id, stream_id, &env.correlation_id);
             }
             Some(P::CommandRequest(request)) => {
                 self.on_browser_command(app, conn_id, request).await;
@@ -1758,6 +1960,7 @@ impl Hub {
         app: &AppState,
         conn_id: uuid::Uuid,
         subscribe: &Subscribe,
+        correlation: &str,
     ) {
         let Some(ident) = self.browser_identity(conn_id) else {
             return;
@@ -1770,7 +1973,12 @@ impl Hub {
                 let devices = self.online_devices_of_owner(ident.owner_id);
                 let needs: Vec<(uuid::Uuid, TargetTag)> =
                     devices.into_iter().map(|d| (d, TargetTag::List)).collect();
-                self.browser_subscribe(conn_id, (ident.owner_id, TargetTag::List), needs);
+                self.browser_subscribe(
+                    conn_id,
+                    (ident.owner_id, TargetTag::List),
+                    needs,
+                    correlation.to_string(),
+                );
             }
             subscribe::Target::Session(key) => {
                 let reply_error = |code: StableErrorCode, msg: &str| {
@@ -1808,7 +2016,12 @@ impl Hub {
                     agent_kind: key.agent_kind,
                     native_session_id: key.native_session_id.clone(),
                 };
-                self.browser_subscribe(conn_id, (ident.owner_id, tag.clone()), vec![(device, tag)]);
+                self.browser_subscribe(
+                    conn_id,
+                    (ident.owner_id, tag.clone()),
+                    vec![(device, tag)],
+                    correlation.to_string(),
+                );
             }
         }
     }
@@ -2156,8 +2369,9 @@ mod tests {
     }
 
     /// R2-AC01 单元回归:
-    /// 1. 快照只删除确实覆盖(同设备、上游批号 ≤ Subscribed.base)的缓冲
-    ///    事件;未覆盖事件保持原下游序号,不重编号。
+    /// 1. 快照在途期间该上游的事件只入暂存,不分配下游序号(§17.4 步骤 4);
+    ///    快照到达后先定序快照帧、再 flush 暂存事件,重放顺序恒为
+    ///    快照 → 其后事件,批号 ≤ Subscribed.base 的暂存批被快照覆盖丢弃。
     /// 2. awaiting 订阅者快照/回放全部成功入队后才转活跃。
     /// 3. 入队失败(慢 consumer)复用重同步/断开收尾,不宣称恢复完成。
     #[tokio::test]
@@ -2191,16 +2405,25 @@ mod tests {
         g.browsers.insert(conn_ok, conn2);
         let ds = g.streams.get_mut(&key).unwrap();
         ds.subscribers
-            .insert(conn_full, SubscriberState { awaiting_snapshot: true, acked: 0 });
+            .insert(conn_full, SubscriberState { awaiting_snapshot: true, acked: 0, subscribe_correlation: String::new() });
         ds.subscribers
-            .insert(conn_ok, SubscriberState { awaiting_snapshot: true, acked: 0 });
+            .insert(conn_ok, SubscriberState { awaiting_snapshot: true, acked: 0, subscribe_correlation: String::new() });
 
-        // 快照前缓冲两个事件:批 5(被 covers=10 覆盖)、批 15(未覆盖)。
-        // awaiting 订阅者只入缓冲不直收(§17.4 步骤 4)。
+        // 快照前到达两个事件批:批 5(被 covers=10 覆盖)、批 15(未覆盖)。
+        // awaiting 订阅者不直收;快照在途时两批都只入暂存(§17.4 步骤 4),
+        // 不占用下游序号。
         let env5 = upstream_batch_env(device, &uid, 5);
         Hub::fan_out_events(&mut g, &uid, &env5, summary_events(device, "covered"));
         let env15 = upstream_batch_env(device, &uid, 15);
         Hub::fan_out_events(&mut g, &uid, &env15, summary_events(device, "uncovered"));
+        {
+            let ds = g.streams.get(&key).unwrap();
+            assert!(
+                ds.buffer.is_empty(),
+                "快照在途事件必须暂存,不得提前定序入缓冲"
+            );
+            assert_eq!(ds.next_seq, 1, "暂存批不消耗下游序号");
+        }
 
         // 填满慢订阅者队列:快照回放入队必然 SlowConsumer。
         let filler = Frame::new(
@@ -2212,13 +2435,14 @@ mod tests {
 
         Hub::handle_upstream_snapshot(&mut g, &uid, &snapshot_env(device, &uid));
 
-        // 覆盖删除:仅批 5 的帧被删;批 15 保留原序号(seq2),不重编号。
+        // 快照占用 seq1 定序;批 5(≤ covers=10)被快照覆盖丢弃;批 15 在
+        // 快照之后定序为 seq2 并扇出——顺序恒为快照 → 其后事件(§17.4 步骤 5)。
         {
             let ds = g.streams.get(&key).unwrap();
             assert_eq!(ds.buffer.len(), 1);
             assert_eq!(ds.buffer.items[0].env.sequence, 2);
             assert_eq!(ds.buffer.items[0].upstream_seq, Some(15));
-            assert_eq!(ds.next_seq, 4, "snapshot occupies seq3, no renumbering");
+            assert_eq!(ds.next_seq, 3, "snapshot seq1 + flushed event seq2");
         }
         // 慢订阅者:收尾 = ResyncRequired + 稳定断开 + 订阅摘除。
         assert!(
@@ -2274,8 +2498,8 @@ mod tests {
         assert!(saw_subscribed);
         assert_eq!(
             seqs,
-            vec![2, 3],
-            "replay = uncovered event(seq2) + snapshot(seq3), base=1"
+            vec![1, 2],
+            "delivery = snapshot(seq1) → flushed uncovered event(seq2), base=1"
         );
     }
 
@@ -2313,6 +2537,7 @@ mod tests {
             SubscriberState {
                 awaiting_snapshot: true,
                 acked: 0,
+                subscribe_correlation: String::new(),
             },
         );
 
@@ -2443,6 +2668,399 @@ mod tests {
             base,
             frames.first().unwrap().env.sequence,
             "window anchored at its first frame"
+        );
+    }
+
+    /// 复核回归 1:快照水位(covers=10)之后到达的关键事件(问题,上游批
+    /// 11)进入暂存后,再被 1024 个输出事件施加压力——暂存只允许挤出非第
+    /// 1 类;快照到达后订阅者必须收到该问题(或显式 ResyncRequired),不得
+    /// 静默丢失后继续宣称同步正常(§17.6)。
+    #[tokio::test]
+    async fn review_pending_overflow_must_deliver_uncovered_question_or_resync() {
+        use agent_console_protocol::v1 as pb;
+        let device = uuid::Uuid::new_v4();
+        let tag = TargetTag::Session {
+            device,
+            agent_kind: 1,
+            native_session_id: "review-session".into(),
+        };
+        let key = (uuid::Uuid::new_v4(), tag.clone());
+        let uid = upstream_stream_id(device, &tag);
+        let mut g = HubInner::default();
+        g.upstream_index.insert(uid.clone(), key.clone());
+        let mut ds = DStream::new(key.clone());
+        ds.upstreams.insert(
+            uid.clone(),
+            UpstreamBinding {
+                device,
+                epoch: 1,
+                last_seq: 9,
+                snapshot_covers: 10,
+                snapshot_received: false,
+            },
+        );
+        let outbox = Arc::new(Outbox::new(2048, BROWSER_QUEUE_MAX_BYTES));
+        let (conn_id, conn) = test_browser(outbox.clone());
+        g.browsers.insert(conn_id, conn);
+        ds.subscribers
+            .insert(conn_id, SubscriberState { awaiting_snapshot: true, acked: 0, subscribe_correlation: String::new() });
+        g.streams.insert(key.clone(), ds);
+        let question = domain_event::Event::PendingAttentionAdded(pb::PendingAttentionAdded {
+            attention: Some(pb::pending_attention_added::Attention::Question(
+                pb::PendingAttentionQuestion {
+                    question_id: "review-uncovered-question".into(),
+                    title: "Synthetic question".into(),
+                    valid: true,
+                    ..Default::default()
+                },
+            )),
+        });
+        Hub::fan_out_events(&mut g, &uid, &upstream_batch_env(device, &uid, 11), vec![question]);
+        for seq in 12..=1035 {
+            let output = domain_event::Event::OutputAppend(pb::OutputAppend {
+                item_id: Some(pb::ItemId {
+                    id: format!("item-{seq}"),
+                    ..Default::default()
+                }),
+                bytes: vec![b'x'],
+                ..Default::default()
+            });
+            Hub::fan_out_events(&mut g, &uid, &upstream_batch_env(device, &uid, seq), vec![output]);
+        }
+        let pending_question = g.streams[&key]
+            .pending_batches
+            .iter()
+            .flat_map(|b| &b.events)
+            .any(|e| matches!(e, domain_event::Event::PendingAttentionAdded(_)));
+        assert!(
+            pending_question,
+            "压力挤出只允许作用于非第 1 类,问题事件必须留在暂存"
+        );
+        Hub::handle_upstream_snapshot(&mut g, &uid, &snapshot_env(device, &uid));
+        let mut saw_question = false;
+        let mut saw_resync = false;
+        while let Ok(Some(item)) =
+            tokio::time::timeout(std::time::Duration::from_millis(1), outbox.recv()).await
+        {
+            let env = match item {
+                OutItem::Direct(bytes) => {
+                    agent_console_protocol::codec::decode_envelope(&bytes).unwrap()
+                }
+                OutItem::Frame(frame) => frame.env.clone(),
+                OutItem::Close(_) => {
+                    saw_resync = true;
+                    break;
+                }
+            };
+            match env.payload {
+                Some(envelope::Payload::ResyncRequired(_)) => saw_resync = true,
+                Some(envelope::Payload::EventBatch(batch)) => {
+                    saw_question |= batch
+                        .events
+                        .iter()
+                        .any(|e| matches!(e.event, Some(domain_event::Event::PendingAttentionAdded(_))));
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_question || saw_resync,
+            "question at upstream seq=11 (snapshot covers=10) was lost; delivered_question={}, resync={}, subscriber_still_active={}",
+            saw_question,
+            saw_resync,
+            g.streams[&key].subscribers.contains_key(&conn_id)
+        );
+    }
+
+    /// 复核回归 2:暂存正文计入现有单流字节预算——257 个 64 KiB 输出块
+    /// (≈16.8 MB)超过 16 MiB 上限时,压力挤出必须把暂存压回预算内(§17.6)。
+    #[test]
+    fn review_pending_queue_must_respect_existing_stream_byte_limit() {
+        use agent_console_protocol::v1 as pb;
+        let device = uuid::Uuid::new_v4();
+        let (key, uid) = list_stream_fixture(device);
+        let mut ds = DStream::new(key);
+        for seq in 1..=257 {
+            ds.push_pending(PendingUpstreamBatch {
+                upstream_id: uid.clone(),
+                upstream_seq: seq,
+                sent_at: None,
+                device_id: device.to_string(),
+                events: vec![domain_event::Event::OutputAppend(pb::OutputAppend {
+                    bytes: vec![b'x'; 64 * 1024],
+                    ..Default::default()
+                })],
+            });
+        }
+        let bytes: usize = ds
+            .pending_batches
+            .iter()
+            .flat_map(|batch| &batch.events)
+            .map(|event| {
+                if let domain_event::Event::OutputAppend(output) = event {
+                    output.bytes.len()
+                } else {
+                    0
+                }
+            })
+            .sum();
+        assert!(
+            bytes <= limits::BUFFER_MAX_BYTES,
+            "pending output bytes={} exceed per-stream limit={}, but existing accounted buffer.bytes={}",
+            bytes,
+            limits::BUFFER_MAX_BYTES,
+            ds.buffer.bytes
+        );
+        assert!(
+            ds.pending_bytes > 0,
+            "暂存字节必须计入预算统计(此处计入 {} 字节)",
+            ds.pending_bytes
+        );
+    }
+
+    /// 复核回归 3:暂存仅剩第 1 类仍超限(1025 个问题事件,无可挤出项)时,
+    /// 必须走显式恢复:订阅者收到 ResyncRequired、暂存清空、binding 重置,
+    /// 且强制重取快照的重订阅 env 真正发往 Bridge(不是只改本地状态)。
+    #[tokio::test]
+    async fn review_pending_overflow_with_only_critical_events_forces_explicit_recovery() {
+        use agent_console_protocol::v1 as pb;
+        let device = uuid::Uuid::new_v4();
+        let tag = TargetTag::Session {
+            device,
+            agent_kind: 1,
+            native_session_id: "review-crit".into(),
+        };
+        let key = (uuid::Uuid::new_v4(), tag.clone());
+        let uid = upstream_stream_id(device, &tag);
+        let mut g = HubInner::default();
+        g.upstream_index.insert(uid.clone(), key.clone());
+        let mut ds = DStream::new(key.clone());
+        ds.upstreams.insert(
+            uid.clone(),
+            UpstreamBinding {
+                device,
+                epoch: 1,
+                last_seq: 0,
+                snapshot_covers: 10,
+                snapshot_received: false,
+            },
+        );
+        let outbox = Arc::new(Outbox::new(2048, BROWSER_QUEUE_MAX_BYTES));
+        let (conn_id, conn) = test_browser(outbox.clone());
+        g.browsers.insert(conn_id, conn);
+        ds.subscribers
+            .insert(conn_id, SubscriberState { awaiting_snapshot: true, acked: 0, subscribe_correlation: String::new() });
+        g.streams.insert(key.clone(), ds);
+        // 注册 Bridge 连接:恢复路径必须把重订阅 env 发往它的 sink。
+        let (sink, mut bridge_rx) = tokio::sync::mpsc::channel::<WireBytes>(64);
+        let (close, _close_rx) = tokio::sync::watch::channel(false);
+        g.bridges.insert(
+            device,
+            BridgeConn {
+                device,
+                owner: uuid::Uuid::new_v4(),
+                sink,
+                close,
+            },
+        );
+
+        for seq in 1..=(limits::SNAPSHOT_PENDING_MAX_EVENTS as u64 + 1) {
+            let question = domain_event::Event::PendingAttentionAdded(pb::PendingAttentionAdded {
+                attention: Some(pb::pending_attention_added::Attention::Question(
+                    pb::PendingAttentionQuestion {
+                        question_id: format!("review-crit-{seq}"),
+                        title: "Critical only".into(),
+                        valid: true,
+                        ..Default::default()
+                    },
+                )),
+            });
+            Hub::fan_out_events(
+                &mut g,
+                &uid,
+                &upstream_batch_env(device, &uid, seq),
+                vec![question],
+            );
+        }
+
+        {
+            let ds = g.streams.get(&key).unwrap();
+            assert!(ds.pending_batches.is_empty(), "显式恢复必须清空暂存");
+            assert_eq!(ds.pending_bytes, 0);
+            assert_eq!(ds.pending_events, 0);
+            assert!(
+                !ds.upstreams.get(&uid).unwrap().snapshot_received,
+                "binding 必须重置等待新快照"
+            );
+        }
+        let mut saw_resync = false;
+        while let Ok(Some(item)) =
+            tokio::time::timeout(std::time::Duration::from_millis(1), outbox.recv()).await
+        {
+            if let OutItem::Direct(bytes) = item {
+                let env = agent_console_protocol::codec::decode_envelope(&bytes).unwrap();
+                if matches!(env.payload, Some(envelope::Payload::ResyncRequired(_))) {
+                    saw_resync = true;
+                }
+            }
+        }
+        assert!(saw_resync, "订阅者必须收到 ResyncRequired");
+        let mut saw_subscribe = false;
+        while let Ok(Some(bytes)) =
+            tokio::time::timeout(std::time::Duration::from_millis(1), bridge_rx.recv()).await
+        {
+            let env = agent_console_protocol::codec::decode_envelope(&bytes).unwrap();
+            if matches!(env.payload, Some(envelope::Payload::Subscribe(_))) {
+                saw_subscribe = true;
+            }
+        }
+        assert!(
+            saw_subscribe,
+            "强制重取快照的重订阅必须真正发往 Bridge,不能只改本地状态"
+        );
+    }
+
+    /// round3 回归:快照水位(covers=10)之后的最终回复(ItemUpsert /
+    /// AssistantMessage,第 2 类)进入暂存后,再被 1024 个输出事件施压——
+    /// 暂存只允许挤出第 3 类;快照到达后订阅者必须收到该回复(或显式
+    /// ResyncRequired)。"可经历史重读"必须先活着送达或触发恢复,不能静默丢。
+    #[tokio::test]
+    async fn round3_uncovered_assistant_message_must_be_delivered_or_resynced() {
+        use agent_console_protocol::v1 as pb;
+        let device = uuid::Uuid::new_v4();
+        let tag = TargetTag::Session {
+            device,
+            agent_kind: 1,
+            native_session_id: "round3-message".into(),
+        };
+        let key = (uuid::Uuid::new_v4(), tag.clone());
+        let uid = upstream_stream_id(device, &tag);
+        let mut g = HubInner::default();
+        g.upstream_index.insert(uid.clone(), key.clone());
+        let mut ds = DStream::new(key.clone());
+        ds.upstreams.insert(
+            uid.clone(),
+            UpstreamBinding {
+                device,
+                epoch: 1,
+                last_seq: 9,
+                snapshot_covers: 10,
+                snapshot_received: false,
+            },
+        );
+        let outbox = Arc::new(Outbox::new(2048, BROWSER_QUEUE_MAX_BYTES));
+        let (conn_id, conn) = test_browser(outbox.clone());
+        g.browsers.insert(conn_id, conn);
+        ds.subscribers.insert(
+            conn_id,
+            SubscriberState { awaiting_snapshot: true, acked: 0, subscribe_correlation: String::new() },
+        );
+        g.streams.insert(key.clone(), ds);
+        let message = domain_event::Event::ItemUpsert(pb::ItemUpsert {
+            item: Some(pb::Item {
+                item_id: Some(pb::ItemId {
+                    id: "uncovered-message".into(),
+                    ..Default::default()
+                }),
+                content: Some(pb::item::Content::AssistantMessage(pb::AssistantMessage {
+                    text: "synthetic final answer".into(),
+                    r#final: true,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+        });
+        Hub::fan_out_events(&mut g, &uid, &upstream_batch_env(device, &uid, 11), vec![message]);
+        for seq in 12..=1035 {
+            let output = domain_event::Event::OutputAppend(pb::OutputAppend {
+                item_id: Some(pb::ItemId {
+                    id: format!("item-{seq}"),
+                    ..Default::default()
+                }),
+                bytes: vec![b'x'],
+                ..Default::default()
+            });
+            Hub::fan_out_events(&mut g, &uid, &upstream_batch_env(device, &uid, seq), vec![output]);
+        }
+        Hub::handle_upstream_snapshot(&mut g, &uid, &snapshot_env(device, &uid));
+        let mut saw_message = false;
+        let mut saw_resync = false;
+        while let Ok(Some(item)) =
+            tokio::time::timeout(std::time::Duration::from_millis(1), outbox.recv()).await
+        {
+            let env = match item {
+                OutItem::Direct(bytes) => {
+                    agent_console_protocol::codec::decode_envelope(&bytes).unwrap()
+                }
+                OutItem::Frame(frame) => frame.env.clone(),
+                OutItem::Close(_) => {
+                    saw_resync = true;
+                    break;
+                }
+            };
+            match env.payload {
+                Some(envelope::Payload::ResyncRequired(_)) => saw_resync = true,
+                Some(envelope::Payload::EventBatch(batch)) => {
+                    saw_message |= batch
+                        .events
+                        .iter()
+                        .any(|e| matches!(e.event, Some(domain_event::Event::ItemUpsert(_))));
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_message || saw_resync,
+            "assistant message at upstream seq=11 (snapshot covers=10) was lost; delivered={}, resync={}, subscriber_still_active={}",
+            saw_message,
+            saw_resync,
+            g.streams[&key].subscribers.contains_key(&conn_id)
+        );
+    }
+
+    /// round3 回归:队首保留一个第 1 类事件后,后续批次被挤空——空批次壳
+    /// 必须立即移除,不得在暂存队列中累积占内存(实测曾残留 3073 个空壳)。
+    #[test]
+    fn round3_evicted_batch_shells_must_not_accumulate_behind_a_question() {
+        use agent_console_protocol::v1 as pb;
+        let device = uuid::Uuid::new_v4();
+        let (key, uid) = list_stream_fixture(device);
+        let mut ds = DStream::new(key);
+        let question = domain_event::Event::PendingAttentionAdded(pb::PendingAttentionAdded {
+            attention: Some(pb::pending_attention_added::Attention::Question(
+                pb::PendingAttentionQuestion {
+                    question_id: "kept-question".into(),
+                    valid: true,
+                    ..Default::default()
+                },
+            )),
+        });
+        assert!(!ds.push_pending(PendingUpstreamBatch {
+            upstream_id: uid.clone(),
+            upstream_seq: 1,
+            sent_at: None,
+            device_id: device.to_string(),
+            events: vec![question],
+        }));
+        for seq in 2..=4097 {
+            assert!(!ds.push_pending(PendingUpstreamBatch {
+                upstream_id: uid.clone(),
+                upstream_seq: seq,
+                sent_at: None,
+                device_id: device.to_string(),
+                events: vec![domain_event::Event::OutputAppend(pb::OutputAppend {
+                    bytes: vec![b'x'],
+                    ..Default::default()
+                })],
+            }));
+        }
+        let empty = ds.pending_batches.iter().filter(|b| b.events.is_empty()).count();
+        assert_eq!(
+            empty, 0,
+            "pending_batches={}, pending_events={}, pending_bytes={}, empty batch shells remain allocated",
+            ds.pending_batches.len(),
+            ds.pending_events,
+            ds.pending_bytes
         );
     }
 }
